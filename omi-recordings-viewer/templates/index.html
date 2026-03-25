@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Omi Recordings</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>Omi Recordings</h1>
+        <div class="search-bar">
+            <input type="text" id="search-input" placeholder="Search transcripts...">
+            <button id="search-btn">Search</button>
+        </div>
+    </header>
+
+    <main>
+        <div id="session-list" class="session-list">
+            <div class="loading">Loading...</div>
+        </div>
+
+        <div id="pagination" class="pagination"></div>
+    </main>
+
+    <!-- Session detail modal -->
+    <div id="detail-modal" class="modal hidden">
+        <div class="modal-content">
+            <button class="modal-close" id="modal-close">&times;</button>
+            <div id="detail-header" class="detail-header"></div>
+            <div id="audio-player-container" class="audio-player-container"></div>
+            <div id="segments-container" class="segments-container"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
