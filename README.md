@@ -85,6 +85,8 @@ curl http://localhost:8091/model/status
 | `SAVE_AUDIO` | `true` | 録音保存 |
 | `RECORDINGS_DIR` | `./recordings` | 保存先 |
 | `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効) |
+| `SILENCE_THRESHOLD` | `200` | 無音検出 RMS 閾値 (0=無効) |
+| `SILENCE_TIMEOUT` | `30.0` | 無音タイムアウト秒数 |
 | `OMI_WHISPER_TOKEN` | (空) | 認証トークン (空=認証なし) |
 
 ### モデル選択の目安
@@ -104,6 +106,33 @@ RTX 3060 12GB なら `large-v3` + `int8_float16` がベストバランス。
 - `transcript.json` -- メタデータ + 文字起こしセグメント
 
 データ量目安: 常時 ON 8h/日で WAV 約 27GB/月。
+
+## 無音検出
+
+RMS ベースの無音判定で GPU リソースを節約:
+
+- 無音バッファは whisper 処理と WAV 書き込みをスキップ
+- 30秒連続で無音が続くと録音セッションを自動終了 (WAV 確定保存)
+- 発話が再開すると新しいセッションを自動開始
+- WebSocket 接続自体は切断しない (Omi 側のライフサイクルに任せる)
+
+`SILENCE_THRESHOLD=0` で無効化可能。閾値 200 は環境ノイズ (50〜300) をカットし、小声 (500〜) は通す設定。
+
+## 録音 Viewer
+
+`omi-recordings-viewer/` に録音閲覧用の Web アプリを同梱:
+
+- 録音一覧・検索 (SQLite FTS)、音声再生、セグメントハイライト
+- 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
+- ポート 8092 でアクセス
+
+gpu-shared デプロイでは自動起動。単体デプロイでは別途起動が必要:
+
+```bash
+cd omi-recordings-viewer
+docker build -t omi-recordings-viewer .
+docker run -d -p 8092:8092 -v ../recordings:/app/recordings:ro omi-recordings-viewer
+```
 
 ## GPU 共有デプロイ
 
