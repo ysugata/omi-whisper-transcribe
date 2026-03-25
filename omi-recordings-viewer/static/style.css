@@ -302,6 +302,359 @@ main {
     color: var(--text-dim);
 }
 
+/* Settings button */
+.settings-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 1.3rem;
+    padding: 4px 10px;
+    cursor: pointer;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.settings-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+/* Settings modal */
+.settings-modal-content {
+    max-width: 700px;
+}
+
+.settings-modal-content h2 {
+    font-size: 1.1rem;
+    margin-bottom: 12px;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0;
+}
+
+.tab {
+    padding: 8px 16px;
+    border: none;
+    background: none;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+}
+
+.tab:hover { color: var(--text); }
+
+.tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Form */
+.form-group {
+    margin-bottom: 12px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+}
+
+.form-group input,
+.form-group textarea {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.form-group input:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.prompt-preview {
+    padding: 8px 12px;
+    background: var(--surface2);
+    border-radius: 6px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    min-height: 40px;
+    word-break: break-all;
+}
+
+.btn-primary {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+.btn-primary:hover { background: var(--accent-dim); }
+
+.btn-danger {
+    padding: 4px 10px;
+    border: none;
+    border-radius: 4px;
+    background: #c0392b;
+    color: #fff;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.btn-danger:hover { background: #e74c3c; }
+
+.save-status {
+    margin-left: 12px;
+    font-size: 0.85rem;
+    color: #2ecc71;
+}
+
+.text-dim {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+}
+
+/* Term corrections */
+.term-add-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.term-add-row input {
+    flex: 1;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.9rem;
+}
+
+.term-add-row input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.term-search-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.term-search-row input {
+    flex: 1;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+.term-search-row input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.terms-list {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.term-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+}
+
+.term-row:last-child { border-bottom: none; }
+
+.term-wrong {
+    min-width: 160px;
+    color: var(--text-dim);
+}
+
+.term-arrow {
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.term-correct {
+    flex: 1;
+    font-weight: 500;
+}
+
+/* Badge */
+.badge {
+    display: inline-block;
+    background: #c0392b;
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 10px;
+    margin-left: 4px;
+    vertical-align: top;
+}
+
+.badge.hidden { display: none; }
+
+.badge-auto {
+    display: inline-block;
+    background: var(--accent-dim);
+    color: #fff;
+    font-size: 0.65rem;
+    padding: 1px 5px;
+    border-radius: 8px;
+    margin-left: 6px;
+}
+
+/* Suggestion rows */
+.suggestion-row {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.suggestion-row:last-child { border-bottom: none; }
+
+.suggestion-diff {
+    font-size: 0.9rem;
+    margin-bottom: 4px;
+}
+
+.suggestion-diff .wrong {
+    color: #e74c3c;
+    text-decoration: line-through;
+}
+
+.suggestion-diff .correct {
+    color: #2ecc71;
+    font-weight: 500;
+}
+
+.suggestion-context {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    font-style: italic;
+}
+
+.suggestion-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.suggestion-edit-input {
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+    width: 200px;
+}
+
+/* Small buttons */
+.btn-sm {
+    padding: 4px 12px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.btn-sm:hover { background: var(--accent-dim); }
+
+.btn-edit {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.btn-edit:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+/* Inline edit input */
+.edit-input {
+    padding: 3px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+/* Preset bar */
+.preset-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.preset-bar select {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+.preset-bar select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* Prompt warnings */
+.prompt-warnings {
+    margin-bottom: 8px;
+}
+
+.warning-text {
+    font-size: 0.8rem;
+    color: #e67e22;
+    display: block;
+    margin-bottom: 2px;
+}
+
 /* Responsive */
 @media (max-width: 600px) {
     header {

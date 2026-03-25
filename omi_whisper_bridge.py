@@ -22,7 +22,10 @@ import hmac
 import json
 import logging
 import os
+import re
+import subprocess
 import time
+import uuid
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +46,27 @@ BEAM_SIZE = int(os.environ.get("BEAM_SIZE", "5"))
 VAD_FILTER = os.environ.get("VAD_FILTER", "true").lower() in ("true", "1", "yes")  # 無音区間のハルシネーション対策
 BUFFER_SECONDS = float(os.environ.get("BUFFER_SECONDS", "3.0"))          # 音声をバッファしてからまとめて処理する秒数
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))                # Omi は 16kHz PCM を送信
+
+# --- Whisper 精度改善パラメータ ---
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "./config")                       # 設定ファイルディレクトリ
+INITIAL_PROMPT = os.environ.get("INITIAL_PROMPT", "")                     # 固有名詞等を含むプロンプト (空=なし, 設定ファイル優先)
+NO_REPEAT_NGRAM_SIZE = int(os.environ.get("NO_REPEAT_NGRAM_SIZE", "3"))   # 繰り返し防止 n-gram サイズ (0=無効)
+LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セグメント平均対数確率の閾値
+NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
+COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
+
+# --- Layer 3: LLM 後処理設定 ---
+LLM_ENABLED = os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
+LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
+LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "5"))
+
+# --- 話者分離設定 ---
+DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
+HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8090"))
 MANAGEMENT_PORT = int(os.environ.get("MANAGEMENT_PORT", "8091"))
@@ -69,6 +93,143 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("omi-whisper")
+
+# ============================================================
+# Layer 1 + Layer 2: 固有名詞改善
+# ============================================================
+
+from prompt_builder import build_prompt
+from term_corrector import TermCorrector
+from llm_corrector import LLMCorrector
+from diarizer import Diarizer
+
+_PROMPT_SETTINGS_PATH = os.path.join(CONFIG_DIR, "prompt_settings.json")
+_TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
+
+term_corrector = TermCorrector(_TERM_CORRECTIONS_PATH)
+
+# Layer 3: LLM 後処理 (API キー未設定なら自動的に無効)
+llm_corrector: LLMCorrector | None = None
+if LLM_ENABLED and LLM_API_KEY:
+    llm_corrector = LLMCorrector(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=LLM_MODEL,
+        timeout=LLM_TIMEOUT,
+    )
+
+# 話者分離
+diarizer: Diarizer | None = None
+if DIARIZATION_ENABLED:
+    diarizer = Diarizer(
+        hf_token=HF_AUTH_TOKEN,
+        language=LANGUAGE or "ja",
+    )
+
+
+def _get_initial_prompt() -> str:
+    """セッション開始時に initial_prompt を決定する。
+
+    優先順位:
+    1. prompt_settings.json がある場合、その内容から構築
+    2. INITIAL_PROMPT 環境変数
+    3. デフォルトの短いプロンプト
+    """
+    try:
+        if os.path.exists(_PROMPT_SETTINGS_PATH):
+            with open(_PROMPT_SETTINGS_PATH, encoding="utf-8") as f:
+                settings = json.load(f)
+            prompt = build_prompt(
+                topic=settings.get("topic", ""),
+                participants=settings.get("participants", []),
+                terms=settings.get("terms", []),
+            )
+            if prompt:
+                log.info(f"Prompt from settings: {prompt[:80]}...")
+                return prompt
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning(f"prompt_settings.json 読み込みエラー: {e}")
+
+    if INITIAL_PROMPT:
+        return INITIAL_PROMPT
+
+    return ""
+
+
+def _get_known_terms() -> list[str]:
+    """LLM 補正用の参考用語リストを構築する。
+
+    prompt_settings の terms + term_corrector の正解語をマージ。
+    """
+    terms: set[str] = set()
+
+    # term_corrector の正解語 (辞書の values)
+    for v in term_corrector.list_corrections().values():
+        terms.add(v)
+
+    # prompt_settings の terms
+    try:
+        if os.path.exists(_PROMPT_SETTINGS_PATH):
+            with open(_PROMPT_SETTINGS_PATH, encoding="utf-8") as f:
+                settings = json.load(f)
+            for t in settings.get("terms", []):
+                terms.add(t)
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    return sorted(terms)
+
+
+_PENDING_SUGGESTIONS_PATH = os.path.join(CONFIG_DIR, "pending_suggestions.json")
+
+
+def _save_llm_suggestions(originals: list[str], corrected_segments: list[dict]) -> None:
+    """LLM が修正した差分を pending_suggestions.json に追記する。"""
+    from llm_corrector import LLMCorrector
+
+    new_suggestions = []
+    for orig_text, seg in zip(originals, corrected_segments):
+        corrected_text = seg.get("text", "")
+        diffs = LLMCorrector.detect_corrections(orig_text, corrected_text)
+        for d in diffs:
+            new_suggestions.append({
+                "id": str(uuid.uuid4())[:8],
+                "wrong": d["wrong"],
+                "correct": d["correct"],
+                "context": orig_text,
+                "detected_at": datetime.now().isoformat(),
+                "status": "pending",
+            })
+
+    if not new_suggestions:
+        return
+
+    # 既存の提案を読み込み
+    try:
+        if os.path.exists(_PENDING_SUGGESTIONS_PATH):
+            with open(_PENDING_SUGGESTIONS_PATH, encoding="utf-8") as f:
+                existing = json.load(f)
+        else:
+            existing = []
+    except (json.JSONDecodeError, OSError):
+        existing = []
+
+    # 重複チェック: 同じ wrong+correct ペアが pending にあればスキップ
+    existing_pairs = {(s["wrong"], s["correct"]) for s in existing if s.get("status") == "pending"}
+    added = 0
+    for s in new_suggestions:
+        pair = (s["wrong"], s["correct"])
+        if pair not in existing_pairs:
+            existing.append(s)
+            existing_pairs.add(pair)
+            added += 1
+
+    if added > 0:
+        os.makedirs(os.path.dirname(_PENDING_SUGGESTIONS_PATH) or ".", exist_ok=True)
+        with open(_PENDING_SUGGESTIONS_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        log.info(f"Saved {added} new LLM suggestion(s) to pending_suggestions.json")
+
 
 # ============================================================
 # モデルマネージャ (Whisper モデルのライフサイクル管理)
@@ -125,6 +286,7 @@ class SessionRecorder:
         self.all_segments: list[dict] = []
         self.total_bytes = 0
         self._finalized = False
+        self._audio_closed = False
 
         if not self.enabled:
             return
@@ -159,16 +321,73 @@ class SessionRecorder:
             return
         self.all_segments.extend(segments)
 
+    def close_audio(self):
+        """WAV ファイルを閉じる (diarization 前に呼ぶ)"""
+        if not self.enabled or self._audio_closed:
+            return
+        self.wav_file.close()
+        self._audio_closed = True
+
+    def _convert_to_opus(self) -> bool:
+        """WAV → OGG Opus に変換し、成功したら WAV を削除"""
+        ogg_path = self.session_dir / "audio.ogg"
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", str(self.wav_path),
+                    "-c:a", "libopus",
+                    "-b:a", "32k",        # Omi と同じ 32kbps
+                    "-ar", "16000",
+                    "-ac", "1",
+                    str(ogg_path),
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                log.error(f"ffmpeg failed: {result.stderr[:500]}")
+                return False
+            # 変換成功 → WAV 削除
+            self.wav_path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            log.warning("ffmpeg not found, keeping WAV")
+            return False
+        except subprocess.TimeoutExpired:
+            log.error("ffmpeg timed out")
+            return False
+
     def finalize(self):
-        """セッション終了時に WAV を閉じ、JSON を書き出す"""
+        """セッション終了時に WAV を閉じ、OGG Opus に変換し、JSON を書き出す"""
         if not self.enabled or self._finalized:
             return
         self._finalized = True
 
-        self.wav_file.close()
+        if not self._audio_closed:
+            self.wav_file.close()
+            self._audio_closed = True
 
         duration_sec = self.total_bytes / (SAMPLE_RATE * 2)
-        file_size_mb = self.total_bytes / (1024 * 1024)
+
+        # 空の録音 (音声なし) なら削除
+        if self.total_bytes == 0:
+            import shutil
+            shutil.rmtree(self.session_dir, ignore_errors=True)
+            log.info("Empty session removed.")
+            return
+
+        # WAV → OGG Opus 変換
+        if self._convert_to_opus():
+            audio_file = "audio.ogg"
+            audio_path = self.session_dir / audio_file
+            file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+        else:
+            audio_file = "audio.wav"
+            file_size_mb = self.total_bytes / (1024 * 1024)
+
+        # 話者数を集計
+        speakers = set(s.get("speaker", "SPEAKER_00") for s in self.all_segments)
+        num_speakers = len(speakers)
 
         # メタデータ付きで JSON 保存
         output = {
@@ -176,10 +395,11 @@ class SessionRecorder:
                 "start": self.start_time.isoformat(),
                 "end": datetime.now().isoformat(),
                 "duration_seconds": round(duration_sec, 1),
-                "audio_file": "audio.wav",
-                "audio_size_mb": round(file_size_mb, 1),
+                "audio_file": audio_file,
+                "audio_size_mb": round(file_size_mb, 2),
                 "model": WHISPER_MODEL,
                 "language": LANGUAGE,
+                "num_speakers": num_speakers,
             },
             "segments": self.all_segments,
         }
@@ -188,15 +408,9 @@ class SessionRecorder:
             json.dump(output, f, ensure_ascii=False, indent=2)
 
         log.info(
-            f"Saved: {self.wav_path.name} ({file_size_mb:.1f}MB, {duration_sec:.0f}s) "
+            f"Saved: {audio_file} ({file_size_mb:.2f}MB, {duration_sec:.0f}s) "
             f"+ {self.json_path.name} ({len(self.all_segments)} segments)"
         )
-
-        # 空の録音 (音声なし) なら削除
-        if self.total_bytes == 0:
-            import shutil
-            shutil.rmtree(self.session_dir, ignore_errors=True)
-            log.info("Empty session removed.")
 
 
 # ============================================================
@@ -211,11 +425,77 @@ def calc_rms_int16(pcm_bytes: bytes) -> float:
     return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
 
 
-def transcribe_audio(audio_bytes: bytes, model, session_offset: float = 0.0) -> list[dict]:
+# ハルシネーション除去用パターン (Whisper が生成しがちな定型句)
+_HALLUCINATION_PATTERNS = [
+    re.compile(r"ご視聴ありがとうございま(した|す)"),
+    re.compile(r"チャンネル登録.*?お願いします"),
+    re.compile(r"チャンネル登録"),
+    re.compile(r"高評価"),
+    re.compile(r"ご清聴ありがとうございま(した|す)"),
+    re.compile(r"お(つかれさま|疲れ様)でした"),
+    re.compile(r"(ではまた|また次回)"),
+    re.compile(r"最後まで(ご覧|見て)いただき.*"),
+    re.compile(r"ご覧いただきありがとうございま(した|す)"),
+    re.compile(r"おやすみなさい"),
+    re.compile(r"字幕.*?(視聴者|翻訳|提供)"),
+    re.compile(r"Thanks? for watching\.?", re.IGNORECASE),
+    re.compile(r"See you next time\.?", re.IGNORECASE),
+    re.compile(r"Subscribe", re.IGNORECASE),
+    re.compile(r"Bye[\.\s]*bye\.?", re.IGNORECASE),
+    re.compile(r"♪+"),
+    re.compile(r"^\s*\.+\s*$"),
+    re.compile(r"(.{2,}?)\1{3,}"),  # 同一フレーズの4回以上繰り返し
+]
+
+
+def _remove_hallucinations(text: str) -> str:
+    """既知のハルシネーションパターンを除去し、残りテキストを返す"""
+    cleaned = text
+    for pattern in _HALLUCINATION_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+# プロンプトエコー検出用の区切り文字パターン
+_PROMPT_SPLIT_RE = re.compile(r"[、。,.\s:：]+")
+
+
+def _is_prompt_echo(text: str, prompt: str, threshold: float = 0.6) -> bool:
+    """テキストが initial_prompt のエコー (プロンプト内容の誤出力) かどうかを判定する。
+
+    テキスト中の単語の60%以上がプロンプトに含まれていればエコーと判定。
     """
-    PCM 16-bit LE の音声バイト列を受け取り、
+    if not prompt:
+        return False
+    text_words = set(w for w in _PROMPT_SPLIT_RE.split(text) if len(w) >= 2)
+    if not text_words:
+        return False
+    prompt_words = set(w for w in _PROMPT_SPLIT_RE.split(prompt) if len(w) >= 2)
+    overlap = len(text_words & prompt_words)
+    ratio = overlap / len(text_words)
+    if ratio >= threshold:
+        log.debug(f"Prompt echo detected ({ratio:.0%}): '{text[:60]}'")
+        return True
+    return False
+
+
+def transcribe_audio(
+    audio_bytes: bytes,
+    model,
+    session_offset: float = 0.0,
+    initial_prompt: str = "",
+    known_terms: list[str] | None = None,
+) -> list[dict]:
+    """PCM 16-bit LE の音声バイト列を受け取り、
     Omi の custom_stt が期待する segments リストを返す。
-    model: ロード済みの WhisperModel インスタンス
+
+    Args:
+        audio_bytes: PCM 16-bit LE 音声データ
+        model: ロード済みの WhisperModel インスタンス
+        session_offset: タイムスタンプオフセット (秒)
+        initial_prompt: Layer 1 で構築した initial_prompt
+        known_terms: Layer 3 LLM 補正用の参考用語リスト
     """
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -224,22 +504,53 @@ def transcribe_audio(audio_bytes: bytes, model, session_offset: float = 0.0) -> 
 
     segments_out = []
 
-    segments, info = model.transcribe(
-        audio_np,
+    # transcribe パラメータ構築
+    transcribe_kwargs = dict(
         beam_size=BEAM_SIZE,
         language=LANGUAGE,
         vad_filter=VAD_FILTER,
         vad_parameters=dict(
-            min_silence_duration_ms=500,
-            speech_pad_ms=200,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=1000,
+            speech_pad_ms=400,
+            threshold=0.5,
         ),
         word_timestamps=False,
+        condition_on_previous_text=True,
+        no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+        compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
+        log_prob_threshold=LOG_PROB_THRESHOLD,
+        no_speech_threshold=NO_SPEECH_THRESHOLD,
     )
+    if initial_prompt:
+        transcribe_kwargs["initial_prompt"] = initial_prompt
+
+    segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
     for seg in segments:
+        # 確信度フィルタ: 低確信度・無音確率高のセグメントを除去
+        if seg.avg_logprob < -0.7 or seg.no_speech_prob > 0.5:
+            log.debug(
+                f"Segment filtered: avg_logprob={seg.avg_logprob:.2f}, "
+                f"no_speech_prob={seg.no_speech_prob:.2f}, text='{seg.text.strip()[:50]}'"
+            )
+            continue
+
         text = seg.text.strip()
         if not text:
             continue
+
+        # ハルシネーション除去
+        text = _remove_hallucinations(text)
+        if not text:
+            continue
+
+        # プロンプトエコー検出
+        if initial_prompt and _is_prompt_echo(text, initial_prompt):
+            continue
+
+        # Layer 2: 用語補正
+        text = term_corrector.correct(text)
 
         segments_out.append({
             "text": text,
@@ -251,7 +562,31 @@ def transcribe_audio(audio_bytes: bytes, model, session_offset: float = 0.0) -> 
             "person_id": None,
         })
 
+    # Layer 3: LLM 後処理
+    if llm_corrector and segments_out:
+        originals = [seg["text"] for seg in segments_out]
+        segments_out = llm_corrector.correct_segments(
+            segments_out,
+            known_terms=known_terms,
+            min_text_length=LLM_MIN_TEXT_LENGTH,
+        )
+        try:
+            _save_llm_suggestions(originals, segments_out)
+        except Exception as e:
+            log.warning(f"Failed to save LLM suggestions: {e}")
+
     return segments_out
+
+
+def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
+    """セグメントのタイムスタンプにオフセットを加算したコピーを返す"""
+    if offset == 0:
+        return segments
+    return [
+        {**seg, "start": round(seg["start"] + offset, 2),
+                "end": round(seg["end"] + offset, 2)}
+        for seg in segments
+    ]
 
 
 # ============================================================
@@ -283,8 +618,14 @@ async def handle_connection(websocket):
     audio_buffer = bytearray()
     session_start = time.time()
     total_audio_seconds = 0.0
+    recorder_audio_seconds = 0.0  # WAV に実際に書き込んだ秒数 (録音用オフセット)
     recorder = SessionRecorder()
     silent_since = None  # 無音開始時刻 (None = 発話中)
+
+    # Layer 1: セッション開始時に initial_prompt を構築
+    session_prompt = _get_initial_prompt()
+    # Layer 3 用の参考用語リスト
+    session_known_terms = _get_known_terms() if llm_corrector else None
 
     # モデル確保 (未ロードなら自動ロード)
     try:
@@ -359,7 +700,12 @@ async def handle_connection(websocket):
                     # 録音セッションが終了していたら新規作成
                     if recorder is None:
                         recorder = SessionRecorder()
+                        recorder_audio_seconds = 0.0
                         log.info("New recording session started (speech detected)")
+
+                # オフセットを退避 (transcribe 前の値を使う)
+                ws_offset = total_audio_seconds
+                rec_offset = recorder_audio_seconds
 
                 # 音声を録音ファイルに書き込み
                 if recorder is not None:
@@ -369,27 +715,28 @@ async def handle_connection(websocket):
                 t0 = time.time()
 
                 loop = asyncio.get_running_loop()
-                segments = await loop.run_in_executor(
+                raw_segments = await loop.run_in_executor(
                     executor,
-                    transcribe_audio,
-                    chunk,
-                    model,
-                    total_audio_seconds,
+                    lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms),
                 )
 
                 elapsed = time.time() - t0
                 total_audio_seconds += buffer_duration
+                recorder_audio_seconds += buffer_duration
 
-                if segments:
-                    response = {"segments": segments}
+                if raw_segments:
+                    # WebSocket 応答: 接続全体のオフセット (Omi アプリ用)
+                    ws_segments = _offset_segments(raw_segments, ws_offset)
+                    response = {"segments": ws_segments}
                     await websocket.send(json.dumps(response))
 
-                    # 文字起こし結果を録音ログに追加
+                    # 録音ログ: WAV ファイル内の位置に合わせたオフセット
                     if recorder is not None:
-                        recorder.add_segments(segments)
+                        rec_segments = _offset_segments(raw_segments, rec_offset)
+                        recorder.add_segments(rec_segments)
 
                     log.info(
-                        f"Sent {len(segments)} segment(s) "
+                        f"Sent {len(raw_segments)} segment(s) "
                         f"[{elapsed:.2f}s processing, "
                         f"RTF={elapsed/buffer_duration:.2f}x]"
                     )
@@ -411,22 +758,52 @@ async def handle_connection(websocket):
             if is_speech:
                 if recorder is None:
                     recorder = SessionRecorder()
+                    recorder_audio_seconds = 0.0
+                rec_offset = recorder_audio_seconds
                 recorder.write_audio(remaining)
 
                 log.info("Processing remaining buffer...")
                 try:
-                    segments = transcribe_audio(remaining, model, total_audio_seconds)
-                    if segments:
-                        recorder.add_segments(segments)
+                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_known_terms)
+                    if raw_segments:
+                        rec_segments = _offset_segments(raw_segments, rec_offset)
+                        recorder.add_segments(rec_segments)
                         try:
-                            response = {"segments": segments}
-                            await websocket.send(json.dumps(response))
+                            ws_segments = _offset_segments(raw_segments, total_audio_seconds)
+                            await websocket.send(json.dumps({"segments": ws_segments}))
                         except Exception:
                             pass
                 except Exception as e:
                     log.error(f"Error processing remaining buffer: {e}", exc_info=True)
 
-        # セッション録音を確定 (WAV クローズ + JSON 書き出し)
+        # セッション終了: whisper モデルを解放
+        model_manager.release()
+
+        # 話者分離 (セッション終了時に完全な WAV に対して実行)
+        if (diarizer and diarizer.enabled
+                and recorder is not None
+                and recorder.enabled
+                and not recorder._finalized
+                and recorder.total_bytes > 0):
+            recorder.close_audio()
+            unloaded = await model_manager.unload_model()
+            if unloaded:
+                log.info("Running post-session diarization...")
+                try:
+                    loop = asyncio.get_running_loop()
+                    updated = await loop.run_in_executor(
+                        None,
+                        lambda: diarizer.diarize(
+                            str(recorder.wav_path), recorder.all_segments
+                        ),
+                    )
+                    recorder.all_segments = updated
+                except Exception as e:
+                    log.error(f"Diarization error: {e}", exc_info=True)
+            else:
+                log.info("Skipping diarization (other sessions active)")
+
+        # セッション録音を確定 (OGG 変換 + JSON 書き出し)
         if recorder is not None:
             recorder.finalize()
 
@@ -435,9 +812,6 @@ async def handle_connection(websocket):
             f"Session ended: {remote} "
             f"(duration={duration:.0f}s, audio={total_audio_seconds:.0f}s)"
         )
-
-        # セッション終了通知
-        model_manager.release()
 
 
 # ============================================================
@@ -448,6 +822,27 @@ async def main():
     log.info(f"Starting Omi-Whisper bridge on ws://{HOST}:{PORT}")
     log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
+    log.info(f"Quality: no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, "
+             f"log_prob_thresh={LOG_PROB_THRESHOLD}, "
+             f"no_speech_thresh={NO_SPEECH_THRESHOLD}, "
+             f"compression_ratio_thresh={COMPRESSION_RATIO_THRESHOLD}")
+    log.info(f"Config dir: {CONFIG_DIR}")
+    log.info(f"Term corrections: {_TERM_CORRECTIONS_PATH} ({len(term_corrector.list_corrections())} entries)")
+    startup_prompt = _get_initial_prompt()
+    if startup_prompt:
+        log.info(f"Initial prompt: {startup_prompt[:100]}{'...' if len(startup_prompt) > 100 else ''}")
+    else:
+        log.info("Initial prompt: (none — set via viewer or INITIAL_PROMPT env)")
+    if llm_corrector:
+        log.info(f"Layer 3 LLM: {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, timeout={LLM_TIMEOUT}s)")
+    else:
+        reason = "DISABLED" if not LLM_ENABLED else "no GEMINI_API_KEY"
+        log.info(f"Layer 3 LLM: {reason}")
+    if diarizer and diarizer.enabled:
+        log.info("Diarization: ENABLED (WhisperX)")
+    else:
+        reason = "DISABLED" if not DIARIZATION_ENABLED else "no HF_AUTH_TOKEN"
+        log.info(f"Diarization: {reason}")
     log.info(f"Audio saving: {'ON -> ' + RECORDINGS_DIR if SAVE_AUDIO else 'OFF'}")
     log.info(f"Silence: threshold={SILENCE_THRESHOLD}, timeout={SILENCE_TIMEOUT}s"
              f"{' (DISABLED)' if SILENCE_THRESHOLD <= 0 else ''}")

@@ -4,16 +4,23 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv tzdata \
+    python3 python3-pip python3-venv tzdata ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# PyTorch with CUDA (install before whisperx to prevent CPU-only torch)
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
 
 COPY omi_whisper_bridge.py .
 COPY model_manager.py .
+COPY prompt_builder.py .
+COPY term_corrector.py .
+COPY llm_corrector.py .
+COPY diarizer.py .
 COPY test_whisper.py .
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント

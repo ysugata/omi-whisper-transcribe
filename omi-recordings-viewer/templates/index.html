@@ -13,6 +13,7 @@
             <input type="text" id="search-input" placeholder="Search transcripts...">
             <button id="search-btn">Search</button>
         </div>
+        <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
     </header>
 
     <main>
@@ -30,6 +31,70 @@
             <div id="detail-header" class="detail-header"></div>
             <div id="audio-player-container" class="audio-player-container"></div>
             <div id="segments-container" class="segments-container"></div>
+        </div>
+    </div>
+
+    <!-- Settings modal -->
+    <div id="settings-modal" class="modal hidden">
+        <div class="modal-content settings-modal-content">
+            <button class="modal-close" id="settings-close">&times;</button>
+            <h2>Whisper Settings</h2>
+
+            <!-- Tabs -->
+            <div class="tabs">
+                <button class="tab active" data-tab="prompt-tab">Prompt Settings</button>
+                <button class="tab" data-tab="terms-tab">Term Corrections</button>
+                <button class="tab" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
+            </div>
+
+            <!-- Prompt settings tab -->
+            <div id="prompt-tab" class="tab-content active">
+                <div class="preset-bar">
+                    <select id="preset-select">
+                        <option value="">-- Select Preset --</option>
+                    </select>
+                    <button id="preset-save-btn" class="btn-sm" title="Save current as preset">Save</button>
+                    <button id="preset-delete-btn" class="btn-sm btn-danger" title="Delete selected preset">Del</button>
+                </div>
+                <div class="form-group">
+                    <label for="prompt-topic">Topic</label>
+                    <input type="text" id="prompt-topic" placeholder="e.g. マイクロサービス基盤のリアーキテクチャ">
+                </div>
+                <div class="form-group">
+                    <label for="prompt-participants">Participants (comma separated)</label>
+                    <input type="text" id="prompt-participants" placeholder="e.g. 田中部長, 佐藤">
+                </div>
+                <div class="form-group">
+                    <label for="prompt-terms">Terms (comma separated)</label>
+                    <textarea id="prompt-terms" rows="3" placeholder="e.g. Kubernetes, Docker, Terraform, ArgoCD"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Preview <span id="prompt-char-count" class="text-dim"></span></label>
+                    <div id="prompt-preview" class="prompt-preview"></div>
+                </div>
+                <div id="prompt-warnings" class="prompt-warnings"></div>
+                <button id="save-prompt" class="btn-primary">Save Prompt Settings</button>
+                <span id="prompt-status" class="save-status"></span>
+            </div>
+
+            <!-- Term corrections tab -->
+            <div id="terms-tab" class="tab-content">
+                <div class="term-add-row">
+                    <input type="text" id="term-wrong" placeholder="Wrong (e.g. クーバネティス)">
+                    <input type="text" id="term-correct" placeholder="Correct (e.g. Kubernetes)">
+                    <button id="term-add-btn" class="btn-primary">Add</button>
+                </div>
+                <div class="term-search-row">
+                    <input type="text" id="term-filter" placeholder="Filter...">
+                    <span id="term-count" class="text-dim"></span>
+                </div>
+                <div id="terms-list" class="terms-list"></div>
+            </div>
+
+            <!-- LLM Suggestions tab -->
+            <div id="suggestions-tab" class="tab-content">
+                <div id="suggestions-list"></div>
+            </div>
         </div>
     </div>
 
