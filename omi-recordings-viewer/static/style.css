@@ -302,6 +302,69 @@ main {
     color: var(--text-dim);
 }
 
+/* Diarize button */
+.diarize-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    padding: 4px 12px;
+    cursor: pointer;
+    line-height: 1.4;
+    flex-shrink: 0;
+}
+
+.diarize-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+/* Diarize progress panel */
+.diarize-panel {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+}
+
+.diarize-panel.hidden { display: none; }
+
+.diarize-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.diarize-header #diarize-status-text {
+    font-weight: 500;
+    font-size: 0.9rem;
+}
+
+.diarize-header #diarize-progress-text {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-left: auto;
+}
+
+.progress-bar {
+    height: 4px;
+    background: var(--surface2);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+
+.progress-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 2px;
+}
+
 /* Settings button */
 .settings-btn {
     background: none;

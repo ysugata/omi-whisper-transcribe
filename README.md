@@ -24,22 +24,21 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 
 ## クイックスタート
 
-### 1. トークン生成 (任意)
+[gpu-shared](../gpu-shared/) 経由でデプロイします。
 
-Cloudflare Tunnel 経由で公開する場合のみ:
+### 1. .env 設定
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
+cd gpu-shared
+cp .env.example .env
+# .env を編集して以下を設定:
+#   HF_AUTH_TOKEN=hf_xxx    (話者分離を使う場合、pyannote の利用規約同意が必要)
+#   OMI_WHISPER_TOKEN=...   (Cloudflare Tunnel 経由で公開する場合)
 ```
 
 ### 2. 起動
 
 ```bash
-cd omi_whisper_transcribe
-
-# トークンを設定する場合
-export OMI_WHISPER_TOKEN=<生成したトークン>
-
 docker compose up -d --build
 ```
 
@@ -49,10 +48,10 @@ docker compose up -d --build
 
 ```bash
 # ログ
-docker compose logs -f
+docker compose logs -f omi-whisper
 
-# 管理 API でモデル状態を確認
-curl http://localhost:8091/model/status
+# Viewer (録音一覧 + バッチ話者分離)
+open http://localhost:8092
 ```
 
 ## ポート
@@ -60,7 +59,8 @@ curl http://localhost:8091/model/status
 | ポート | プロトコル | 用途 |
 |--------|-----------|------|
 | 8090 | WebSocket | 音声受信 + 文字起こし結果送信 |
-| 8091 | HTTP | 管理 API |
+| 8091 | HTTP | 管理 API (内部、gpu-shared 経由) |
+| 8092 | HTTP | 録音 Viewer |
 
 ## 管理 API (port 8091)
 
@@ -69,6 +69,9 @@ curl http://localhost:8091/model/status
 | `/model/load` | POST | モデルロード (冪等) |
 | `/model/unload` | POST | モデルアンロード (セッション中は 409) |
 | `/model/status` | GET | `{"loaded": bool, "session_count": int, "model_name": "...", "compute_type": "..."}` |
+| `/diarize/start` | POST | バッチ話者分離を開始 (実行中は 409、HF_AUTH_TOKEN 未設定は 503) |
+| `/diarize/status` | GET | バッチ話者分離の進捗状態を JSON で返す |
+| `/diarize/cancel` | POST | 実行中のバッチ話者分離をキャンセル |
 
 ## 環境変数
 
@@ -87,6 +90,8 @@ curl http://localhost:8091/model/status
 | `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効) |
 | `SILENCE_THRESHOLD` | `200` | 無音検出 RMS 閾値 (0=無効) |
 | `SILENCE_TIMEOUT` | `30.0` | 無音タイムアウト秒数 |
+| `DIARIZATION_ENABLED` | `false` | セッション終了時の自動話者分離 |
+| `HF_AUTH_TOKEN` | (空) | HuggingFace トークン (話者分離に必須) |
 | `OMI_WHISPER_TOKEN` | (空) | 認証トークン (空=認証なし) |
 
 ### モデル選択の目安
@@ -118,26 +123,40 @@ RMS ベースの無音判定で GPU リソースを節約:
 
 `SILENCE_THRESHOLD=0` で無効化可能。閾値 200 は環境ノイズ (50〜300) をカットし、小声 (500〜) は通す設定。
 
-## 録音 Viewer
+## バッチ話者分離
 
-`omi-recordings-viewer/` に録音閲覧用の Web アプリを同梱:
+Viewer の「Diarize」ボタンから、未処理の全録音に対して一括で話者分離を実行できます。
 
-- 録音一覧・検索 (SQLite FTS)、音声再生、セグメントハイライト
-- 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
-- ポート 8092 でアクセス
-
-gpu-shared デプロイでは自動起動。単体デプロイでは別途起動が必要:
-
-```bash
-cd omi-recordings-viewer
-docker build -t omi-recordings-viewer .
-docker run -d -p 8092:8092 -v ../recordings:/app/recordings:ro omi-recordings-viewer
+```
+[Browser]  ←→  [Viewer (8092)]  ←→  [Bridge (8091)]
+  UI + 進捗表示     プロキシ API         GPU + Diarizer
 ```
 
-## GPU 共有デプロイ
+### 使い方
 
-qwen-tts と GPU を共有する場合は [gpu-shared](../gpu-shared/) を使用してください。
-omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて外部から制御されます。
+1. `.env` に `HF_AUTH_TOKEN=hf_xxx` を設定 ([pyannote](https://huggingface.co/pyannote/speaker-diarization-3.1) の利用規約に同意が必要)
+2. Viewer を開くとヘッダーに「Diarize」ボタンが表示される
+3. ボタンを押すと確認ダイアログ → バッチ処理開始
+4. 進捗パネルでリアルタイムに進行状況を確認 (2秒ポーリング)
+5. 完了後、各セッションの transcript.json に話者情報が追加される
+
+### 動作仕様
+
+- `HF_AUTH_TOKEN` があれば Diarizer が常に利用可能 (バッチ用)
+- `DIARIZATION_ENABLED=true` の場合のみ、セッション終了時に自動で話者分離も実行
+- GPU ロックで Whisper セッションと排他制御 (処理中は Whisper をアンロード)
+- キャンセルは現在処理中のセッション完了後に安全に停止
+- エラー時も元のセグメントは保持される (テキスト消失なし)
+
+## 録音 Viewer
+
+`omi-recordings-viewer/` に録音閲覧用の Web アプリを同梱 (ポート 8092):
+
+- 録音一覧・検索 (SQLite FTS)
+- 音声再生 + セグメントハイライト
+- バッチ話者分離 (上記参照)
+- 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット)
+- 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
 
 ## Cloudflare Tunnel
 

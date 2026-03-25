@@ -1,5 +1,6 @@
 """Omi Recordings Viewer — aiohttp web server."""
 
+import asyncio
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 import aiohttp_jinja2
 import jinja2
 from aiohttp import web
@@ -23,6 +25,7 @@ RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "/app/recordings")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/config")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/index.db")
 PORT = int(os.environ.get("PORT", "8092"))
+BRIDGE_MGMT_URL = os.environ.get("BRIDGE_MGMT_URL", "")
 
 _TERM_CORRECTIONS_PATH = Path(CONFIG_DIR) / "term_corrections.json"
 _PROMPT_SETTINGS_PATH = Path(CONFIG_DIR) / "prompt_settings.json"
@@ -357,6 +360,46 @@ async def handle_delete_preset(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Diarization プロキシ API (Bridge へ中継)
+# ============================================================
+
+async def _proxy_bridge(request: web.Request, method: str, path: str) -> web.Response:
+    """Bridge 管理 API へリクエストをプロキシする共通ロジック。"""
+    if not BRIDGE_MGMT_URL:
+        return web.json_response({"error": "bridge not configured"}, status=503)
+
+    session: aiohttp.ClientSession = request.app["bridge_session"]
+    url = f"{BRIDGE_MGMT_URL}{path}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        if method == "GET":
+            resp = await session.get(url, timeout=timeout)
+        else:
+            resp = await session.post(url, timeout=timeout)
+        body = await resp.read()
+        return web.Response(
+            body=body,
+            status=resp.status,
+            content_type=resp.content_type or "application/json",
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"Bridge proxy error ({path}): {e}")
+        return web.json_response({"error": "bridge unavailable"}, status=502)
+
+
+async def handle_diarize_start(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/diarize/start")
+
+
+async def handle_diarize_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/diarize/status")
+
+
+async def handle_diarize_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/diarize/cancel")
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -367,14 +410,14 @@ async def on_startup(app: web.Application):
     logger.info("Initial sync: indexed %d new sessions", n)
 
     app["indexer"] = indexer
-
-    import asyncio
     app["sync_task"] = asyncio.create_task(indexer.periodic_sync())
+    app["bridge_session"] = aiohttp.ClientSession()
 
 
 async def on_cleanup(app: web.Application):
     app["sync_task"].cancel()
     await app["indexer"].close()
+    await app["bridge_session"].close()
 
 
 def create_app() -> web.Application:
@@ -409,6 +452,11 @@ def create_app() -> web.Application:
     app.router.add_post("/api/presets", handle_post_preset)
     app.router.add_put("/api/presets/{id}", handle_put_preset)
     app.router.add_delete("/api/presets/{id}", handle_delete_preset)
+
+    # Diarization プロキシ API
+    app.router.add_post("/api/diarize/start", handle_diarize_start)
+    app.router.add_get("/api/diarize/status", handle_diarize_status)
+    app.router.add_post("/api/diarize/cancel", handle_diarize_cancel)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

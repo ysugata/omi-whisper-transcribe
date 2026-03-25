@@ -765,6 +765,118 @@
         }
     });
 
+    // ============================================================
+    // Batch Diarization
+    // ============================================================
+
+    var diarizeBtn = document.getElementById("diarize-btn");
+    var diarizePanel = document.getElementById("diarize-panel");
+    var diarizeStatusText = document.getElementById("diarize-status-text");
+    var diarizeProgressText = document.getElementById("diarize-progress-text");
+    var diarizeCancelBtn = document.getElementById("diarize-cancel-btn");
+    var diarizeProgressFill = document.getElementById("diarize-progress-fill");
+    var diarizeCurrent = document.getElementById("diarize-current");
+    var diarizeTimer = null;
+
+    function checkDiarizeAvailability() {
+        fetch("/api/diarize/status").then(function (r) {
+            if (r.ok) {
+                diarizeBtn.classList.remove("hidden");
+                return r.json();
+            }
+            // 502/503 = bridge not available
+            diarizeBtn.classList.add("hidden");
+            return null;
+        }).then(function (state) {
+            if (state && state.running) {
+                showDiarizePanel(state);
+                startDiarizePolling();
+            }
+        }).catch(function () {
+            diarizeBtn.classList.add("hidden");
+        });
+    }
+
+    function showDiarizePanel(state) {
+        diarizePanel.classList.remove("hidden");
+        updateDiarizeUI(state);
+    }
+
+    function updateDiarizeUI(state) {
+        var done = (state.processed || 0) + (state.failed || 0);
+        var total = state.total || 0;
+        var pct = total > 0 ? Math.round(done / total * 100) : 0;
+
+        diarizeProgressFill.style.width = pct + "%";
+        diarizeProgressText.textContent = done + " / " + total;
+
+        if (state.running) {
+            diarizeStatusText.textContent = state.cancel_requested ? "Cancelling..." : "Processing...";
+            diarizeCancelBtn.style.display = "";
+            if (state.current_session) {
+                diarizeCurrent.textContent = state.current_session;
+            } else {
+                diarizeCurrent.textContent = "";
+            }
+        } else {
+            diarizeCancelBtn.style.display = "none";
+            diarizeCurrent.textContent = "";
+            if (state.finished_at) {
+                var msg = "Done: " + (state.processed || 0) + " processed";
+                if (state.failed > 0) msg += ", " + state.failed + " failed";
+                if (state.cancel_requested) msg += " (cancelled)";
+                diarizeStatusText.textContent = msg;
+            }
+        }
+    }
+
+    function startDiarizePolling() {
+        if (diarizeTimer) return;
+        diarizeTimer = setInterval(function () {
+            fetch("/api/diarize/status").then(function (r) { return r.json(); }).then(function (state) {
+                updateDiarizeUI(state);
+                if (!state.running) {
+                    clearInterval(diarizeTimer);
+                    diarizeTimer = null;
+                    // reload session list to reflect new diarization data
+                    loadPage(currentPage);
+                }
+            }).catch(function () {
+                clearInterval(diarizeTimer);
+                diarizeTimer = null;
+            });
+        }, 2000);
+    }
+
+    diarizeBtn.addEventListener("click", function () {
+        if (!confirm("Run speaker diarization on unprocessed recordings?")) return;
+
+        fetch("/api/diarize/start", { method: "POST" }).then(function (r) {
+            if (r.ok) {
+                return r.json().then(function () {
+                    showDiarizePanel({ running: true, total: 0, processed: 0, failed: 0 });
+                    startDiarizePolling();
+                });
+            }
+            return r.json().then(function (data) {
+                if (r.status === 409) {
+                    alert("Already running");
+                } else if (r.status === 503) {
+                    alert("HF_AUTH_TOKEN is not configured");
+                } else {
+                    alert("Error: " + (data.error || r.status));
+                }
+            });
+        }).catch(function (e) {
+            alert("Failed to start: " + e.message);
+        });
+    });
+
+    diarizeCancelBtn.addEventListener("click", function () {
+        fetch("/api/diarize/cancel", { method: "POST" }).catch(function () {});
+    });
+
     // --- Init ---
     loadPage(1);
+    checkDiarizeAvailability();
 })();

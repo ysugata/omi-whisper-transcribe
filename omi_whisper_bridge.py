@@ -118,9 +118,9 @@ if LLM_ENABLED and LLM_API_KEY:
         timeout=LLM_TIMEOUT,
     )
 
-# 話者分離
+# 話者分離 (HF_AUTH_TOKEN があれば常に利用可能)
 diarizer: Diarizer | None = None
-if DIARIZATION_ENABLED:
+if HF_AUTH_TOKEN:
     diarizer = Diarizer(
         hf_token=HF_AUTH_TOKEN,
         language=LANGUAGE or "ja",
@@ -623,6 +623,151 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
 
 
 # ============================================================
+# バッチ話者分離
+# ============================================================
+
+_batch_state = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "current_session": None,
+    "errors": [],
+    "cancel_requested": False,
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def _find_undiarized_sessions() -> list[dict]:
+    """RECORDINGS_DIR 配下の未 diarize セッションを古い順に返す。"""
+    base = Path(RECORDINGS_DIR)
+    if not base.exists():
+        return []
+
+    sessions = []
+    for day_dir in sorted(base.iterdir()):
+        if not day_dir.is_dir():
+            continue
+        for time_dir in sorted(day_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+            try:
+                with open(transcript_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            session_info = data.get("session", {})
+            if session_info.get("diarized"):
+                continue
+
+            # 音声ファイル特定
+            audio_file = session_info.get("audio_file", "audio.ogg")
+            audio_path = time_dir / audio_file
+            if not audio_path.exists():
+                # fallback
+                for ext in ("audio.ogg", "audio.wav"):
+                    alt = time_dir / ext
+                    if alt.exists():
+                        audio_path = alt
+                        break
+                else:
+                    continue
+
+            segments = data.get("segments", [])
+            if not segments:
+                continue
+
+            sessions.append({
+                "path": f"{day_dir.name}/{time_dir.name}",
+                "audio": audio_path,
+                "transcript_path": transcript_path,
+                "data": data,
+            })
+
+    return sessions
+
+
+async def _batch_diarize_task():
+    """バッチ話者分離タスク。asyncio.create_task で起動する。"""
+    _batch_state["running"] = True
+    _batch_state["processed"] = 0
+    _batch_state["failed"] = 0
+    _batch_state["skipped"] = 0
+    _batch_state["current_session"] = None
+    _batch_state["errors"] = []
+    _batch_state["cancel_requested"] = False
+    _batch_state["started_at"] = datetime.now().isoformat()
+    _batch_state["finished_at"] = None
+
+    try:
+        sessions = _find_undiarized_sessions()
+        _batch_state["total"] = len(sessions)
+        log.info(f"Batch diarization: {len(sessions)} session(s) to process")
+
+        if not sessions:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        for sess in sessions:
+            if _batch_state["cancel_requested"]:
+                log.info("Batch diarization cancelled by user")
+                break
+
+            _batch_state["current_session"] = sess["path"]
+            log.info(f"Batch diarize: {sess['path']}")
+
+            try:
+                async with model_manager.gpu_lock:
+                    await model_manager.unload_model()
+
+                    updated = await loop.run_in_executor(
+                        None,
+                        lambda s=sess: diarizer.diarize(
+                            str(s["audio"]), s["data"]["segments"]
+                        ),
+                    )
+
+                # transcript.json を更新
+                data = sess["data"]
+                data["segments"] = updated
+                data["session"]["diarized"] = True
+                speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
+                data["session"]["num_speakers"] = len(speakers)
+
+                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+
+                _batch_state["processed"] += 1
+                log.info(f"Batch diarize done: {sess['path']} ({len(speakers)} speakers)")
+
+            except Exception as e:
+                _batch_state["failed"] += 1
+                err_msg = f"{sess['path']}: {e}"
+                _batch_state["errors"].append(err_msg)
+                log.error(f"Batch diarize error: {err_msg}", exc_info=True)
+
+    except Exception as e:
+        log.error(f"Batch diarization task error: {e}", exc_info=True)
+    finally:
+        _batch_state["running"] = False
+        _batch_state["current_session"] = None
+        _batch_state["finished_at"] = datetime.now().isoformat()
+        log.info(
+            f"Batch diarization finished: "
+            f"processed={_batch_state['processed']}, "
+            f"failed={_batch_state['failed']}, "
+            f"total={_batch_state['total']}"
+        )
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -813,7 +958,7 @@ async def handle_connection(websocket):
         model_manager.release()
 
         # 話者分離 (バックグラウンドで実行、新セッションをブロックしない)
-        if (diarizer and diarizer.enabled
+        if (DIARIZATION_ENABLED and diarizer and diarizer.enabled
                 and recorder is not None
                 and recorder.enabled
                 and not recorder._finalized
@@ -857,10 +1002,10 @@ async def main():
         reason = "DISABLED" if not LLM_ENABLED else "no GEMINI_API_KEY"
         log.info(f"Layer 3 LLM: {reason}")
     if diarizer and diarizer.enabled:
-        log.info("Diarization: ENABLED (WhisperX)")
+        auto = "auto-ON" if DIARIZATION_ENABLED else "manual-only"
+        log.info(f"Diarization: AVAILABLE ({auto})")
     else:
-        reason = "DISABLED" if not DIARIZATION_ENABLED else "no HF_AUTH_TOKEN"
-        log.info(f"Diarization: {reason}")
+        log.info("Diarization: UNAVAILABLE (no HF_AUTH_TOKEN)")
     log.info(f"Audio saving: {'ON -> ' + RECORDINGS_DIR if SAVE_AUDIO else 'OFF'}")
     log.info(f"Silence: threshold={SILENCE_THRESHOLD}, timeout={SILENCE_TIMEOUT}s"
              f"{' (DISABLED)' if SILENCE_THRESHOLD <= 0 else ''}")
@@ -890,10 +1035,33 @@ async def main():
     async def handle_model_status(request):
         return web.json_response(model_manager.status())
 
+    async def handle_batch_start(request):
+        if diarizer is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        if _batch_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409,
+            )
+        asyncio.create_task(_batch_diarize_task())
+        return web.json_response({"status": "started"})
+
+    async def handle_batch_status(request):
+        return web.json_response(_batch_state)
+
+    async def handle_batch_cancel(request):
+        if _batch_state["running"]:
+            _batch_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)
+    mgmt_app.router.add_post("/diarize/start", handle_batch_start)
+    mgmt_app.router.add_get("/diarize/status", handle_batch_status)
+    mgmt_app.router.add_post("/diarize/cancel", handle_batch_cancel)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()
