@@ -1,0 +1,33 @@
+services:
+  omi-whisper:
+    build: .
+    container_name: omi-whisper-transcribe
+    ports:
+      - "${PORT:-8090}:${PORT:-8090}"
+      - "${MANAGEMENT_PORT:-8091}:${MANAGEMENT_PORT:-8091}"
+    volumes:
+      - whisper-models:/models
+      - ./recordings:/app/recordings
+    environment:
+      - HF_HOME=/models
+      - OMI_WHISPER_TOKEN=${OMI_WHISPER_TOKEN:-}
+      # --- 以下は任意: デフォルト値を上書きする場合のみ設定 ---
+      # - WHISPER_MODEL=large-v3        # tiny, base, small, medium, large-v3
+      # - COMPUTE_TYPE=int8_float16     # float16, int8_float16, int8
+      # - LANGUAGE=ja                   # ja, en, auto
+      # - BEAM_SIZE=5
+      # - VAD_FILTER=true
+      # - BUFFER_SECONDS=3.0
+      # - SAVE_AUDIO=true
+      # - MAX_RECORDING_DAYS=30
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  whisper-models:

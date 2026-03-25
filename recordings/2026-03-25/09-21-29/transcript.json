@@ -1,0 +1,22 @@
+{
+  "session": {
+    "start": "2026-03-25T09:21:29.400290",
+    "end": "2026-03-25T09:24:52.702345",
+    "duration_seconds": 202.6,
+    "audio_file": "audio.wav",
+    "audio_size_mb": 6.2,
+    "model": "large-v3",
+    "language": "ja"
+  },
+  "segments": [
+    {
+      "text": "ご視聴ありがとうございました",
+      "speaker": "SPEAKER_00",
+      "speaker_id": 0,
+      "start": 186.5,
+      "end": 216.48,
+      "is_user": true,
+      "person_id": null
+    }
+  ]
+}
