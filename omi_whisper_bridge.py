@@ -52,6 +52,10 @@ SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "true").lower() in ("true", "1", "yes"
 RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "./recordings")        # 保存先ディレクトリ
 MAX_RECORDING_DAYS = int(os.environ.get("MAX_RECORDING_DAYS", "30"))     # 自動削除: この日数より古い録音を起動時に削除 (0=無効)
 
+# --- 無音検出設定 ---
+SILENCE_THRESHOLD = int(os.environ.get("SILENCE_THRESHOLD", "200"))      # int16 RMS 閾値 (0=無効)
+SILENCE_TIMEOUT = float(os.environ.get("SILENCE_TIMEOUT", "30.0"))       # 無音タイムアウト秒数
+
 # --- 認証設定 (Cloudflare Tunnel 経由で公開する場合) ---
 AUTH_TOKEN = os.environ.get("OMI_WHISPER_TOKEN", "")                     # 空文字 = 認証なし (LAN内専用)
 # トークン生成例: python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -199,6 +203,14 @@ class SessionRecorder:
 # 音声バッファ → 文字起こし
 # ============================================================
 
+def calc_rms_int16(pcm_bytes: bytes) -> float:
+    """PCM int16 バイト列の RMS (Root Mean Square) を計算"""
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if len(samples) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+
+
 def transcribe_audio(audio_bytes: bytes, model, session_offset: float = 0.0) -> list[dict]:
     """
     PCM 16-bit LE の音声バイト列を受け取り、
@@ -272,6 +284,7 @@ async def handle_connection(websocket):
     session_start = time.time()
     total_audio_seconds = 0.0
     recorder = SessionRecorder()
+    silent_since = None  # 無音開始時刻 (None = 発話中)
 
     # モデル確保 (未ロードなら自動ロード)
     try:
@@ -300,15 +313,57 @@ async def handle_connection(websocket):
             # バイナリ = 音声データ
             audio_buffer.extend(message)
 
-            # 音声を録音ファイルに書き込み
-            recorder.write_audio(message)
-
             buffer_duration = len(audio_buffer) / (SAMPLE_RATE * 2)
 
-            # バッファが指定秒数に達したら文字起こし
+            # バッファが指定秒数に達したら処理
             if buffer_duration >= BUFFER_SECONDS:
                 chunk = bytes(audio_buffer)
                 audio_buffer.clear()
+
+                # --- 無音検出 ---
+                if SILENCE_THRESHOLD > 0:
+                    rms = calc_rms_int16(chunk)
+
+                    if rms < SILENCE_THRESHOLD:
+                        # 無音バッファ
+                        if silent_since is None:
+                            silent_since = time.time()
+                            log.debug(f"Silence started (RMS={rms:.0f})")
+
+                        elapsed_silence = time.time() - silent_since
+
+                        # タイムアウト → 録音セッション自動終了
+                        if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
+                            recorder.finalize()
+                            log.info(
+                                f"Session finalized due to silence timeout "
+                                f"({elapsed_silence:.0f}s silent)"
+                            )
+                            recorder = None
+
+                        total_audio_seconds += buffer_duration
+                        log.debug(
+                            f"Silent buffer skipped (RMS={rms:.0f}, "
+                            f"silent={elapsed_silence:.0f}s)"
+                        )
+                        continue
+
+                    # 発話あり → silent_since リセット
+                    if silent_since is not None:
+                        log.info(
+                            f"Speech resumed after "
+                            f"{time.time() - silent_since:.0f}s of silence (RMS={rms:.0f})"
+                        )
+                        silent_since = None
+
+                    # 録音セッションが終了していたら新規作成
+                    if recorder is None:
+                        recorder = SessionRecorder()
+                        log.info("New recording session started (speech detected)")
+
+                # 音声を録音ファイルに書き込み
+                if recorder is not None:
+                    recorder.write_audio(chunk)
 
                 log.info(f"Transcribing {buffer_duration:.1f}s of audio...")
                 t0 = time.time()
@@ -330,7 +385,8 @@ async def handle_connection(websocket):
                     await websocket.send(json.dumps(response))
 
                     # 文字起こし結果を録音ログに追加
-                    recorder.add_segments(segments)
+                    if recorder is not None:
+                        recorder.add_segments(segments)
 
                     log.info(
                         f"Sent {len(segments)} segment(s) "
@@ -345,23 +401,34 @@ async def handle_connection(websocket):
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
     finally:
-        # 残りバッファの処理 (WAV には受信時に既に書き込み済みなので文字起こしのみ)
+        # 残りバッファの処理
         if len(audio_buffer) > SAMPLE_RATE:
-            log.info("Processing remaining buffer...")
-            try:
-                segments = transcribe_audio(bytes(audio_buffer), model, total_audio_seconds)
-                if segments:
-                    recorder.add_segments(segments)
-                    try:
-                        response = {"segments": segments}
-                        await websocket.send(json.dumps(response))
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.error(f"Error processing remaining buffer: {e}", exc_info=True)
+            # 無音検出が有効なら残りバッファもチェック
+            remaining = bytes(audio_buffer)
+            is_speech = (SILENCE_THRESHOLD <= 0 or
+                         calc_rms_int16(remaining) >= SILENCE_THRESHOLD)
+
+            if is_speech:
+                if recorder is None:
+                    recorder = SessionRecorder()
+                recorder.write_audio(remaining)
+
+                log.info("Processing remaining buffer...")
+                try:
+                    segments = transcribe_audio(remaining, model, total_audio_seconds)
+                    if segments:
+                        recorder.add_segments(segments)
+                        try:
+                            response = {"segments": segments}
+                            await websocket.send(json.dumps(response))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.error(f"Error processing remaining buffer: {e}", exc_info=True)
 
         # セッション録音を確定 (WAV クローズ + JSON 書き出し)
-        recorder.finalize()
+        if recorder is not None:
+            recorder.finalize()
 
         duration = time.time() - session_start
         log.info(
@@ -382,6 +449,8 @@ async def main():
     log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
     log.info(f"Audio saving: {'ON -> ' + RECORDINGS_DIR if SAVE_AUDIO else 'OFF'}")
+    log.info(f"Silence: threshold={SILENCE_THRESHOLD}, timeout={SILENCE_TIMEOUT}s"
+             f"{' (DISABLED)' if SILENCE_THRESHOLD <= 0 else ''}")
     log.info(f"Auth: {'TOKEN required' if AUTH_TOKEN else 'DISABLED (LAN only)'}")
     log.info(f"Management API: http://0.0.0.0:{MANAGEMENT_PORT}")
     log.info("Model will be loaded on-demand (GPU not used until first connection)")
