@@ -24,12 +24,10 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 
 ## クイックスタート
 
-[gpu-shared](../gpu-shared/) 経由でデプロイします。
-
 ### 1. .env 設定
 
 ```bash
-cd gpu-shared
+cd omi_whisper_transcribe
 cp .env.example .env
 # .env を編集して以下を設定:
 #   HF_AUTH_TOKEN=hf_xxx    (話者分離を使う場合、pyannote の利用規約同意が必要)
@@ -50,6 +48,9 @@ docker compose up -d --build
 # ログ
 docker compose logs -f omi-whisper
 
+# 管理 API でモデル状態を確認
+curl http://localhost:8091/model/status
+
 # Viewer (録音一覧 + バッチ話者分離)
 open http://localhost:8092
 ```
@@ -59,7 +60,7 @@ open http://localhost:8092
 | ポート | プロトコル | 用途 |
 |--------|-----------|------|
 | 8090 | WebSocket | 音声受信 + 文字起こし結果送信 |
-| 8091 | HTTP | 管理 API (内部、gpu-shared 経由) |
+| 8091 | HTTP | 管理 API |
 | 8092 | HTTP | 録音 Viewer |
 
 ## 管理 API (port 8091)
@@ -157,6 +158,11 @@ Viewer の「Diarize」ボタンから、未処理の全録音に対して一括
 - バッチ話者分離 (上記参照)
 - 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット)
 - 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
+
+## GPU 共有デプロイ
+
+qwen-tts と GPU を共有する場合は [gpu-shared](../gpu-shared/) を使用してください。
+omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて外部から制御されます。
 
 ## Cloudflare Tunnel
 
