@@ -590,6 +590,39 @@ def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
 
 
 # ============================================================
+# バックグラウンド話者分離
+# ============================================================
+
+async def _run_diarization_bg(recorder: SessionRecorder) -> None:
+    """セッション終了後にバックグラウンドで話者分離 → finalize を実行する。
+
+    gpu_lock を取得してから実行するため、diarization 中に新セッションの
+    acquire() が呼ばれても、diarization 完了まで待機する。
+    """
+    try:
+        async with model_manager.gpu_lock:
+            unloaded = await model_manager.unload_model()
+            if not unloaded:
+                log.info("Skipping diarization (other sessions active)")
+                recorder.finalize()
+                return
+
+            log.info("Running post-session diarization (background)...")
+            loop = asyncio.get_running_loop()
+            updated = await loop.run_in_executor(
+                None,
+                lambda: diarizer.diarize(
+                    str(recorder.wav_path), recorder.all_segments
+                ),
+            )
+            recorder.all_segments = updated
+    except Exception as e:
+        log.error(f"Diarization error: {e}", exc_info=True)
+    finally:
+        recorder.finalize()
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -779,33 +812,18 @@ async def handle_connection(websocket):
         # セッション終了: whisper モデルを解放
         model_manager.release()
 
-        # 話者分離 (セッション終了時に完全な WAV に対して実行)
+        # 話者分離 (バックグラウンドで実行、新セッションをブロックしない)
         if (diarizer and diarizer.enabled
                 and recorder is not None
                 and recorder.enabled
                 and not recorder._finalized
                 and recorder.total_bytes > 0):
             recorder.close_audio()
-            unloaded = await model_manager.unload_model()
-            if unloaded:
-                log.info("Running post-session diarization...")
-                try:
-                    loop = asyncio.get_running_loop()
-                    updated = await loop.run_in_executor(
-                        None,
-                        lambda: diarizer.diarize(
-                            str(recorder.wav_path), recorder.all_segments
-                        ),
-                    )
-                    recorder.all_segments = updated
-                except Exception as e:
-                    log.error(f"Diarization error: {e}", exc_info=True)
-            else:
-                log.info("Skipping diarization (other sessions active)")
-
-        # セッション録音を確定 (OGG 変換 + JSON 書き出し)
-        if recorder is not None:
-            recorder.finalize()
+            asyncio.create_task(_run_diarization_bg(recorder))
+        else:
+            # diarization なし → 即 finalize
+            if recorder is not None:
+                recorder.finalize()
 
         duration = time.time() - session_start
         log.info(

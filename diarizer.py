@@ -88,6 +88,7 @@ class Diarizer:
         """話者分離パイプラインの実体。同期メソッド (executor から呼ぶ)。"""
         import torch
         import whisperx
+        from whisperx.diarize import DiarizationPipeline
 
         log.info(f"Starting diarization: {audio_path}")
 
@@ -123,7 +124,7 @@ class Diarizer:
 
         # --- Step 2: Diarization (pyannote) ---
         log.info("Step 2/3: Loading diarization model (pyannote)...")
-        diarize_model = whisperx.DiarizationPipeline(
+        diarize_model = DiarizationPipeline(
             use_auth_token=self._hf_token,
             device=self._device,
         )

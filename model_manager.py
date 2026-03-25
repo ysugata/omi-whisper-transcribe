@@ -30,6 +30,7 @@ class ModelManager:
         self._executor: ThreadPoolExecutor | None = None
         self._session_count = 0
         self._lock = asyncio.Lock()
+        self._gpu_lock = asyncio.Lock()  # diarization 等の排他 GPU 処理用
 
         log.info(f"ModelManager initialized: model={model_name}, compute={compute_type}")
 
@@ -41,6 +42,11 @@ class ModelManager:
     def session_count(self) -> int:
         return self._session_count
 
+    @property
+    def gpu_lock(self) -> asyncio.Lock:
+        """排他 GPU 処理用ロック。diarization 等で使用。"""
+        return self._gpu_lock
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -48,23 +54,25 @@ class ModelManager:
     async def acquire(self) -> tuple:
         """
         WS 接続時に呼ぶ。未ロードなら自動ロード。
+        GPU 排他ロック (diarization 等) が解放されるまで待機する。
 
         Returns: (model, executor)
         """
-        async with self._lock:
-            self._session_count += 1
-            log.info(f"acquire: session_count={self._session_count}")
+        async with self._gpu_lock:
+            async with self._lock:
+                self._session_count += 1
+                log.info(f"acquire: session_count={self._session_count}")
 
-            if self._model is not None:
+                if self._model is not None:
+                    return self._model, self._executor
+
+                try:
+                    await self._load_model()
+                except BaseException:
+                    self._session_count -= 1
+                    raise
+
                 return self._model, self._executor
-
-            try:
-                await self._load_model()
-            except BaseException:
-                self._session_count -= 1
-                raise
-
-            return self._model, self._executor
 
     def release(self):
         """WS 切断時に呼ぶ。"""
