@@ -32,6 +32,7 @@ _PROMPT_SETTINGS_PATH = Path(CONFIG_DIR) / "prompt_settings.json"
 _PENDING_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_suggestions.json"
 _PROMPT_PRESETS_PATH = Path(CONFIG_DIR) / "prompt_presets.json"
 _AUTO_DETECTED_PATH = Path(CONFIG_DIR) / "auto_detected_terms.json"
+_HOTWORDS_CUSTOM_PATH = Path(CONFIG_DIR) / "hotwords_custom.json"
 
 # 初期辞書 (term_corrector.py と同じもの、viewer 単体でも初期生成できるように)
 _INITIAL_DICT = {
@@ -248,6 +249,12 @@ async def handle_approve_suggestion(request: web.Request) -> web.Response:
     terms[target["wrong"]] = target["correct"]
     _write_json(_TERM_CORRECTIONS_PATH, terms)
 
+    # hotwords custom にも正解語を追加 (デコーダバイアスで認識改善)
+    custom_hw = _read_json(_HOTWORDS_CUSTOM_PATH, [])
+    if target["correct"] not in custom_hw:
+        custom_hw.append(target["correct"])
+        _write_json(_HOTWORDS_CUSTOM_PATH, custom_hw)
+
     # auto_detected に記録
     auto_detected = _read_json(_AUTO_DETECTED_PATH, [])
     if target["wrong"] not in auto_detected:
@@ -258,7 +265,7 @@ async def handle_approve_suggestion(request: web.Request) -> web.Response:
     suggestions = [s for s in suggestions if s["id"] != sid]
     _write_json(_PENDING_SUGGESTIONS_PATH, suggestions)
 
-    logger.info(f"Suggestion approved: {target['wrong']} → {target['correct']}")
+    logger.info(f"Suggestion approved: {target['wrong']} → {target['correct']} (also added to hotwords)")
     return web.json_response({"status": "ok"})
 
 
@@ -375,7 +382,21 @@ async def _proxy_bridge(request: web.Request, method: str, path: str) -> web.Res
         if method == "GET":
             resp = await session.get(url, timeout=timeout)
         else:
-            resp = await session.post(url, timeout=timeout)
+            # POST/PUT/DELETE ボディを転送
+            req_body = None
+            req_headers = {}
+            try:
+                req_body = await request.read()
+                if req_body:
+                    req_headers["Content-Type"] = request.content_type or "application/json"
+            except Exception:
+                pass
+            if method == "PUT":
+                resp = await session.put(url, data=req_body, headers=req_headers, timeout=timeout)
+            elif method == "DELETE":
+                resp = await session.delete(url, data=req_body, headers=req_headers, timeout=timeout)
+            else:
+                resp = await session.post(url, data=req_body, headers=req_headers, timeout=timeout)
         body = await resp.read()
         return web.Response(
             body=body,
@@ -397,6 +418,30 @@ async def handle_diarize_status(request: web.Request) -> web.Response:
 
 async def handle_diarize_cancel(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/diarize/cancel")
+
+
+# ============================================================
+# Hotwords プロキシ API (Bridge へ中継)
+# ============================================================
+
+async def handle_hotwords_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/hotwords/status")
+
+
+async def handle_hotwords_settings_get(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/hotwords/settings")
+
+
+async def handle_hotwords_settings_put(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "PUT", "/hotwords/settings")
+
+
+async def handle_hotwords_custom_post(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/hotwords/custom")
+
+
+async def handle_hotwords_custom_delete(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "DELETE", "/hotwords/custom")
 
 
 # ============================================================
@@ -457,6 +502,13 @@ def create_app() -> web.Application:
     app.router.add_post("/api/diarize/start", handle_diarize_start)
     app.router.add_get("/api/diarize/status", handle_diarize_status)
     app.router.add_post("/api/diarize/cancel", handle_diarize_cancel)
+
+    # Hotwords プロキシ API
+    app.router.add_get("/api/hotwords/status", handle_hotwords_status)
+    app.router.add_get("/api/hotwords/settings", handle_hotwords_settings_get)
+    app.router.add_put("/api/hotwords/settings", handle_hotwords_settings_put)
+    app.router.add_post("/api/hotwords/custom", handle_hotwords_custom_post)
+    app.router.add_delete("/api/hotwords/custom", handle_hotwords_custom_delete)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

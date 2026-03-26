@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "max_total": 500,
+  "categories": {
+    "place": {
+      "enabled": true,
+      "max": 200
+    },
+    "company": {
+      "enabled": true,
+      "max": 100
+    },
+    "station": {
+      "enabled": true,
+      "max": 100
+    },
+    "surname": {
+      "enabled": false,
+      "max": 50
+    },
+    "given": {
+      "enabled": false,
+      "max": 50
+    },
+    "product": {
+      "enabled": true,
+      "max": 50
+    }
+  }
+}

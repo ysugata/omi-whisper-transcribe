@@ -93,6 +93,9 @@ VAD_SPEECH_PAD_MS = int(os.environ.get("VAD_SPEECH_PAD_MS", "300"))           # 
 SILENCE_THRESHOLD = int(os.environ.get("SILENCE_THRESHOLD", "200"))      # int16 RMS 閾値 (0=無効)
 SILENCE_TIMEOUT = float(os.environ.get("SILENCE_TIMEOUT", "30.0"))       # 無音タイムアウト秒数
 
+# --- Hotwords 設定 ---
+HOTWORDS_ENABLED = os.environ.get("HOTWORDS_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # --- 認証設定 (Cloudflare Tunnel 経由で公開する場合) ---
 AUTH_TOKEN = os.environ.get("OMI_WHISPER_TOKEN", "")                     # 空文字 = 認証なし (LAN内専用)
 # トークン生成例: python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -116,6 +119,7 @@ from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
 from diarizer import Diarizer
 from audio_preprocessor import AudioPreprocessor
+from hotword_loader import HotwordLoader
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _PROMPT_SETTINGS_PATH = os.path.join(CONFIG_DIR, "prompt_settings.json")
@@ -149,14 +153,20 @@ if NORMALIZE_ENABLED:
         normalize_target_dbfs=NORMALIZE_TARGET_DBFS,
     )
 
+# Hotwords ローダー
+hotword_loader = HotwordLoader(CONFIG_DIR)
+
 
 def _get_initial_prompt() -> str:
     """セッション開始時に initial_prompt を決定する。
 
     優先順位:
-    1. prompt_settings.json がある場合、その内容から構築
+    1. prompt_settings.json がある場合、その内容から構築 (topic, participants のみ)
     2. INITIAL_PROMPT 環境変数
     3. デフォルトの短いプロンプト
+
+    固有名詞・用語の認識は hotwords (デコーダバイアス) で処理するため、
+    initial_prompt には含めない。
     """
     try:
         if os.path.exists(_PROMPT_SETTINGS_PATH):
@@ -165,7 +175,6 @@ def _get_initial_prompt() -> str:
             prompt = build_prompt(
                 topic=settings.get("topic", ""),
                 participants=settings.get("participants", []),
-                terms=settings.get("terms", []),
             )
             if prompt:
                 log.info(f"Prompt from settings: {prompt[:80]}...")
@@ -182,7 +191,7 @@ def _get_initial_prompt() -> str:
 def _get_known_terms() -> list[str]:
     """LLM 補正用の参考用語リストを構築する。
 
-    prompt_settings の terms + term_corrector の正解語をマージ。
+    term_corrector の正解語 + hotwords カスタム語をマージ。
     """
     terms: set[str] = set()
 
@@ -190,15 +199,9 @@ def _get_known_terms() -> list[str]:
     for v in term_corrector.list_corrections().values():
         terms.add(v)
 
-    # prompt_settings の terms
-    try:
-        if os.path.exists(_PROMPT_SETTINGS_PATH):
-            with open(_PROMPT_SETTINGS_PATH, encoding="utf-8") as f:
-                settings = json.load(f)
-            for t in settings.get("terms", []):
-                terms.add(t)
-    except (json.JSONDecodeError, OSError):
-        pass
+    # hotwords のカスタム語
+    for w in hotword_loader.get_custom_words():
+        terms.add(w)
 
     return sorted(terms)
 
@@ -509,6 +512,7 @@ def transcribe_audio(
     session_offset: float = 0.0,
     initial_prompt: str = "",
     known_terms: list[str] | None = None,
+    hotwords: str = "",
 ) -> list[dict]:
     """PCM 16-bit LE の音声バイト列を受け取り、
     Omi の custom_stt が期待する segments リストを返す。
@@ -519,6 +523,7 @@ def transcribe_audio(
         session_offset: タイムスタンプオフセット (秒)
         initial_prompt: Layer 1 で構築した initial_prompt
         known_terms: Layer 3 LLM 補正用の参考用語リスト
+        hotwords: カンマ区切りの hotwords 文字列 (デコーダバイアス用)
     """
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -531,19 +536,21 @@ def transcribe_audio(
 
     segments_out = []
 
+    chunk_duration = len(audio_np) / SAMPLE_RATE
+
     # transcribe パラメータ構築
     transcribe_kwargs = dict(
         beam_size=BEAM_SIZE,
         language=LANGUAGE,
         vad_filter=VAD_FILTER,
         vad_parameters=dict(
-            min_speech_duration_ms=100,
+            min_speech_duration_ms=250,
             min_silence_duration_ms=500,
             speech_pad_ms=200,
-            threshold=0.35,
+            threshold=0.4,
         ),
         word_timestamps=False,
-        condition_on_previous_text=True,
+        condition_on_previous_text=False,
         no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
         compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
         log_prob_threshold=LOG_PROB_THRESHOLD,
@@ -551,14 +558,24 @@ def transcribe_audio(
     )
     if initial_prompt:
         transcribe_kwargs["initial_prompt"] = initial_prompt
+    if hotwords:
+        transcribe_kwargs["hotwords"] = hotwords
 
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
     for seg in segments:
-        # 確信度フィルタ: 両方悪い場合のみ除去 (Silero VAD で事前検証済み)
-        if seg.avg_logprob < -0.7 and seg.no_speech_prob > 0.6:
+        # 確信度フィルタ 1: 非常に高い無音確率 → 単独で除去
+        if seg.no_speech_prob > 0.85:
             log.info(
-                f"Segment FILTERED: avg_logprob={seg.avg_logprob:.2f}, "
+                f"Segment FILTERED (high no_speech): no_speech_prob={seg.no_speech_prob:.2f}, "
+                f"text='{seg.text.strip()[:80]}'"
+            )
+            continue
+
+        # 確信度フィルタ 2: 両方悪い場合に除去
+        if seg.avg_logprob < -0.7 and seg.no_speech_prob > 0.5:
+            log.info(
+                f"Segment FILTERED (low quality): avg_logprob={seg.avg_logprob:.2f}, "
                 f"no_speech_prob={seg.no_speech_prob:.2f}, text='{seg.text.strip()[:80]}'"
             )
             continue
@@ -566,6 +583,20 @@ def transcribe_audio(
         text = seg.text.strip()
         if not text:
             continue
+
+        # 短すぎるセグメントでかつ信頼度が低い場合は除去
+        if len(text) <= 1:
+            log.debug(f"Single-char segment dropped: '{text}'")
+            continue
+        if len(text) <= 3 and seg.avg_logprob < -0.5:
+            log.debug(f"Short low-confidence segment dropped: '{text}' (logprob={seg.avg_logprob:.2f})")
+            continue
+
+        # タイムスタンプをチャンク長にクランプ
+        seg_start = max(0.0, min(seg.start, chunk_duration))
+        seg_end = max(0.0, min(seg.end, chunk_duration))
+        if seg_start >= seg_end:
+            seg_end = min(seg_start + 0.5, chunk_duration)  # 最小 0.5s
 
         # ハルシネーション除去
         cleaned = _remove_hallucinations(text)
@@ -585,8 +616,8 @@ def transcribe_audio(
             "text": text,
             "speaker": "SPEAKER_00",
             "speaker_id": 0,
-            "start": round(seg.start + session_offset, 2),
-            "end": round(seg.end + session_offset, 2),
+            "start": round(seg_start + session_offset, 2),
+            "end": round(seg_end + session_offset, 2),
             "is_user": True,
             "person_id": None,
         })
@@ -638,13 +669,17 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
 
             log.info("Running post-session diarization (background)...")
             loop = asyncio.get_running_loop()
-            updated = await loop.run_in_executor(
+            updated, success = await loop.run_in_executor(
                 None,
                 lambda: diarizer.diarize(
                     str(recorder.wav_path), recorder.all_segments
                 ),
             )
-            recorder.all_segments = updated
+            if success:
+                recorder.all_segments = updated
+                log.info("Post-session diarization succeeded")
+            else:
+                log.warning("Post-session diarization failed, keeping original segments")
     except Exception as e:
         log.error(f"Diarization error: {e}", exc_info=True)
     finally:
@@ -669,8 +704,11 @@ _batch_state = {
 }
 
 
-def _find_undiarized_sessions() -> list[dict]:
-    """RECORDINGS_DIR 配下の未 diarize セッションを古い順に返す。"""
+def _find_undiarized_sessions(force: bool = False) -> list[dict]:
+    """RECORDINGS_DIR 配下の未 diarize セッションを古い順に返す。
+
+    force=True の場合、既に diarized=True のセッションも含める (再実行用)。
+    """
     base = Path(RECORDINGS_DIR)
     if not base.exists():
         return []
@@ -692,7 +730,7 @@ def _find_undiarized_sessions() -> list[dict]:
                 continue
 
             session_info = data.get("session", {})
-            if session_info.get("diarized"):
+            if not force and session_info.get("diarized"):
                 continue
 
             # 音声ファイル特定
@@ -722,8 +760,10 @@ def _find_undiarized_sessions() -> list[dict]:
     return sessions
 
 
-async def _batch_diarize_task():
+async def _batch_diarize_task(force: bool = False):
     """バッチ話者分離タスク。asyncio.create_task で起動する。"""
+    import shutil
+
     _batch_state["running"] = True
     _batch_state["processed"] = 0
     _batch_state["failed"] = 0
@@ -735,9 +775,9 @@ async def _batch_diarize_task():
     _batch_state["finished_at"] = None
 
     try:
-        sessions = _find_undiarized_sessions()
+        sessions = _find_undiarized_sessions(force=force)
         _batch_state["total"] = len(sessions)
-        log.info(f"Batch diarization: {len(sessions)} session(s) to process")
+        log.info(f"Batch diarization: {len(sessions)} session(s) to process (force={force})")
 
         if not sessions:
             return
@@ -756,14 +796,24 @@ async def _batch_diarize_task():
                 async with model_manager.gpu_lock:
                     await model_manager.unload_model()
 
-                    updated = await loop.run_in_executor(
+                    updated, success = await loop.run_in_executor(
                         None,
                         lambda s=sess: diarizer.diarize(
                             str(s["audio"]), s["data"]["segments"]
                         ),
                     )
 
-                # transcript.json を更新
+                if not success:
+                    _batch_state["failed"] += 1
+                    err_msg = f"{sess['path']}: diarization failed (see logs)"
+                    _batch_state["errors"].append(err_msg)
+                    log.warning(f"Batch diarize failed: {sess['path']}")
+                    continue
+
+                # バックアップを作成してから transcript.json を更新
+                bak_path = str(sess["transcript_path"]) + ".bak"
+                shutil.copy2(sess["transcript_path"], bak_path)
+
                 data = sess["data"]
                 data["segments"] = updated
                 data["session"]["diarized"] = True
@@ -842,6 +892,12 @@ async def handle_connection(websocket):
     session_prompt = _get_initial_prompt()
     # Layer 3 用の参考用語リスト
     session_known_terms = _get_known_terms() if llm_corrector else None
+    # Hotwords (デコーダバイアス)
+    session_hotwords = ""
+    if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
+        session_hotwords = hotword_loader.get_hotwords_string()
+        if session_hotwords:
+            log.info(f"Hotwords: {hotword_loader.get_count()} terms active")
 
     # モデル確保 (未ロードなら自動ロード)
     try:
@@ -876,7 +932,7 @@ async def handle_connection(websocket):
         loop = asyncio.get_running_loop()
         raw_segments = await loop.run_in_executor(
             executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms),
+            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms, session_hotwords),
         )
 
         elapsed = time.time() - t0
@@ -1026,7 +1082,7 @@ async def handle_connection(websocket):
 
                 log.info("Processing remaining buffer...")
                 try:
-                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_known_terms)
+                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_known_terms, session_hotwords)
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
@@ -1091,6 +1147,15 @@ async def main():
     else:
         log.info("Diarization: UNAVAILABLE (no HF_AUTH_TOKEN)")
     log.info(f"Normalize: {'ON (' + str(NORMALIZE_TARGET_DBFS) + 'dBFS)' if audio_preprocessor else 'OFF'}")
+    if HOTWORDS_ENABLED:
+        hw_settings = hotword_loader.get_settings()
+        if hw_settings.get("enabled", True):
+            log.info(f"Hotwords: {hotword_loader.get_count()} terms loaded "
+                     f"({len(hotword_loader.get_custom_words())} custom)")
+        else:
+            log.info("Hotwords: DISABLED (settings)")
+    else:
+        log.info("Hotwords: DISABLED (env)")
     if VAD_SEG_ENABLED:
         log.info(f"VAD segmentation: ON (check={VAD_CHECK_INTERVAL}s, "
                  f"silence_trigger={VAD_SILENCE_TRIGGER}s, max_buffer={VAD_MAX_BUFFER}s)")
@@ -1134,8 +1199,25 @@ async def main():
             return web.json_response(
                 {"error": "already running"}, status=409,
             )
-        asyncio.create_task(_batch_diarize_task())
-        return web.json_response({"status": "started"})
+
+        # force パラメータ: 既に diarized なセッションも再処理
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+
+        # 対象セッション数を事前チェック
+        sessions = _find_undiarized_sessions(force=force)
+        if not sessions and not force:
+            return web.json_response({
+                "status": "no_sessions",
+                "message": "All sessions already diarized",
+            })
+
+        asyncio.create_task(_batch_diarize_task(force=force))
+        return web.json_response({"status": "started", "total": len(sessions)})
 
     async def handle_batch_status(request):
         return web.json_response(_batch_state)
@@ -1145,6 +1227,43 @@ async def main():
             _batch_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
+    # --- Hotwords 管理 API ---
+
+    async def handle_hotwords_status(request):
+        settings = hotword_loader.get_settings()
+        return web.json_response({
+            "enabled": HOTWORDS_ENABLED and settings.get("enabled", True),
+            "env_enabled": HOTWORDS_ENABLED,
+            "count": hotword_loader.get_count(),
+            "custom": hotword_loader.get_custom_words(),
+            "custom_count": len(hotword_loader.get_custom_words()),
+            "categories": hotword_loader.get_category_stats(),
+        })
+
+    async def handle_hotwords_settings_get(request):
+        return web.json_response(hotword_loader.get_settings())
+
+    async def handle_hotwords_settings_put(request):
+        body = await request.json()
+        hotword_loader.update_settings(body)
+        return web.json_response({"status": "ok", "count": hotword_loader.get_count()})
+
+    async def handle_hotwords_custom_post(request):
+        body = await request.json()
+        word = str(body.get("word", "")).strip()
+        if not word:
+            return web.json_response({"error": "word is required"}, status=400)
+        hotword_loader.add_custom(word)
+        return web.json_response({"status": "ok", "custom": hotword_loader.get_custom_words()})
+
+    async def handle_hotwords_custom_delete(request):
+        body = await request.json()
+        word = str(body.get("word", "")).strip()
+        if not word:
+            return web.json_response({"error": "word is required"}, status=400)
+        hotword_loader.remove_custom(word)
+        return web.json_response({"status": "ok", "custom": hotword_loader.get_custom_words()})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -1152,6 +1271,11 @@ async def main():
     mgmt_app.router.add_post("/diarize/start", handle_batch_start)
     mgmt_app.router.add_get("/diarize/status", handle_batch_status)
     mgmt_app.router.add_post("/diarize/cancel", handle_batch_cancel)
+    mgmt_app.router.add_get("/hotwords/status", handle_hotwords_status)
+    mgmt_app.router.add_get("/hotwords/settings", handle_hotwords_settings_get)
+    mgmt_app.router.add_put("/hotwords/settings", handle_hotwords_settings_put)
+    mgmt_app.router.add_post("/hotwords/custom", handle_hotwords_custom_post)
+    mgmt_app.router.add_delete("/hotwords/custom", handle_hotwords_custom_delete)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()

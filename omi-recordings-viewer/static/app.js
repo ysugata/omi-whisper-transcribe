@@ -264,6 +264,7 @@
         loadSuggestions();
         loadSuggestionCount();
         loadPresets();
+        loadHotwordsSettings();
     }
 
     function closeSettings() {
@@ -292,7 +293,6 @@
 
     var promptTopic = document.getElementById("prompt-topic");
     var promptParticipants = document.getElementById("prompt-participants");
-    var promptTerms = document.getElementById("prompt-terms");
     var promptPreview = document.getElementById("prompt-preview");
     var promptCharCount = document.getElementById("prompt-char-count");
     var promptWarnings = document.getElementById("prompt-warnings");
@@ -308,15 +308,6 @@
         if (pp) {
             var names = pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean);
             if (names.length) parts.push("参加者: " + names.join("、") + "。");
-        }
-
-        var tt = promptTerms.value.trim();
-        if (tt) {
-            var terms = tt.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean);
-            if (terms.length) {
-                var selected = terms.slice(0, 15);
-                parts.push("関連用語: " + selected.join("、") + "。");
-            }
         }
 
         var text = parts.length ? parts.join("") : "";
@@ -360,13 +351,11 @@
 
     promptTopic.addEventListener("input", buildPreview);
     promptParticipants.addEventListener("input", buildPreview);
-    promptTerms.addEventListener("input", buildPreview);
 
     function loadPromptSettings() {
         fetch("/api/prompt-settings").then(function (r) { return r.json(); }).then(function (data) {
             promptTopic.value = data.topic || "";
             promptParticipants.value = (data.participants || []).join(", ");
-            promptTerms.value = (data.terms || []).join(", ");
             buildPreview();
         });
     }
@@ -375,16 +364,13 @@
         var pp = promptParticipants.value.trim();
         var participants = pp ? pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
 
-        var tt = promptTerms.value.trim();
-        var terms = tt ? tt.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-
         fetch("/api/prompt-settings", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 topic: promptTopic.value.trim(),
                 participants: participants,
-                terms: terms,
+                terms: [],
             }),
         }).then(function (r) { return r.json(); }).then(function () {
             promptStatus.textContent = "Saved!";
@@ -692,7 +678,6 @@
                 opt.textContent = p.name;
                 opt.dataset.topic = p.topic || "";
                 opt.dataset.participants = (p.participants || []).join(", ");
-                opt.dataset.terms = (p.terms || []).join(", ");
                 presetSelect.appendChild(opt);
             });
             // Restore selection
@@ -708,7 +693,6 @@
 
         promptTopic.value = opt.dataset.topic || "";
         promptParticipants.value = opt.dataset.participants || "";
-        promptTerms.value = opt.dataset.terms || "";
         buildPreview();
     });
 
@@ -719,9 +703,6 @@
         var pp = promptParticipants.value.trim();
         var participants = pp ? pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
 
-        var tt = promptTerms.value.trim();
-        var terms = tt ? tt.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-
         fetch("/api/presets", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -729,7 +710,7 @@
                 name: name.trim(),
                 topic: promptTopic.value.trim(),
                 participants: participants,
-                terms: terms,
+                terms: [],
             }),
         }).then(function (r) { return r.json(); }).then(function (preset) {
             loadPresets();
@@ -848,18 +829,24 @@
         }, 2000);
     }
 
-    diarizeBtn.addEventListener("click", function () {
-        if (!confirm("Run speaker diarization on unprocessed recordings?")) return;
-
-        fetch("/api/diarize/start", { method: "POST" }).then(function (r) {
-            if (r.ok) {
-                return r.json().then(function () {
-                    showDiarizePanel({ running: true, total: 0, processed: 0, failed: 0 });
-                    startDiarizePolling();
-                });
-            }
+    function startDiarizeRequest(force) {
+        var opts = { method: "POST" };
+        if (force) {
+            opts.headers = { "Content-Type": "application/json" };
+            opts.body = JSON.stringify({ force: true });
+        }
+        fetch("/api/diarize/start", opts).then(function (r) {
             return r.json().then(function (data) {
-                if (r.status === 409) {
+                if (r.ok) {
+                    if (data.status === "no_sessions") {
+                        if (confirm("All sessions already diarized. Re-run on all sessions?")) {
+                            startDiarizeRequest(true);
+                        }
+                        return;
+                    }
+                    showDiarizePanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
+                    startDiarizePolling();
+                } else if (r.status === 409) {
                     alert("Already running");
                 } else if (r.status === 503) {
                     alert("HF_AUTH_TOKEN is not configured");
@@ -870,13 +857,190 @@
         }).catch(function (e) {
             alert("Failed to start: " + e.message);
         });
+    }
+
+    diarizeBtn.addEventListener("click", function () {
+        if (!confirm("Run speaker diarization on recordings?")) return;
+        startDiarizeRequest(false);
     });
 
     diarizeCancelBtn.addEventListener("click", function () {
         fetch("/api/diarize/cancel", { method: "POST" }).catch(function () {});
     });
 
+    // ============================================================
+    // Hotwords
+    // ============================================================
+
+    var hotwordsEnabledCb = document.getElementById("hotwords-enabled");
+    var hotwordsMaxTotal = document.getElementById("hotwords-max-total");
+    var hotwordsCategoriesEl = document.getElementById("hotwords-categories");
+    var hotwordsCustomInput = document.getElementById("hotword-custom-input");
+    var hotwordsCustomAddBtn = document.getElementById("hotword-custom-add-btn");
+    var hotwordsCustomListEl = document.getElementById("hotwords-custom-list");
+    var hotwordsTotalCount = document.getElementById("hotwords-total-count");
+    var saveHotwordsBtn = document.getElementById("save-hotwords-settings");
+    var hotwordsStatus = document.getElementById("hotwords-status");
+    var hotwordsBadge = document.getElementById("hotwords-badge");
+
+    var hotwordsSettingsCache = null;
+    var hotwordsStatusCache = null;
+
+    function loadHotwordsStatus() {
+        fetch("/api/hotwords/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data) return;
+            hotwordsStatusCache = data;
+            hotwordsBadge.textContent = data.count || 0;
+            hotwordsTotalCount.textContent = (data.count || 0) + " active";
+        }).catch(function () {});
+    }
+
+    function loadHotwordsSettings() {
+        fetch("/api/hotwords/settings").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data) return;
+            hotwordsSettingsCache = data;
+            hotwordsEnabledCb.checked = data.enabled !== false;
+            hotwordsMaxTotal.value = data.max_total || 500;
+            renderHotwordsCategories(data.categories || {});
+            loadHotwordsCustom();
+            loadHotwordsStatus();
+        }).catch(function () {});
+    }
+
+    function renderHotwordsCategories(categories) {
+        var catNames = {
+            place: "Places", company: "Companies", station: "Stations",
+            surname: "Surnames", given: "Given Names", product: "Products"
+        };
+        var html = "";
+        for (var cat in categories) {
+            var c = categories[cat];
+            var label = catNames[cat] || cat;
+            html += '<div class="hotword-category-row">';
+            html += '<label class="toggle-label">';
+            html += '<input type="checkbox" class="hw-cat-enabled" data-cat="' + cat + '"' +
+                (c.enabled !== false ? " checked" : "") + '>';
+            html += '<span>' + escapeHtml(label) + '</span>';
+            html += '</label>';
+            html += '<input type="number" class="hw-cat-max" data-cat="' + cat + '" ' +
+                'min="0" max="2000" value="' + (c.max || 100) + '" style="width:60px">';
+            html += '</div>';
+        }
+        hotwordsCategoriesEl.innerHTML = html;
+    }
+
+    function loadHotwordsCustom() {
+        fetch("/api/hotwords/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data) return;
+            hotwordsCustomCache = data.custom || [];
+            renderHotwordsCustom();
+        }).catch(function () {});
+    }
+
+    var hotwordsCustomCache = [];
+
+    function renderHotwordsCustom() {
+        if (hotwordsCustomCache.length === 0) {
+            hotwordsCustomListEl.innerHTML = '<div class="text-dim">No custom hotwords</div>';
+            return;
+        }
+        var html = "";
+        hotwordsCustomCache.forEach(function (word) {
+            html += '<div class="hotword-custom-item">';
+            html += '<span>' + escapeHtml(word) + '</span>';
+            html += '<button class="btn-danger btn-sm hw-custom-del" data-word="' + escapeHtml(word) + '">Del</button>';
+            html += '</div>';
+        });
+        hotwordsCustomListEl.innerHTML = html;
+
+        var delBtns = hotwordsCustomListEl.querySelectorAll(".hw-custom-del");
+        for (var i = 0; i < delBtns.length; i++) {
+            delBtns[i].addEventListener("click", function () {
+                removeHotwordCustom(this.getAttribute("data-word"));
+            });
+        }
+    }
+
+    hotwordsCustomAddBtn.addEventListener("click", addHotwordCustom);
+    hotwordsCustomInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") addHotwordCustom();
+    });
+
+    function addHotwordCustom() {
+        var word = hotwordsCustomInput.value.trim();
+        if (!word) return;
+        fetch("/api/hotwords/custom", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ word: word }),
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            if (data.custom) {
+                hotwordsCustomCache = data.custom;
+                renderHotwordsCustom();
+            }
+            hotwordsCustomInput.value = "";
+            loadHotwordsStatus();
+        });
+    }
+
+    function removeHotwordCustom(word) {
+        fetch("/api/hotwords/custom", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ word: word }),
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            if (data.custom) {
+                hotwordsCustomCache = data.custom;
+                renderHotwordsCustom();
+            }
+            loadHotwordsStatus();
+        });
+    }
+
+    saveHotwordsBtn.addEventListener("click", function () {
+        var categories = {};
+        var enabledCbs = hotwordsCategoriesEl.querySelectorAll(".hw-cat-enabled");
+        var maxInputs = hotwordsCategoriesEl.querySelectorAll(".hw-cat-max");
+
+        for (var i = 0; i < enabledCbs.length; i++) {
+            var cat = enabledCbs[i].getAttribute("data-cat");
+            categories[cat] = { enabled: enabledCbs[i].checked };
+        }
+        for (var j = 0; j < maxInputs.length; j++) {
+            var cat2 = maxInputs[j].getAttribute("data-cat");
+            if (categories[cat2]) {
+                categories[cat2].max = parseInt(maxInputs[j].value, 10) || 100;
+            }
+        }
+
+        var payload = {
+            enabled: hotwordsEnabledCb.checked,
+            max_total: parseInt(hotwordsMaxTotal.value, 10) || 500,
+            categories: categories,
+        };
+
+        fetch("/api/hotwords/settings", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            hotwordsStatus.textContent = "Saved!";
+            setTimeout(function () { hotwordsStatus.textContent = ""; }, 2000);
+            loadHotwordsStatus();
+        });
+    });
+
     // --- Init ---
     loadPage(1);
     checkDiarizeAvailability();
+    loadHotwordsStatus();
 })();
