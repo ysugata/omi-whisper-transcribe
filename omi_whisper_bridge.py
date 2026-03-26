@@ -471,6 +471,9 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"♪+"),
     re.compile(r"^\s*\.+\s*$"),
     re.compile(r"(.{2,}?)\1{3,}"),  # 同一フレーズの4回以上繰り返し
+    re.compile(r"(F\d+[・,、]\s*){3,}"),  # F-key 暴走パターン (F1・F2・F3...)
+    re.compile(r"([ぁ-ん]{1,3}[,、]\s*){5,}"),  # カンマ/中黒区切りの単音節羅列 (背景音楽ハルシネーション)
+    re.compile(r"^[。、.,!?・…―\s]+$"),  # 句読点・記号のみ
 ]
 
 
@@ -597,6 +600,12 @@ def transcribe_audio(
         seg_end = max(0.0, min(seg.end, chunk_duration))
         if seg_start >= seg_end:
             seg_end = min(seg_start + 0.5, chunk_duration)  # 最小 0.5s
+
+        # 文字速度フィルタ (日本語会話は 5〜10 文字/秒、25 は早口でも不可能)
+        duration = seg_end - seg_start
+        if duration > 0 and len(text) / duration > 25:
+            log.info(f"Segment FILTERED (impossible rate {len(text)/duration:.0f} chars/s): '{text[:80]}'")
+            continue
 
         # ハルシネーション除去
         cleaned = _remove_hallucinations(text)
