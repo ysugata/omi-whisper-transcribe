@@ -28,7 +28,7 @@ log = logging.getLogger("omi-whisper.speaker-filter")
 
 DEFAULT_THRESHOLD = 0.55
 SPEAKERS_FILE = "speakers.json"
-EMBEDDING_MODEL = "pyannote/embedding"
+EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
 
 
 class SpeakerFilter:
@@ -90,13 +90,12 @@ class SpeakerFilter:
             pass
 
     def _load_model(self):
-        """pyannote/embedding モデルをロードして返す。"""
+        """wespeaker-voxceleb-resnet34-LM モデルをロードして返す。"""
+        import torch
         from pyannote.audio import Model, Inference
-        model = Model.from_pretrained(
-            EMBEDDING_MODEL,
-            use_auth_token=self._hf_token,
-        )
-        inference = Inference(model, window="whole", device=self._device)
+        model = Model.from_pretrained(EMBEDDING_MODEL)
+        device = torch.device(self._device)
+        inference = Inference(model, window="whole", device=device)
         log.info("Embedding model loaded")
         return inference
 
