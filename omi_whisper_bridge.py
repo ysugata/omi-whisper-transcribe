@@ -555,11 +555,11 @@ def transcribe_audio(
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
     for seg in segments:
-        # 確信度フィルタ: 低確信度・無音確率高のセグメントを除去
-        if seg.avg_logprob < -0.7 or seg.no_speech_prob > 0.5:
-            log.debug(
-                f"Segment filtered: avg_logprob={seg.avg_logprob:.2f}, "
-                f"no_speech_prob={seg.no_speech_prob:.2f}, text='{seg.text.strip()[:50]}'"
+        # 確信度フィルタ: 両方悪い場合のみ除去 (Silero VAD で事前検証済み)
+        if seg.avg_logprob < -0.7 and seg.no_speech_prob > 0.6:
+            log.info(
+                f"Segment FILTERED: avg_logprob={seg.avg_logprob:.2f}, "
+                f"no_speech_prob={seg.no_speech_prob:.2f}, text='{seg.text.strip()[:80]}'"
             )
             continue
 
@@ -568,9 +568,11 @@ def transcribe_audio(
             continue
 
         # ハルシネーション除去
-        text = _remove_hallucinations(text)
-        if not text:
+        cleaned = _remove_hallucinations(text)
+        if not cleaned:
+            log.info(f"Hallucination removed: '{text[:80]}'")
             continue
+        text = cleaned
 
         # プロンプトエコー検出
         if initial_prompt and _is_prompt_echo(text, initial_prompt):
@@ -882,20 +884,20 @@ async def handle_connection(websocket):
         recorder_audio_seconds += chunk_duration
 
         if raw_segments:
-            # WebSocket 応答: 接続全体のオフセット (Omi アプリ用)
-            ws_segments = _offset_segments(raw_segments, ws_offset)
-            response = {"segments": ws_segments}
-            await websocket.send(json.dumps(response))
-
-            # 録音ログ: WAV ファイル内の位置に合わせたオフセット
+            # 録音ログ: WAV ファイル内の位置に合わせたオフセット (先に保存)
             rec_segments = _offset_segments(raw_segments, rec_offset)
             recorder.add_segments(rec_segments)
 
             log.info(
-                f"Sent {len(raw_segments)} segment(s) "
+                f"Transcribed {len(raw_segments)} segment(s) "
                 f"[{elapsed:.2f}s processing, "
                 f"RTF={elapsed/chunk_duration:.2f}x]"
             )
+
+            # WebSocket 応答: 接続全体のオフセット (Omi アプリ用)
+            ws_segments = _offset_segments(raw_segments, ws_offset)
+            response = {"segments": ws_segments}
+            await websocket.send(json.dumps(response))
         else:
             log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
 

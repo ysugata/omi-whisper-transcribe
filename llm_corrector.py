@@ -17,15 +17,17 @@ _PUNCT_RE = re.compile(r'^[\s、。,.!?・…―「」『』（）()\-–—]+$'
 _NUM_RE = re.compile(r'^[\d０-９\s.,%]+$')
 
 SYSTEM_PROMPT = """あなたは音声文字起こしテキストの校正者です。
-以下のルールに厳密に従ってください:
+番号付きの発話テキストが入力されます。全体の文脈と参考用語リストを活用して以下のルールに従ってください:
 
 1. 固有名詞・技術用語・社名・プロダクト名の誤認識を修正する
 2. カタカナで書かれた技術用語を正しい英語表記に修正する（例: ドッカー → Docker）
-3. 発言の意味・内容・語順は絶対に変えない
-4. 明らかな誤りだけを修正し、曖昧な箇所はそのまま残す
-5. 句読点の追加・削除はしない
-6. 修正後のテキストだけを返す（説明・コメント・前置きは一切不要）
-7. 修正が不要な場合は入力テキストをそのまま返す"""
+3. 音声認識で脱落した可能性のある単語を前後の文脈から補完する（例: 「3060のVRAM」→「RTX3060のVRAM」）
+4. 参考用語リストの単語が、音声認識で似た別の単語に誤認識されていないか注意する（例: Nginx が「Linux」に、gRPC が「GRPC」に誤認識される等）
+5. 発言の意味・内容・語順は絶対に変えない
+6. 明らかな誤りだけを修正し、曖昧な箇所はそのまま残す
+7. 句読点の追加・削除はしない
+8. 入力と同じ [番号] 形式で、修正後のテキストだけを返す
+9. 修正が不要な行も入力をそのまま返す"""
 
 
 class LLMCorrector:
@@ -81,10 +83,16 @@ class LLMCorrector:
         """LLM のレスポンスを検証し、異常なら元テキストを返す。"""
         if not corrected or not corrected.strip():
             return original
+        corrected = corrected.strip()
         if len(corrected) > len(original) * 2 or len(corrected) < len(original) * 0.5:
             log.warning(f"LLM出力の長さが異常: 元={len(original)} 修正={len(corrected)}")
             return original
-        return corrected.strip()
+        # 類似度チェック: 元テキストと大きく異なる場合は拒否
+        ratio = difflib.SequenceMatcher(None, original, corrected).ratio()
+        if ratio < 0.5:
+            log.warning(f"LLM出力が元テキストと乖離 (similarity={ratio:.2f}): '{corrected[:60]}'")
+            return original
+        return corrected
 
     def correct(
         self,
@@ -112,7 +120,6 @@ class LLMCorrector:
                 ],
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
-                extra_body={"reasoning_effort": "none"},
             )
             corrected = response.choices[0].message.content
             result = self._validate_response(text, corrected)
@@ -126,44 +133,112 @@ class LLMCorrector:
             log.warning(f"LLM API error (text preserved): {e}")
             return text
 
+    def _parse_batch_response(self, raw: str, expected_count: int) -> dict[int, str]:
+        """番号付きバッチレスポンスをパースして {0-indexed: text} を返す。"""
+        result = {}
+        pattern = re.compile(r'^\[(\d+)\]\s*(.*)')
+
+        for line in raw.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            m = pattern.match(line)
+            if m:
+                idx = int(m.group(1)) - 1  # 0-indexed
+                text = m.group(2).strip()
+                if 0 <= idx < expected_count and text:
+                    result[idx] = text
+
+        if len(result) != expected_count:
+            log.warning(f"LLM batch: expected {expected_count} lines, got {len(result)}")
+
+        return result
+
     def correct_segments(
         self,
         segments: list[dict],
         known_terms: Optional[list[str]] = None,
         min_text_length: int = 5,
     ) -> list[dict]:
-        """セグメントのリストに対して一括で補正を適用する。
+        """セグメントのリストをまとめて1回の API コールで補正する。
 
-        min_text_length 以下の短いセグメントはスキップする。
+        全セグメントを番号付きリストとして送信し、文脈を活用した補正を行う。
+        min_text_length 未満の短いセグメントはスキップする。
         """
         if not self._enabled:
             return segments
 
-        result = []
-        for seg in segments:
-            seg_copy = dict(seg)
-            text = seg_copy.get("text", "")
+        # 対象セグメントを収集
+        eligible: list[tuple[int, str]] = []
+        for i, seg in enumerate(segments):
+            text = seg.get("text", "")
             if len(text) >= min_text_length:
-                seg_copy["text"] = self.correct(text, known_terms)
-            result.append(seg_copy)
-        return result
+                eligible.append((i, text))
+
+        if not eligible:
+            return segments
+
+        # 番号付きリストを構築
+        lines = [f"[{idx + 1}] {text}" for idx, (_, text) in enumerate(eligible)]
+
+        parts = []
+        if known_terms:
+            terms_str = ", ".join(known_terms[:30])
+            parts.append(f"参考用語リスト: {terms_str}")
+        parts.append("\n".join(lines))
+        user_msg = "\n".join(parts)
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
+            raw = response.choices[0].message.content
+            log.info(f"LLM batch request:\n{user_msg}")
+            log.info(f"LLM batch response:\n{raw}")
+            corrected_map = self._parse_batch_response(raw, len(eligible))
+
+            # 結果を適用
+            result = [dict(seg) for seg in segments]
+            for idx, (seg_idx, original_text) in enumerate(eligible):
+                if idx in corrected_map:
+                    validated = self._validate_response(original_text, corrected_map[idx])
+                    result[seg_idx]["text"] = validated
+                    if validated != original_text:
+                        log.debug(f"LLM corrected [{idx + 1}]: '{original_text[:50]}' → '{validated[:50]}'")
+
+            return result
+
+        except Exception as e:
+            log.warning(f"LLM batch API error (text preserved): {e}")
+            return [dict(seg) for seg in segments]
 
     @staticmethod
     def _is_trivial_change(wrong: str, correct: str) -> bool:
-        """変更が些細なものかどうかを判定する。"""
+        """変更が些細 or ゴミかどうかを判定する。"""
         # 句読点のみの変更
         if _PUNCT_RE.match(wrong) or _PUNCT_RE.match(correct):
             return True
         # 数字のみの変更
         if _NUM_RE.match(wrong) or _NUM_RE.match(correct):
             return True
-        # 1文字の変更
-        if len(wrong) <= 1 or len(correct) <= 1:
+        # 短すぎる断片 (3文字未満) はゴミ
+        if len(wrong) < 3 or len(correct) < 3:
             return True
-        # ひらがな2文字以下の変更
-        if len(wrong) <= 2 and all('\u3040' <= c <= '\u309f' for c in wrong):
+        # ひらがな・カタカナのみの短い断片 (4文字未満) はゴミ
+        _kana = lambda c: '\u3040' <= c <= '\u309f' or '\u30a0' <= c <= '\u30ff'
+        if len(wrong) < 4 and all(_kana(c) for c in wrong):
             return True
-        if len(correct) <= 2 and all('\u3040' <= c <= '\u309f' for c in correct):
+        if len(correct) < 4 and all(_kana(c) for c in correct):
+            return True
+        # wrong と correct の類似度が高すぎる (助詞レベルの変更)
+        ratio = difflib.SequenceMatcher(None, wrong, correct).ratio()
+        if ratio > 0.8 and len(wrong) < 6:
             return True
         return False
 
