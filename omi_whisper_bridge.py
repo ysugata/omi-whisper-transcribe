@@ -44,7 +44,7 @@ _lang = os.environ.get("LANGUAGE", "ja")
 LANGUAGE = None if _lang.lower() == "auto" else _lang                    # "ja", "en", or "auto" (自動検出)
 BEAM_SIZE = int(os.environ.get("BEAM_SIZE", "5"))
 VAD_FILTER = os.environ.get("VAD_FILTER", "true").lower() in ("true", "1", "yes")  # 無音区間のハルシネーション対策
-BUFFER_SECONDS = float(os.environ.get("BUFFER_SECONDS", "3.0"))          # 音声をバッファしてからまとめて処理する秒数
+BUFFER_SECONDS = float(os.environ.get("BUFFER_SECONDS", "5.0"))          # 音声をバッファしてからまとめて処理する秒数
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))                # Omi は 16kHz PCM を送信
 
 # --- Whisper 精度改善パラメータ ---
@@ -76,6 +76,19 @@ SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "true").lower() in ("true", "1", "yes"
 RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "./recordings")        # 保存先ディレクトリ
 MAX_RECORDING_DAYS = int(os.environ.get("MAX_RECORDING_DAYS", "30"))     # 自動削除: この日数より古い録音を起動時に削除 (0=無効)
 
+# --- 音声前処理設定 ---
+NORMALIZE_ENABLED = os.environ.get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
+NORMALIZE_TARGET_DBFS = float(os.environ.get("NORMALIZE_TARGET_DBFS", "-16.0"))
+
+# --- VAD セグメンテーション設定 ---
+VAD_SEG_ENABLED = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
+VAD_CHECK_INTERVAL = float(os.environ.get("VAD_CHECK_INTERVAL", "1.0"))       # VAD チェック間隔 (秒)
+VAD_SILENCE_TRIGGER = float(os.environ.get("VAD_SILENCE_TRIGGER", "0.8"))     # 発話後この無音で文字起こし実行
+VAD_MAX_BUFFER = float(os.environ.get("VAD_MAX_BUFFER", "30.0"))              # バッファ上限 (秒)
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))                 # Silero VAD 閾値
+VAD_MIN_SILENCE_MS = int(os.environ.get("VAD_MIN_SILENCE_MS", "500"))         # 発話間の最小無音 (ms)
+VAD_SPEECH_PAD_MS = int(os.environ.get("VAD_SPEECH_PAD_MS", "300"))           # 発話前後のパディング (ms)
+
 # --- 無音検出設定 ---
 SILENCE_THRESHOLD = int(os.environ.get("SILENCE_THRESHOLD", "200"))      # int16 RMS 閾値 (0=無効)
 SILENCE_TIMEOUT = float(os.environ.get("SILENCE_TIMEOUT", "30.0"))       # 無音タイムアウト秒数
@@ -102,6 +115,8 @@ from prompt_builder import build_prompt
 from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
 from diarizer import Diarizer
+from audio_preprocessor import AudioPreprocessor
+from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _PROMPT_SETTINGS_PATH = os.path.join(CONFIG_DIR, "prompt_settings.json")
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -124,6 +139,14 @@ if HF_AUTH_TOKEN:
     diarizer = Diarizer(
         hf_token=HF_AUTH_TOKEN,
         language=LANGUAGE or "ja",
+    )
+
+# 音声前処理 (ラウドネス正規化)
+audio_preprocessor: AudioPreprocessor | None = None
+if NORMALIZE_ENABLED:
+    audio_preprocessor = AudioPreprocessor(
+        normalize_enabled=True,
+        normalize_target_dbfs=NORMALIZE_TARGET_DBFS,
     )
 
 
@@ -502,6 +525,10 @@ def transcribe_audio(
     if len(audio_np) < 1600:  # 0.1秒未満は無視
         return []
 
+    # 音声前処理 (ラウドネス正規化)
+    if audio_preprocessor is not None:
+        audio_np = audio_preprocessor.process_array(audio_np, SAMPLE_RATE)
+
     segments_out = []
 
     # transcribe パラメータ構築
@@ -510,10 +537,10 @@ def transcribe_audio(
         language=LANGUAGE,
         vad_filter=VAD_FILTER,
         vad_parameters=dict(
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=1000,
-            speech_pad_ms=400,
-            threshold=0.5,
+            min_speech_duration_ms=100,
+            min_silence_duration_ms=500,
+            speech_pad_ms=200,
+            threshold=0.35,
         ),
         word_timestamps=False,
         condition_on_previous_text=True,
@@ -798,7 +825,16 @@ async def handle_connection(websocket):
     total_audio_seconds = 0.0
     recorder_audio_seconds = 0.0  # WAV に実際に書き込んだ秒数 (録音用オフセット)
     recorder = SessionRecorder()
-    silent_since = None  # 無音開始時刻 (None = 発話中)
+    last_speech_time = time.time()  # 最後に発話を検出した時刻 (セッション管理用)
+    last_vad_check_len = 0  # 前回 VAD チェック時のバッファ長 (bytes)
+
+    # VAD オプション (Silero VAD)
+    vad_options = VadOptions(
+        threshold=VAD_THRESHOLD,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+        speech_pad_ms=VAD_SPEECH_PAD_MS,
+    )
 
     # Layer 1: セッション開始時に initial_prompt を構築
     session_prompt = _get_initial_prompt()
@@ -812,6 +848,56 @@ async def handle_connection(websocket):
         log.error(f"Failed to acquire model: {e}", exc_info=True)
         await websocket.close(1013, "Model unavailable")
         return
+
+    async def _transcribe_chunk(chunk: bytes):
+        """チャンクを文字起こしして結果を送信する共通処理。"""
+        nonlocal total_audio_seconds, recorder_audio_seconds, recorder
+
+        chunk_duration = len(chunk) / (SAMPLE_RATE * 2)
+
+        # 録音セッションがなければ新規作成
+        if recorder is None:
+            recorder = SessionRecorder()
+            recorder_audio_seconds = 0.0
+            log.info("New recording session started (speech detected)")
+
+        # オフセットを退避 (transcribe 前の値を使う)
+        ws_offset = total_audio_seconds
+        rec_offset = recorder_audio_seconds
+
+        # 音声を録音ファイルに書き込み
+        recorder.write_audio(chunk)
+
+        log.info(f"Transcribing {chunk_duration:.1f}s of audio...")
+        t0 = time.time()
+
+        loop = asyncio.get_running_loop()
+        raw_segments = await loop.run_in_executor(
+            executor,
+            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms),
+        )
+
+        elapsed = time.time() - t0
+        total_audio_seconds += chunk_duration
+        recorder_audio_seconds += chunk_duration
+
+        if raw_segments:
+            # WebSocket 応答: 接続全体のオフセット (Omi アプリ用)
+            ws_segments = _offset_segments(raw_segments, ws_offset)
+            response = {"segments": ws_segments}
+            await websocket.send(json.dumps(response))
+
+            # 録音ログ: WAV ファイル内の位置に合わせたオフセット
+            rec_segments = _offset_segments(raw_segments, rec_offset)
+            recorder.add_segments(rec_segments)
+
+            log.info(
+                f"Sent {len(raw_segments)} segment(s) "
+                f"[{elapsed:.2f}s processing, "
+                f"RTF={elapsed/chunk_duration:.2f}x]"
+            )
+        else:
+            log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
 
     try:
         async for message in websocket:
@@ -834,92 +920,88 @@ async def handle_connection(websocket):
 
             buffer_duration = len(audio_buffer) / (SAMPLE_RATE * 2)
 
-            # バッファが指定秒数に達したら処理
-            if buffer_duration >= BUFFER_SECONDS:
-                chunk = bytes(audio_buffer)
-                audio_buffer.clear()
+            if VAD_SEG_ENABLED:
+                # ============================================================
+                # VAD ベースのセグメンテーション
+                # ============================================================
 
-                # --- 無音検出 ---
-                if SILENCE_THRESHOLD > 0:
-                    rms = calc_rms_int16(chunk)
+                # VAD チェック間隔: 前回チェックから十分な新規音声が溜まったか
+                new_audio_sec = (len(audio_buffer) - last_vad_check_len) / (SAMPLE_RATE * 2)
+                if new_audio_sec < VAD_CHECK_INTERVAL:
+                    continue
+                last_vad_check_len = len(audio_buffer)
 
-                    if rms < SILENCE_THRESHOLD:
-                        # 無音バッファ
-                        if silent_since is None:
-                            silent_since = time.time()
-                            log.debug(f"Silence started (RMS={rms:.0f})")
+                # バッファを float32 に変換して VAD 実行
+                audio_float = np.frombuffer(bytes(audio_buffer), dtype=np.int16).astype(np.float32) / 32768.0
+                speech_timestamps = get_speech_timestamps(audio_float, vad_options)
 
-                        elapsed_silence = time.time() - silent_since
+                if not speech_timestamps:
+                    # 発話なし — セッションタイムアウト判定
+                    elapsed_silence = time.time() - last_speech_time
+                    if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
+                        recorder.finalize()
+                        log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
+                        recorder = None
 
-                        # タイムアウト → 録音セッション自動終了
-                        if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
-                            recorder.finalize()
-                            log.info(
-                                f"Session finalized due to silence timeout "
-                                f"({elapsed_silence:.0f}s silent)"
-                            )
-                            recorder = None
-
+                    # バッファが上限を超えたら破棄 (無音が溜まり続けるのを防ぐ)
+                    if buffer_duration >= VAD_MAX_BUFFER:
                         total_audio_seconds += buffer_duration
-                        log.debug(
-                            f"Silent buffer skipped (RMS={rms:.0f}, "
-                            f"silent={elapsed_silence:.0f}s)"
-                        )
-                        continue
+                        audio_buffer.clear()
+                        last_vad_check_len = 0
+                        log.debug(f"Silent buffer discarded ({buffer_duration:.1f}s)")
+                    continue
 
-                    # 発話あり → silent_since リセット
-                    if silent_since is not None:
-                        log.info(
-                            f"Speech resumed after "
-                            f"{time.time() - silent_since:.0f}s of silence (RMS={rms:.0f})"
-                        )
-                        silent_since = None
+                # 発話あり — タイムアウトリセット
+                last_speech_time = time.time()
 
-                    # 録音セッションが終了していたら新規作成
-                    if recorder is None:
-                        recorder = SessionRecorder()
-                        recorder_audio_seconds = 0.0
-                        log.info("New recording session started (speech detected)")
+                # 末尾の無音時間を計算
+                last_speech_end_sample = speech_timestamps[-1]["end"]
+                last_speech_end_sec = last_speech_end_sample / SAMPLE_RATE
+                trailing_silence = buffer_duration - last_speech_end_sec
 
-                # オフセットを退避 (transcribe 前の値を使う)
-                ws_offset = total_audio_seconds
-                rec_offset = recorder_audio_seconds
+                # 発話が完了した (十分な末尾無音がある) またはバッファ上限
+                if trailing_silence >= VAD_SILENCE_TRIGGER or buffer_duration >= VAD_MAX_BUFFER:
+                    # 発話終了地点 + パディングまで切り出し
+                    cut_sec = min(last_speech_end_sec + 0.3, buffer_duration)
+                    cut_bytes = int(cut_sec * SAMPLE_RATE) * 2
+                    # 偶数バイトにアラインメント (int16)
+                    cut_bytes = cut_bytes - (cut_bytes % 2)
 
-                # 音声を録音ファイルに書き込み
-                if recorder is not None:
-                    recorder.write_audio(chunk)
+                    chunk = bytes(audio_buffer[:cut_bytes])
+                    remaining = audio_buffer[cut_bytes:]
+                    audio_buffer = bytearray(remaining)
+                    last_vad_check_len = 0
 
-                log.info(f"Transcribing {buffer_duration:.1f}s of audio...")
-                t0 = time.time()
+                    if buffer_duration >= VAD_MAX_BUFFER:
+                        log.info(f"VAD: Buffer limit reached ({buffer_duration:.1f}s), force transcribing")
+                    else:
+                        log.info(f"VAD: Utterance complete ({last_speech_end_sec:.1f}s speech, "
+                                 f"{trailing_silence:.1f}s trailing silence)")
 
-                loop = asyncio.get_running_loop()
-                raw_segments = await loop.run_in_executor(
-                    executor,
-                    lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms),
-                )
+                    await _transcribe_chunk(chunk)
 
-                elapsed = time.time() - t0
-                total_audio_seconds += buffer_duration
-                recorder_audio_seconds += buffer_duration
+            else:
+                # ============================================================
+                # フォールバック: 固定時間チャンク (旧方式)
+                # ============================================================
+                if buffer_duration >= BUFFER_SECONDS:
+                    chunk = bytes(audio_buffer)
+                    audio_buffer.clear()
 
-                if raw_segments:
-                    # WebSocket 応答: 接続全体のオフセット (Omi アプリ用)
-                    ws_segments = _offset_segments(raw_segments, ws_offset)
-                    response = {"segments": ws_segments}
-                    await websocket.send(json.dumps(response))
+                    # RMS 無音検出
+                    if SILENCE_THRESHOLD > 0:
+                        rms = calc_rms_int16(chunk)
+                        if rms < SILENCE_THRESHOLD:
+                            elapsed_silence = time.time() - last_speech_time
+                            if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
+                                recorder.finalize()
+                                log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
+                                recorder = None
+                            total_audio_seconds += buffer_duration
+                            continue
+                        last_speech_time = time.time()
 
-                    # 録音ログ: WAV ファイル内の位置に合わせたオフセット
-                    if recorder is not None:
-                        rec_segments = _offset_segments(raw_segments, rec_offset)
-                        recorder.add_segments(rec_segments)
-
-                    log.info(
-                        f"Sent {len(raw_segments)} segment(s) "
-                        f"[{elapsed:.2f}s processing, "
-                        f"RTF={elapsed/buffer_duration:.2f}x]"
-                    )
-                else:
-                    log.debug(f"No speech detected in buffer ({elapsed:.2f}s)")
+                    await _transcribe_chunk(chunk)
 
     except websockets.exceptions.ConnectionClosed:
         log.info(f"Connection closed: {remote}")
@@ -1006,6 +1088,12 @@ async def main():
         log.info(f"Diarization: AVAILABLE ({auto})")
     else:
         log.info("Diarization: UNAVAILABLE (no HF_AUTH_TOKEN)")
+    log.info(f"Normalize: {'ON (' + str(NORMALIZE_TARGET_DBFS) + 'dBFS)' if audio_preprocessor else 'OFF'}")
+    if VAD_SEG_ENABLED:
+        log.info(f"VAD segmentation: ON (check={VAD_CHECK_INTERVAL}s, "
+                 f"silence_trigger={VAD_SILENCE_TRIGGER}s, max_buffer={VAD_MAX_BUFFER}s)")
+    else:
+        log.info(f"VAD segmentation: OFF (fixed {BUFFER_SECONDS}s chunks)")
     log.info(f"Audio saving: {'ON -> ' + RECORDINGS_DIR if SAVE_AUDIO else 'OFF'}")
     log.info(f"Silence: threshold={SILENCE_THRESHOLD}, timeout={SILENCE_TIMEOUT}s"
              f"{' (DISABLED)' if SILENCE_THRESHOLD <= 0 else ''}")
