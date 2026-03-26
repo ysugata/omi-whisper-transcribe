@@ -798,6 +798,221 @@ main {
     border-bottom: none;
 }
 
+/* Speaker badges on segments */
+.speaker-badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.speaker-badge.user-speaker {
+    background: #27ae60;
+    color: #fff;
+}
+
+.speaker-badge.known-speaker {
+    background: var(--accent);
+    color: #fff;
+}
+
+.speaker-badge.unknown-speaker {
+    background: #555;
+    color: #999;
+}
+
+.segment.unknown-segment {
+    opacity: 0.5;
+}
+
+/* Voiceprint bar (segment selection) */
+.voiceprint-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--surface2);
+    border-radius: 6px;
+    margin-bottom: 8px;
+}
+
+.voiceprint-bar.hidden { display: none; }
+
+.voiceprint-bar select {
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+/* Segment filter bar */
+.segment-filter-bar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+.segment-filter-bar.hidden { display: none; }
+
+.seg-filter-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: none;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.seg-filter-btn:hover { color: var(--text); border-color: var(--accent); }
+.seg-filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Segment checkbox */
+.segment-checkbox {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    flex-shrink: 0;
+    margin-top: 2px;
+    cursor: pointer;
+}
+
+/* Voice tab */
+.voice-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+
+.voice-add-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.voice-add-row input[type="text"] {
+    flex: 1;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.9rem;
+}
+
+.voice-add-row input[type="text"]:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.voice-speakers-list {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+
+.voice-speaker-row {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.voice-speaker-row:last-child { border-bottom: none; }
+
+.voice-speaker-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.voice-speaker-name {
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+
+.voice-speaker-meta {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-left: auto;
+}
+
+.voice-samples-list {
+    padding-left: 12px;
+    margin-top: 6px;
+}
+
+.voice-sample-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+}
+
+.voice-sample-row .btn-danger {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+}
+
+.voice-threshold-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.voice-threshold-row label {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+.voice-threshold-row input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+}
+
+.voice-threshold-row span {
+    font-size: 0.85rem;
+    min-width: 36px;
+    text-align: center;
+}
+
+.voice-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.badge-user {
+    display: inline-block;
+    background: #27ae60;
+    color: #fff;
+    font-size: 0.65rem;
+    padding: 1px 5px;
+    border-radius: 8px;
+}
+
+.badge-other {
+    display: inline-block;
+    background: var(--accent-dim);
+    color: #fff;
+    font-size: 0.65rem;
+    padding: 1px 5px;
+    border-radius: 8px;
+}
+
 /* Responsive */
 @media (max-width: 600px) {
     header {

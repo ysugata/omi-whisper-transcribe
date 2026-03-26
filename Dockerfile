@@ -23,6 +23,7 @@ COPY llm_corrector.py .
 COPY diarizer.py .
 COPY audio_preprocessor.py .
 COPY hotword_loader.py .
+COPY speaker_filter.py .
 COPY test_whisper.py .
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント

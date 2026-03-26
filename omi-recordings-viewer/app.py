@@ -445,6 +445,63 @@ async def handle_hotwords_custom_delete(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Speaker プロキシ API (Bridge へ中継)
+# ============================================================
+
+async def handle_speakers_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/speakers/status")
+
+
+async def handle_speakers_list(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/speakers/list")
+
+
+async def handle_speakers_add(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/speakers/add")
+
+
+async def handle_speakers_update(request: web.Request) -> web.Response:
+    speaker_id = request.match_info["id"]
+    return await _proxy_bridge(request, "PUT", f"/speakers/{speaker_id}")
+
+
+async def handle_speakers_delete(request: web.Request) -> web.Response:
+    speaker_id = request.match_info["id"]
+    return await _proxy_bridge(request, "DELETE", f"/speakers/{speaker_id}")
+
+
+async def handle_speakers_add_voiceprint(request: web.Request) -> web.Response:
+    speaker_id = request.match_info["id"]
+    return await _proxy_bridge(request, "POST", f"/speakers/{speaker_id}/voiceprint")
+
+
+async def handle_speakers_remove_voiceprint(request: web.Request) -> web.Response:
+    speaker_id = request.match_info["id"]
+    sample_id = request.match_info["sample_id"]
+    return await _proxy_bridge(request, "DELETE", f"/speakers/{speaker_id}/voiceprint/{sample_id}")
+
+
+async def handle_speakers_threshold(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "PUT", "/speakers/threshold")
+
+
+async def handle_speakers_tag_start(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/speakers/tag/start")
+
+
+async def handle_speakers_tag_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/speakers/tag/status")
+
+
+async def handle_speakers_tag_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/speakers/tag/cancel")
+
+
+async def handle_speakers_delete_all(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "DELETE", "/speakers/all")
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -509,6 +566,20 @@ def create_app() -> web.Application:
     app.router.add_put("/api/hotwords/settings", handle_hotwords_settings_put)
     app.router.add_post("/api/hotwords/custom", handle_hotwords_custom_post)
     app.router.add_delete("/api/hotwords/custom", handle_hotwords_custom_delete)
+
+    # Speaker プロキシ API (固定パスを {id} より先に登録)
+    app.router.add_get("/api/speakers/status", handle_speakers_status)
+    app.router.add_get("/api/speakers/list", handle_speakers_list)
+    app.router.add_post("/api/speakers/add", handle_speakers_add)
+    app.router.add_put("/api/speakers/threshold", handle_speakers_threshold)
+    app.router.add_post("/api/speakers/tag/start", handle_speakers_tag_start)
+    app.router.add_get("/api/speakers/tag/status", handle_speakers_tag_status)
+    app.router.add_post("/api/speakers/tag/cancel", handle_speakers_tag_cancel)
+    app.router.add_delete("/api/speakers/all", handle_speakers_delete_all)
+    app.router.add_put("/api/speakers/{id}", handle_speakers_update)
+    app.router.add_delete("/api/speakers/{id}", handle_speakers_delete)
+    app.router.add_post("/api/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
+    app.router.add_delete("/api/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

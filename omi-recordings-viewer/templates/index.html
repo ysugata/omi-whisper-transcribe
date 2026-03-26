@@ -37,12 +37,37 @@
         <div id="pagination" class="pagination"></div>
     </main>
 
+    <!-- Speaker tag progress panel -->
+    <div id="tag-panel" class="diarize-panel hidden">
+        <div class="diarize-header">
+            <span id="tag-status-text">Processing...</span>
+            <span id="tag-progress-text">0 / 0</span>
+            <button id="tag-cancel-btn" class="btn-sm btn-danger">Cancel</button>
+        </div>
+        <div class="progress-bar">
+            <div id="tag-progress-fill" class="progress-fill"></div>
+        </div>
+        <div id="tag-current" class="text-dim"></div>
+    </div>
+
     <!-- Session detail modal -->
     <div id="detail-modal" class="modal hidden">
         <div class="modal-content">
             <button class="modal-close" id="modal-close">&times;</button>
             <div id="detail-header" class="detail-header"></div>
             <div id="audio-player-container" class="audio-player-container"></div>
+            <div id="voiceprint-bar" class="voiceprint-bar hidden">
+                <span id="voiceprint-selected-count">0 selected</span>
+                <select id="voiceprint-speaker-select">
+                    <option value="">-- Speaker --</option>
+                </select>
+                <button id="voiceprint-add-btn" class="btn-sm" disabled>Add to voiceprint</button>
+            </div>
+            <div id="segment-filter-bar" class="segment-filter-bar hidden">
+                <button class="seg-filter-btn active" data-filter="all">All</button>
+                <button class="seg-filter-btn" data-filter="unknown-only">Unknown only</button>
+                <button class="seg-filter-btn" data-filter="hide-unknown">Hide unknown</button>
+            </div>
             <div id="segments-container" class="segments-container"></div>
         </div>
     </div>
@@ -59,6 +84,7 @@
                 <button class="tab" data-tab="terms-tab">Term Corrections</button>
                 <button class="tab" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
+                <button class="tab" data-tab="voice-tab">Voice</button>
             </div>
 
             <!-- Prompt settings tab -->
@@ -130,6 +156,33 @@
                 </div>
                 <button id="save-hotwords-settings" class="btn-primary">Save Settings</button>
                 <span id="hotwords-status" class="save-status"></span>
+            </div>
+
+            <!-- Voice tab -->
+            <div id="voice-tab" class="tab-content">
+                <div class="voice-header">
+                    <span id="voice-status-text" class="text-dim">0 speakers</span>
+                </div>
+                <div class="voice-add-row">
+                    <input type="text" id="voice-name-input" placeholder="Speaker name (e.g. Taro)">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="voice-is-user">
+                        <span>Me</span>
+                    </label>
+                    <button id="voice-add-btn" class="btn-primary">Add Speaker</button>
+                </div>
+                <div id="voice-speakers-list" class="voice-speakers-list"></div>
+                <div class="voice-threshold-row">
+                    <label>Similarity Threshold</label>
+                    <input type="range" id="voice-threshold" min="0.3" max="0.9" step="0.05" value="0.55">
+                    <span id="voice-threshold-value">0.55</span>
+                    <button id="voice-threshold-save" class="btn-sm">Save</button>
+                </div>
+                <div class="voice-actions">
+                    <button id="voice-tag-btn" class="btn-primary">Tag All Recordings</button>
+                    <button id="voice-delete-all-btn" class="btn-danger">Delete All Speakers</button>
+                </div>
+                <span id="voice-status" class="save-status"></span>
             </div>
         </div>
     </div>

@@ -120,6 +120,7 @@ from llm_corrector import LLMCorrector
 from diarizer import Diarizer
 from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
+from speaker_filter import SpeakerFilter
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _PROMPT_SETTINGS_PATH = os.path.join(CONFIG_DIR, "prompt_settings.json")
@@ -155,6 +156,14 @@ if NORMALIZE_ENABLED:
 
 # Hotwords ローダー
 hotword_loader = HotwordLoader(CONFIG_DIR)
+
+# 声紋ベースの話者フィルタ (HF_AUTH_TOKEN があれば常に利用可能)
+speaker_filter: SpeakerFilter | None = None
+if HF_AUTH_TOKEN:
+    speaker_filter = SpeakerFilter(
+        config_dir=CONFIG_DIR,
+        hf_token=HF_AUTH_TOKEN,
+    )
 
 
 def _get_initial_prompt() -> str:
@@ -856,6 +865,165 @@ async def _batch_diarize_task(force: bool = False):
 
 
 # ============================================================
+# バッチ話者タグ付け
+# ============================================================
+
+_batch_tag_state = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "current_session": None,
+    "errors": [],
+    "cancel_requested": False,
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def _find_untagged_sessions(force: bool = False) -> list[dict]:
+    """RECORDINGS_DIR 配下の未タグ付けセッションを古い順に返す。"""
+    base = Path(RECORDINGS_DIR)
+    if not base.exists():
+        return []
+
+    sessions = []
+    for day_dir in sorted(base.iterdir()):
+        if not day_dir.is_dir():
+            continue
+        for time_dir in sorted(day_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+            try:
+                with open(transcript_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            session_info = data.get("session", {})
+            if not force and session_info.get("speaker_tagged"):
+                continue
+
+            # 音声ファイル特定
+            audio_file = session_info.get("audio_file", "audio.ogg")
+            audio_path = time_dir / audio_file
+            if not audio_path.exists():
+                for ext in ("audio.ogg", "audio.wav"):
+                    alt = time_dir / ext
+                    if alt.exists():
+                        audio_path = alt
+                        break
+                else:
+                    continue
+
+            segments = data.get("segments", [])
+            if not segments:
+                continue
+
+            sessions.append({
+                "path": f"{day_dir.name}/{time_dir.name}",
+                "audio": audio_path,
+                "transcript_path": transcript_path,
+                "data": data,
+            })
+
+    return sessions
+
+
+async def _batch_tag_task(force: bool = False):
+    """バッチ話者タグ付けタスク。asyncio.create_task で起動する。"""
+    import shutil
+
+    _batch_tag_state["running"] = True
+    _batch_tag_state["processed"] = 0
+    _batch_tag_state["failed"] = 0
+    _batch_tag_state["skipped"] = 0
+    _batch_tag_state["current_session"] = None
+    _batch_tag_state["errors"] = []
+    _batch_tag_state["cancel_requested"] = False
+    _batch_tag_state["started_at"] = datetime.now().isoformat()
+    _batch_tag_state["finished_at"] = None
+
+    try:
+        sessions = _find_untagged_sessions(force=force)
+        _batch_tag_state["total"] = len(sessions)
+        log.info(f"Batch speaker tagging: {len(sessions)} session(s) to process (force={force})")
+
+        if not sessions:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        # embedding モデルを一度だけロード
+        inference = None
+        try:
+            async with model_manager.gpu_lock:
+                await model_manager.unload_model()
+                inference = await loop.run_in_executor(
+                    None, speaker_filter._load_model
+                )
+
+            for sess in sessions:
+                if _batch_tag_state["cancel_requested"]:
+                    log.info("Batch speaker tagging cancelled by user")
+                    break
+
+                _batch_tag_state["current_session"] = sess["path"]
+                log.info(f"Batch tag: {sess['path']}")
+
+                try:
+                    updated = await loop.run_in_executor(
+                        None,
+                        lambda s=sess: speaker_filter.tag_segments_with_model(
+                            inference, str(s["audio"]), s["data"]["segments"]
+                        ),
+                    )
+
+                    # バックアップを作成してから transcript.json を更新
+                    bak_path = str(sess["transcript_path"]) + ".bak"
+                    shutil.copy2(sess["transcript_path"], bak_path)
+
+                    data = sess["data"]
+                    data["segments"] = updated
+                    data["session"]["speaker_tagged"] = True
+
+                    with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+
+                    _batch_tag_state["processed"] += 1
+                    log.info(f"Batch tag done: {sess['path']}")
+
+                except Exception as e:
+                    _batch_tag_state["failed"] += 1
+                    err_msg = f"{sess['path']}: {e}"
+                    _batch_tag_state["errors"].append(err_msg)
+                    log.error(f"Batch tag error: {err_msg}", exc_info=True)
+
+        finally:
+            if inference is not None:
+                await loop.run_in_executor(
+                    None, lambda: speaker_filter._unload_model(inference)
+                )
+
+    except Exception as e:
+        log.error(f"Batch speaker tagging task error: {e}", exc_info=True)
+    finally:
+        _batch_tag_state["running"] = False
+        _batch_tag_state["current_session"] = None
+        _batch_tag_state["finished_at"] = datetime.now().isoformat()
+        log.info(
+            f"Batch speaker tagging finished: "
+            f"processed={_batch_tag_state['processed']}, "
+            f"failed={_batch_tag_state['failed']}, "
+            f"total={_batch_tag_state['total']}"
+        )
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -1165,6 +1333,12 @@ async def main():
             log.info("Hotwords: DISABLED (settings)")
     else:
         log.info("Hotwords: DISABLED (env)")
+    if speaker_filter and speaker_filter.enabled:
+        sf_status = speaker_filter.get_status()
+        log.info(f"Speaker filter: AVAILABLE ({sf_status['speaker_count']} speakers, "
+                 f"threshold={sf_status['threshold']})")
+    else:
+        log.info("Speaker filter: UNAVAILABLE (no HF_AUTH_TOKEN)")
     if VAD_SEG_ENABLED:
         log.info(f"VAD segmentation: ON (check={VAD_CHECK_INTERVAL}s, "
                  f"silence_trigger={VAD_SILENCE_TRIGGER}s, max_buffer={VAD_MAX_BUFFER}s)")
@@ -1273,6 +1447,194 @@ async def main():
         hotword_loader.remove_custom(word)
         return web.json_response({"status": "ok", "custom": hotword_loader.get_custom_words()})
 
+    # --- Speaker 管理 API ---
+
+    async def handle_speakers_status(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        return web.json_response(speaker_filter.get_status())
+
+    async def handle_speakers_list(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        return web.json_response(speaker_filter.list_speakers())
+
+    async def handle_speakers_add(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return web.json_response({"error": "name is required"}, status=400)
+        is_user = bool(body.get("is_user", False))
+        speaker = speaker_filter.add_speaker(name, is_user=is_user)
+        return web.json_response(speaker, status=201)
+
+    async def handle_speakers_update(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        speaker_id = request.match_info["id"]
+        body = await request.json()
+        name = body.get("name")
+        is_user = body.get("is_user")
+        result = speaker_filter.update_speaker(speaker_id, name=name, is_user=is_user)
+        if result is None:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"status": "ok"})
+
+    async def handle_speakers_delete(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        speaker_id = request.match_info["id"]
+        ok = speaker_filter.remove_speaker(speaker_id)
+        if not ok:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"status": "ok"})
+
+    async def handle_speakers_add_voiceprint(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        speaker_id = request.match_info["id"]
+        body = await request.json()
+        session_path = str(body.get("session", "")).strip()
+        segment_indices = body.get("segment_indices", [])
+
+        if not session_path:
+            return web.json_response({"error": "session is required"}, status=400)
+        if not segment_indices:
+            return web.json_response({"error": "segment_indices is required"}, status=400)
+
+        # セッションの音声・トランスクリプトを特定
+        parts = session_path.split("/")
+        if len(parts) != 2:
+            return web.json_response({"error": "invalid session path"}, status=400)
+
+        session_dir = Path(RECORDINGS_DIR) / parts[0] / parts[1]
+        transcript_path = session_dir / "transcript.json"
+        if not transcript_path.exists():
+            return web.json_response({"error": "session not found"}, status=404)
+
+        try:
+            with open(transcript_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return web.json_response({"error": "transcript read error"}, status=500)
+
+        audio_file = data.get("session", {}).get("audio_file", "audio.ogg")
+        audio_path = session_dir / audio_file
+        if not audio_path.exists():
+            for ext in ("audio.ogg", "audio.wav"):
+                alt = session_dir / ext
+                if alt.exists():
+                    audio_path = alt
+                    break
+            else:
+                return web.json_response({"error": "audio not found"}, status=404)
+
+        all_segments = data.get("segments", [])
+        selected_segments = []
+        for idx in segment_indices:
+            if 0 <= idx < len(all_segments):
+                selected_segments.append(all_segments[idx])
+
+        if not selected_segments:
+            return web.json_response({"error": "no valid segments selected"}, status=400)
+
+        loop = asyncio.get_running_loop()
+        try:
+            async with model_manager.gpu_lock:
+                await model_manager.unload_model()
+                sample = await loop.run_in_executor(
+                    None,
+                    lambda: speaker_filter.add_voiceprint(
+                        speaker_id, str(audio_path), selected_segments, session_path
+                    ),
+                )
+        except Exception as e:
+            log.error(f"Add voiceprint error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+        if sample is None:
+            return web.json_response({"error": "failed to extract voiceprint"}, status=500)
+        return web.json_response(sample, status=201)
+
+    async def handle_speakers_remove_voiceprint(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        speaker_id = request.match_info["id"]
+        sample_id = request.match_info["sample_id"]
+        result = speaker_filter.remove_voiceprint(speaker_id, sample_id)
+        if result is None:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.json_response(result)
+
+    async def handle_speakers_threshold(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        body = await request.json()
+        threshold = float(body.get("threshold", 0.55))
+        speaker_filter.update_threshold(threshold)
+        return web.json_response({"status": "ok", "threshold": speaker_filter.get_threshold()})
+
+    async def handle_speakers_tag_start(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        if _batch_tag_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409,
+            )
+
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+
+        sessions = _find_untagged_sessions(force=force)
+        if not sessions and not force:
+            return web.json_response({
+                "status": "no_sessions",
+                "message": "All sessions already tagged",
+            })
+
+        asyncio.create_task(_batch_tag_task(force=force))
+        return web.json_response({"status": "started", "total": len(sessions)})
+
+    async def handle_speakers_tag_status(request):
+        return web.json_response(_batch_tag_state)
+
+    async def handle_speakers_tag_cancel(request):
+        if _batch_tag_state["running"]:
+            _batch_tag_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
+    async def handle_speakers_delete_all(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        speaker_filter.delete_all()
+        return web.json_response({"status": "ok"})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -1285,6 +1647,19 @@ async def main():
     mgmt_app.router.add_put("/hotwords/settings", handle_hotwords_settings_put)
     mgmt_app.router.add_post("/hotwords/custom", handle_hotwords_custom_post)
     mgmt_app.router.add_delete("/hotwords/custom", handle_hotwords_custom_delete)
+    # Speaker 管理 API (固定パスを {id} より先に登録)
+    mgmt_app.router.add_get("/speakers/status", handle_speakers_status)
+    mgmt_app.router.add_get("/speakers/list", handle_speakers_list)
+    mgmt_app.router.add_post("/speakers/add", handle_speakers_add)
+    mgmt_app.router.add_put("/speakers/threshold", handle_speakers_threshold)
+    mgmt_app.router.add_post("/speakers/tag/start", handle_speakers_tag_start)
+    mgmt_app.router.add_get("/speakers/tag/status", handle_speakers_tag_status)
+    mgmt_app.router.add_post("/speakers/tag/cancel", handle_speakers_tag_cancel)
+    mgmt_app.router.add_delete("/speakers/all", handle_speakers_delete_all)
+    mgmt_app.router.add_put("/speakers/{id}", handle_speakers_update)
+    mgmt_app.router.add_delete("/speakers/{id}", handle_speakers_delete)
+    mgmt_app.router.add_post("/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
+    mgmt_app.router.add_delete("/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()

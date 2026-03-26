@@ -24,6 +24,13 @@
     var termsCache = null;
     var autoDetectedCache = [];
 
+    // Speaker / voiceprint state
+    var currentDetailDate = "";
+    var currentDetailTime = "";
+    var currentDetailSegments = [];
+    var speakersCache = [];
+    var segmentFilter = "all";
+
     // --- Helpers ---
 
     function formatDuration(sec) {
@@ -146,6 +153,10 @@
         var s = data.session;
         var t = data.transcript;
 
+        currentDetailDate = s.date;
+        currentDetailTime = s.time;
+        currentDetailSegments = (t && t.segments) ? t.segments : [];
+
         detailHeader.innerHTML =
             "<h2>" + formatDateTime(s.date, s.time) + "</h2>" +
             '<div class="meta">' +
@@ -162,7 +173,27 @@
 
         audioEl.addEventListener("timeupdate", onTimeUpdate);
 
-        var segments = (t && t.segments) ? t.segments : [];
+        // Show voiceprint bar and filter bar if speakers exist
+        var vpBar = document.getElementById("voiceprint-bar");
+        var filterBar = document.getElementById("segment-filter-bar");
+        var hasTagged = currentDetailSegments.some(function (seg) { return seg.person_id; });
+        if (speakersCache.length > 0) {
+            vpBar.classList.remove("hidden");
+            updateVoiceprintSpeakerSelect();
+        } else {
+            vpBar.classList.add("hidden");
+        }
+        if (hasTagged) {
+            filterBar.classList.remove("hidden");
+        } else {
+            filterBar.classList.add("hidden");
+        }
+
+        renderSegments();
+    }
+
+    function renderSegments() {
+        var segments = currentDetailSegments;
         if (segments.length === 0) {
             segmentsContainer.innerHTML = '<div class="loading">No segments</div>';
             return;
@@ -170,9 +201,29 @@
 
         var html = "";
         segments.forEach(function (seg, idx) {
-            html += '<div class="segment" data-idx="' + idx + '" data-start="' + seg.start + '" data-end="' + seg.end + '">';
+            var isUnknown = seg.person_id === "unknown";
+            var isHidden = false;
+            if (segmentFilter === "unknown-only" && !isUnknown && seg.person_id) isHidden = true;
+            if (segmentFilter === "hide-unknown" && isUnknown) isHidden = true;
+
+            var cls = "segment";
+            if (isUnknown) cls += " unknown-segment";
+            if (isHidden) cls += " hidden";
+
+            html += '<div class="' + cls + '" data-idx="' + idx + '" data-start="' + seg.start + '" data-end="' + seg.end + '">';
+            html += '<input type="checkbox" class="segment-checkbox" data-idx="' + idx + '">';
             html += '<span class="segment-time" data-seek="' + seg.start + '">' + formatTimestamp(seg.start) + "</span>";
-            html += '<span class="segment-speaker">' + (seg.speaker || "") + "</span>";
+
+            // Speaker badge
+            if (seg.person_id && seg.person_id !== "unknown") {
+                var badgeCls = seg.is_user ? "speaker-badge user-speaker" : "speaker-badge known-speaker";
+                html += '<span class="' + badgeCls + '">' + escapeHtml(seg.person_name || seg.person_id) + "</span>";
+            } else if (seg.person_id === "unknown") {
+                html += '<span class="speaker-badge unknown-speaker">?</span>';
+            } else {
+                html += '<span class="segment-speaker">' + (seg.speaker || "") + "</span>";
+            }
+
             html += '<span class="segment-text">' + escapeHtml(seg.text) + "</span>";
             html += "</div>";
         });
@@ -189,6 +240,31 @@
                 }
             });
         }
+
+        // Checkbox events
+        var checkboxes = segmentsContainer.querySelectorAll(".segment-checkbox");
+        for (var j = 0; j < checkboxes.length; j++) {
+            checkboxes[j].addEventListener("change", updateVoiceprintSelection);
+        }
+    }
+
+    function updateVoiceprintSelection() {
+        var checked = segmentsContainer.querySelectorAll(".segment-checkbox:checked");
+        var countEl = document.getElementById("voiceprint-selected-count");
+        var addBtn = document.getElementById("voiceprint-add-btn");
+        countEl.textContent = checked.length + " selected";
+        addBtn.disabled = checked.length === 0;
+    }
+
+    function updateVoiceprintSpeakerSelect() {
+        var sel = document.getElementById("voiceprint-speaker-select");
+        sel.innerHTML = '<option value="">-- Speaker --</option>';
+        speakersCache.forEach(function (sp) {
+            var opt = document.createElement("option");
+            opt.value = sp.id;
+            opt.textContent = sp.name + (sp.is_user ? " (me)" : "");
+            sel.appendChild(opt);
+        });
     }
 
     function onTimeUpdate() {
@@ -230,9 +306,23 @@
         detailHeader.innerHTML = '<div class="loading">Loading...</div>';
         audioContainer.innerHTML = "";
         segmentsContainer.innerHTML = "";
+        segmentFilter = "all";
         modal.classList.remove("hidden");
 
+        // Load speakers list in parallel with session detail
+        loadSpeakersCache();
         fetchSessionDetail(date, time).then(renderDetail);
+    }
+
+    function loadSpeakersCache() {
+        fetch("/api/speakers/list").then(function (r) {
+            if (!r.ok) return [];
+            return r.json();
+        }).then(function (data) {
+            speakersCache = data || [];
+        }).catch(function () {
+            speakersCache = [];
+        });
     }
 
     function closeModal() {
@@ -265,6 +355,7 @@
         loadSuggestionCount();
         loadPresets();
         loadHotwordsSettings();
+        loadVoiceSettings();
     }
 
     function closeSettings() {
@@ -1039,8 +1130,356 @@
         });
     });
 
+    // ============================================================
+    // Voice / Speaker Management
+    // ============================================================
+
+    var voiceNameInput = document.getElementById("voice-name-input");
+    var voiceIsUserCb = document.getElementById("voice-is-user");
+    var voiceAddBtn = document.getElementById("voice-add-btn");
+    var voiceSpeakersListEl = document.getElementById("voice-speakers-list");
+    var voiceStatusText = document.getElementById("voice-status-text");
+    var voiceThresholdSlider = document.getElementById("voice-threshold");
+    var voiceThresholdValue = document.getElementById("voice-threshold-value");
+    var voiceThresholdSaveBtn = document.getElementById("voice-threshold-save");
+    var voiceTagBtn = document.getElementById("voice-tag-btn");
+    var voiceDeleteAllBtn = document.getElementById("voice-delete-all-btn");
+    var voiceStatus = document.getElementById("voice-status");
+
+    function loadVoiceSettings() {
+        fetch("/api/speakers/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data) {
+                voiceStatusText.textContent = "Unavailable (no HF token)";
+                return;
+            }
+            voiceStatusText.textContent = data.speaker_count + " speaker(s), " + data.total_samples + " sample(s)";
+            voiceThresholdSlider.value = data.threshold || 0.55;
+            voiceThresholdValue.textContent = (data.threshold || 0.55).toFixed(2);
+        }).catch(function () {
+            voiceStatusText.textContent = "Unavailable";
+        });
+
+        loadVoiceSpeakers();
+    }
+
+    function loadVoiceSpeakers() {
+        fetch("/api/speakers/list").then(function (r) {
+            if (!r.ok) return [];
+            return r.json();
+        }).then(function (data) {
+            speakersCache = data || [];
+            renderVoiceSpeakers(data || []);
+        }).catch(function () {
+            voiceSpeakersListEl.innerHTML = '<div class="text-dim">Unavailable</div>';
+        });
+    }
+
+    function renderVoiceSpeakers(speakers) {
+        if (speakers.length === 0) {
+            voiceSpeakersListEl.innerHTML = '<div class="loading">No speakers registered</div>';
+            return;
+        }
+
+        var html = "";
+        speakers.forEach(function (sp) {
+            html += '<div class="voice-speaker-row" data-id="' + escapeHtml(sp.id) + '">';
+            html += '<div class="voice-speaker-header">';
+            html += '<span class="voice-speaker-name">' + escapeHtml(sp.name) + '</span>';
+            if (sp.is_user) {
+                html += ' <span class="badge-user">Me</span>';
+            } else {
+                html += ' <span class="badge-other">Other</span>';
+            }
+            html += '<span class="voice-speaker-meta">' +
+                sp.sample_count + ' sample(s), ' + (sp.total_duration || 0).toFixed(1) + 's' +
+                (sp.has_embedding ? '' : ' (no embedding)') +
+                '</span>';
+            html += '<button class="btn-edit voice-speaker-edit" data-id="' + escapeHtml(sp.id) + '">Edit</button>';
+            html += '<button class="btn-danger voice-speaker-del" data-id="' + escapeHtml(sp.id) + '">Del</button>';
+            html += '</div>';
+            html += '<div class="voice-samples-list" id="samples-' + escapeHtml(sp.id) + '">';
+            html += '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(sp.id) + '">Show samples</a>';
+            html += '</div>';
+            html += '</div>';
+        });
+        voiceSpeakersListEl.innerHTML = html;
+
+        // Bind events
+        var delBtns = voiceSpeakersListEl.querySelectorAll(".voice-speaker-del");
+        for (var i = 0; i < delBtns.length; i++) {
+            delBtns[i].addEventListener("click", function () {
+                var id = this.getAttribute("data-id");
+                if (!confirm("Delete this speaker and all voiceprints?")) return;
+                fetch("/api/speakers/" + id, { method: "DELETE" })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
+            });
+        }
+
+        var editBtns = voiceSpeakersListEl.querySelectorAll(".voice-speaker-edit");
+        for (var j = 0; j < editBtns.length; j++) {
+            editBtns[j].addEventListener("click", function () {
+                editSpeaker(this.getAttribute("data-id"));
+            });
+        }
+
+        var showLinks = voiceSpeakersListEl.querySelectorAll(".voice-show-samples");
+        for (var k = 0; k < showLinks.length; k++) {
+            showLinks[k].addEventListener("click", function (e) {
+                e.preventDefault();
+                loadSpeakerSamples(this.getAttribute("data-id"));
+            });
+        }
+    }
+
+    function editSpeaker(id) {
+        var sp = speakersCache.find(function (s) { return s.id === id; });
+        if (!sp) return;
+        var newName = prompt("Speaker name:", sp.name);
+        if (!newName || !newName.trim()) return;
+        fetch("/api/speakers/" + id, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName.trim() }),
+        }).then(function (r) { return r.json(); })
+          .then(function () { loadVoiceSpeakers(); });
+    }
+
+    function loadSpeakerSamples(speakerId) {
+        // We need full speaker data — for now re-fetch from the status
+        // The samples are stored in config/speakers.json, accessible via speakers/list
+        // But list only returns summary. We need to read the samples from the file.
+        // Actually, let's fetch the speakers.json config directly through a custom endpoint
+        // or just show what we know from the summary.
+        var el = document.getElementById("samples-" + speakerId);
+        if (!el) return;
+        el.innerHTML = '<div class="text-dim">Sample details in config/speakers.json</div>';
+    }
+
+    voiceAddBtn.addEventListener("click", function () {
+        var name = voiceNameInput.value.trim();
+        if (!name) return;
+        var isUser = voiceIsUserCb.checked;
+        fetch("/api/speakers/add", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name, is_user: isUser }),
+        }).then(function (r) { return r.json(); }).then(function () {
+            voiceNameInput.value = "";
+            voiceIsUserCb.checked = false;
+            loadVoiceSpeakers();
+            loadVoiceSettings();
+        });
+    });
+
+    voiceNameInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") voiceAddBtn.click();
+    });
+
+    voiceThresholdSlider.addEventListener("input", function () {
+        voiceThresholdValue.textContent = parseFloat(this.value).toFixed(2);
+    });
+
+    voiceThresholdSaveBtn.addEventListener("click", function () {
+        var val = parseFloat(voiceThresholdSlider.value);
+        fetch("/api/speakers/threshold", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ threshold: val }),
+        }).then(function (r) { return r.json(); }).then(function () {
+            voiceStatus.textContent = "Threshold saved!";
+            setTimeout(function () { voiceStatus.textContent = ""; }, 2000);
+        });
+    });
+
+    voiceDeleteAllBtn.addEventListener("click", function () {
+        if (!confirm("Delete ALL speakers and voiceprints?")) return;
+        fetch("/api/speakers/all", { method: "DELETE" })
+            .then(function (r) { return r.json(); })
+            .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
+    });
+
+    // ============================================================
+    // Batch Speaker Tagging
+    // ============================================================
+
+    var tagPanel = document.getElementById("tag-panel");
+    var tagStatusText = document.getElementById("tag-status-text");
+    var tagProgressText = document.getElementById("tag-progress-text");
+    var tagCancelBtn = document.getElementById("tag-cancel-btn");
+    var tagProgressFill = document.getElementById("tag-progress-fill");
+    var tagCurrent = document.getElementById("tag-current");
+    var tagTimer = null;
+
+    function showTagPanel(state) {
+        tagPanel.classList.remove("hidden");
+        updateTagUI(state);
+    }
+
+    function updateTagUI(state) {
+        var done = (state.processed || 0) + (state.failed || 0);
+        var total = state.total || 0;
+        var pct = total > 0 ? Math.round(done / total * 100) : 0;
+
+        tagProgressFill.style.width = pct + "%";
+        tagProgressText.textContent = done + " / " + total;
+
+        if (state.running) {
+            tagStatusText.textContent = state.cancel_requested ? "Cancelling..." : "Tagging...";
+            tagCancelBtn.style.display = "";
+            tagCurrent.textContent = state.current_session || "";
+        } else {
+            tagCancelBtn.style.display = "none";
+            tagCurrent.textContent = "";
+            if (state.finished_at) {
+                var msg = "Done: " + (state.processed || 0) + " tagged";
+                if (state.failed > 0) msg += ", " + state.failed + " failed";
+                if (state.cancel_requested) msg += " (cancelled)";
+                tagStatusText.textContent = msg;
+            }
+        }
+    }
+
+    function startTagPolling() {
+        if (tagTimer) return;
+        tagTimer = setInterval(function () {
+            fetch("/api/speakers/tag/status").then(function (r) { return r.json(); }).then(function (state) {
+                updateTagUI(state);
+                if (!state.running) {
+                    clearInterval(tagTimer);
+                    tagTimer = null;
+                    loadPage(currentPage);
+                }
+            }).catch(function () {
+                clearInterval(tagTimer);
+                tagTimer = null;
+            });
+        }, 2000);
+    }
+
+    voiceTagBtn.addEventListener("click", function () {
+        if (!confirm("Run speaker tagging on all recordings?")) return;
+        var opts = { method: "POST" };
+        fetch("/api/speakers/tag/start", opts).then(function (r) {
+            return r.json().then(function (data) {
+                if (r.ok) {
+                    if (data.status === "no_sessions") {
+                        if (confirm("All sessions already tagged. Re-run on all?")) {
+                            fetch("/api/speakers/tag/start", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ force: true }),
+                            }).then(function (r2) { return r2.json(); }).then(function (d2) {
+                                showTagPanel({ running: true, total: d2.total || 0, processed: 0, failed: 0 });
+                                startTagPolling();
+                            });
+                        }
+                        return;
+                    }
+                    showTagPanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
+                    startTagPolling();
+                } else if (r.status === 409) {
+                    alert("Already running");
+                } else {
+                    alert("Error: " + (data.error || r.status));
+                }
+            });
+        }).catch(function (e) {
+            alert("Failed: " + e.message);
+        });
+    });
+
+    tagCancelBtn.addEventListener("click", function () {
+        fetch("/api/speakers/tag/cancel", { method: "POST" }).catch(function () {});
+    });
+
+    // Check if tag batch is already running on load
+    function checkTagStatus() {
+        fetch("/api/speakers/tag/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (state) {
+            if (state && state.running) {
+                showTagPanel(state);
+                startTagPolling();
+            }
+        }).catch(function () {});
+    }
+
+    // ============================================================
+    // Voiceprint add from session detail
+    // ============================================================
+
+    var voiceprintAddBtn = document.getElementById("voiceprint-add-btn");
+    var voiceprintSpeakerSelect = document.getElementById("voiceprint-speaker-select");
+
+    voiceprintAddBtn.addEventListener("click", function () {
+        var speakerId = voiceprintSpeakerSelect.value;
+        if (!speakerId) {
+            alert("Select a speaker first");
+            return;
+        }
+
+        var checked = segmentsContainer.querySelectorAll(".segment-checkbox:checked");
+        if (checked.length === 0) {
+            alert("Select segments first");
+            return;
+        }
+
+        var indices = [];
+        for (var i = 0; i < checked.length; i++) {
+            indices.push(parseInt(checked[i].getAttribute("data-idx"), 10));
+        }
+
+        var session = currentDetailDate + "/" + currentDetailTime;
+        voiceprintAddBtn.disabled = true;
+        voiceprintAddBtn.textContent = "Adding...";
+
+        fetch("/api/speakers/" + speakerId + "/voiceprint", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session: session, segment_indices: indices }),
+        }).then(function (r) {
+            return r.json().then(function (data) {
+                if (r.ok) {
+                    alert("Voiceprint added! (" + (data.duration || 0).toFixed(1) + "s)");
+                    // Uncheck all
+                    var cbs = segmentsContainer.querySelectorAll(".segment-checkbox:checked");
+                    for (var j = 0; j < cbs.length; j++) cbs[j].checked = false;
+                    updateVoiceprintSelection();
+                } else {
+                    alert("Error: " + (data.error || "unknown"));
+                }
+            });
+        }).catch(function (e) {
+            alert("Failed: " + e.message);
+        }).finally(function () {
+            voiceprintAddBtn.disabled = false;
+            voiceprintAddBtn.textContent = "Add to voiceprint";
+        });
+    });
+
+    // ============================================================
+    // Segment filter
+    // ============================================================
+
+    var filterBtns = document.querySelectorAll(".seg-filter-btn");
+    for (var fi = 0; fi < filterBtns.length; fi++) {
+        filterBtns[fi].addEventListener("click", function () {
+            filterBtns = document.querySelectorAll(".seg-filter-btn");
+            for (var fj = 0; fj < filterBtns.length; fj++) filterBtns[fj].classList.remove("active");
+            this.classList.add("active");
+            segmentFilter = this.getAttribute("data-filter");
+            renderSegments();
+        });
+    }
+
     // --- Init ---
     loadPage(1);
     checkDiarizeAvailability();
     loadHotwordsStatus();
+    checkTagStatus();
 })();
