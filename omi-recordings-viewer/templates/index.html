@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Omi Recordings</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v={{ v }}">
 </head>
 <body>
     <header>
@@ -56,11 +56,16 @@
             <button class="modal-close" id="modal-close">&times;</button>
             <div id="detail-header" class="detail-header"></div>
             <div id="audio-player-container" class="audio-player-container"></div>
-            <div id="voiceprint-bar" class="voiceprint-bar hidden">
+            <div id="voiceprint-bar" class="voiceprint-bar">
                 <span id="voiceprint-selected-count">0 selected</span>
                 <select id="voiceprint-speaker-select">
                     <option value="">-- Speaker --</option>
+                    <option value="__new__">+ New Speaker...</option>
                 </select>
+                <div id="voiceprint-new-speaker" class="voiceprint-new-speaker hidden">
+                    <input type="text" id="voiceprint-new-name" placeholder="Name">
+                    <label class="toggle-label"><input type="checkbox" id="voiceprint-new-is-user"><span>Me</span></label>
+                </div>
                 <button id="voiceprint-add-btn" class="btn-sm" disabled>Add to voiceprint</button>
             </div>
             <div id="segment-filter-bar" class="segment-filter-bar hidden">
@@ -187,6 +192,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v={{ v }}"></script>
 </body>
 </html>

@@ -6,7 +6,10 @@
     "audio_file": "audio.wav",
     "audio_size_mb": 0.1,
     "model": "large-v3",
-    "language": "ja"
+    "language": "ja",
+    "diarized": true,
+    "num_speakers": 1,
+    "speaker_tagged": true
   },
   "segments": [
     {
@@ -15,8 +18,10 @@
       "speaker_id": 0,
       "start": 0.0,
       "end": 29.98,
-      "is_user": true,
-      "person_id": null
+      "is_user": false,
+      "person_id": "unknown",
+      "person_name": "unknown",
+      "speaker_similarity": 0.265
     }
   ]
 }

@@ -87,7 +87,8 @@ def _write_json(path: Path, data) -> None:
 # ============================================================
 
 async def handle_index(request: web.Request) -> web.Response:
-    return aiohttp_jinja2.render_template("index.html", request, {})
+    import time
+    return aiohttp_jinja2.render_template("index.html", request, {"v": int(time.time())})
 
 
 async def handle_api_sessions(request: web.Request) -> web.Response:

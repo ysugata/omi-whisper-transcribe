@@ -1,1 +1,58 @@
-[]
+[
+  {
+    "id": "6ffefbfc",
+    "wrong": "キューバネーツ",
+    "correct": "Kubernetes",
+    "context": "キューバネーツクラスターのHelmチャートをR5CDでデプロイしています。",
+    "detected_at": "2026-03-26T17:24:35.112303",
+    "status": "pending"
+  },
+  {
+    "id": "d6849086",
+    "wrong": "アルゴシデ",
+    "correct": "ArgoCD",
+    "context": "KubernetesクラスターのHelmチャートをアルゴシデで",
+    "detected_at": "2026-03-26T17:27:13.536587",
+    "status": "pending"
+  },
+  {
+    "id": "11a084a6",
+    "wrong": "チャート",
+    "correct": "chart",
+    "context": "キューバネーツクラスターのHelmチャートをR5CDでデプロイしています。",
+    "detected_at": "2026-03-26T17:33:39.541190",
+    "status": "pending"
+  },
+  {
+    "id": "11ea424b",
+    "wrong": "イントワーチ",
+    "correct": "PyTorch",
+    "context": "RTX3060のVRAMは12GBで、WhisperのLargeモデルをイントワーチで量子化して動かしています",
+    "detected_at": "2026-03-26T17:33:39.541276",
+    "status": "pending"
+  },
+  {
+    "id": "128e02fd",
+    "wrong": "ガーバナ",
+    "correct": "Grafana",
+    "context": "PrometheusとガーバナでDatadogの代わりにオブザーベリビティ基盤を構築したGitHub ActionsのCIパイプラインでTerraformのプランをプロリクエストに自動コメントさせる。",
+    "detected_at": "2026-03-26T17:33:46.374270",
+    "status": "pending"
+  },
+  {
+    "id": "c6a7383c",
+    "wrong": "プロリクエスト",
+    "correct": "Pull Request",
+    "context": "PrometheusとガーバナでDatadogの代わりにオブザーベリビティ基盤を構築したGitHub ActionsのCIパイプラインでTerraformのプランをプロリクエストに自動コメントさせる。",
+    "detected_at": "2026-03-26T17:33:46.374337",
+    "status": "pending"
+  },
+  {
+    "id": "16e7dfd1",
+    "wrong": "炎症部屋",
+    "correct": "Ansible",
+    "context": "わかった、炎症部屋に確認してみる",
+    "detected_at": "2026-03-26T21:40:34.271668",
+    "status": "pending"
+  }
+]

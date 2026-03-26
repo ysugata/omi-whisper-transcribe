@@ -851,6 +851,24 @@ main {
     font-size: 0.85rem;
 }
 
+.voiceprint-new-speaker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.voiceprint-new-speaker.hidden { display: none; }
+
+.voiceprint-new-speaker input[type="text"] {
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.85rem;
+    width: 120px;
+}
+
 /* Segment filter bar */
 .segment-filter-bar {
     display: flex;

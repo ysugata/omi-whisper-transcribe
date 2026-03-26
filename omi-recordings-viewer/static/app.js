@@ -173,16 +173,14 @@
 
         audioEl.addEventListener("timeupdate", onTimeUpdate);
 
-        // Show voiceprint bar and filter bar if speakers exist
+        // Always show voiceprint bar (users can create new speakers inline)
         var vpBar = document.getElementById("voiceprint-bar");
         var filterBar = document.getElementById("segment-filter-bar");
         var hasTagged = currentDetailSegments.some(function (seg) { return seg.person_id; });
-        if (speakersCache.length > 0) {
-            vpBar.classList.remove("hidden");
-            updateVoiceprintSpeakerSelect();
-        } else {
-            vpBar.classList.add("hidden");
-        }
+        updateVoiceprintSpeakerSelect();
+        // Reset new speaker form
+        var newSp = document.getElementById("voiceprint-new-speaker");
+        if (newSp) newSp.classList.add("hidden");
         if (hasTagged) {
             filterBar.classList.remove("hidden");
         } else {
@@ -265,6 +263,10 @@
             opt.textContent = sp.name + (sp.is_user ? " (me)" : "");
             sel.appendChild(opt);
         });
+        var newOpt = document.createElement("option");
+        newOpt.value = "__new__";
+        newOpt.textContent = "+ New Speaker...";
+        sel.appendChild(newOpt);
     }
 
     function onTimeUpdate() {
@@ -284,10 +286,20 @@
 
     // --- Events ---
 
-    function loadPage(page) {
+    function loadPage(page, retryCount) {
         currentPage = page;
         listEl.innerHTML = '<div class="loading">Loading...</div>';
-        fetchSessions(page, currentQuery).then(renderSessions);
+        fetchSessions(page, currentQuery).then(renderSessions).catch(function (err) {
+            console.error("loadPage failed:", err);
+            var retry = retryCount || 0;
+            if (retry < 3) {
+                setTimeout(function () { loadPage(page, retry + 1); }, 1000 * (retry + 1));
+            } else {
+                listEl.innerHTML = '<div class="empty-state">Failed to load. <a href="#" id="retry-link">Retry</a></div>';
+                var retryLink = document.getElementById("retry-link");
+                if (retryLink) retryLink.addEventListener("click", function (e) { e.preventDefault(); loadPage(1); });
+            }
+        });
     }
 
     function doSearch() {
@@ -309,13 +321,16 @@
         segmentFilter = "all";
         modal.classList.remove("hidden");
 
-        // Load speakers list in parallel with session detail
-        loadSpeakersCache();
-        fetchSessionDetail(date, time).then(renderDetail);
+        // Load speakers list and session detail in parallel, render when both ready
+        var speakersPromise = loadSpeakersCache();
+        var detailPromise = fetchSessionDetail(date, time);
+        Promise.all([speakersPromise, detailPromise]).then(function (results) {
+            renderDetail(results[1]);
+        });
     }
 
     function loadSpeakersCache() {
-        fetch("/api/speakers/list").then(function (r) {
+        return fetch("/api/speakers/list").then(function (r) {
             if (!r.ok) return [];
             return r.json();
         }).then(function (data) {
@@ -1415,11 +1430,56 @@
 
     var voiceprintAddBtn = document.getElementById("voiceprint-add-btn");
     var voiceprintSpeakerSelect = document.getElementById("voiceprint-speaker-select");
+    var voiceprintNewSpeaker = document.getElementById("voiceprint-new-speaker");
+    var voiceprintNewName = document.getElementById("voiceprint-new-name");
+    var voiceprintNewIsUser = document.getElementById("voiceprint-new-is-user");
+
+    // Show/hide new speaker fields when dropdown changes
+    voiceprintSpeakerSelect.addEventListener("change", function () {
+        if (this.value === "__new__") {
+            voiceprintNewSpeaker.classList.remove("hidden");
+            voiceprintNewName.focus();
+        } else {
+            voiceprintNewSpeaker.classList.add("hidden");
+        }
+    });
+
+    function addVoiceprintToSpeaker(speakerId, indices, session) {
+        voiceprintAddBtn.disabled = true;
+        voiceprintAddBtn.textContent = "Adding...";
+
+        fetch("/api/speakers/" + speakerId + "/voiceprint", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session: session, segment_indices: indices }),
+        }).then(function (r) {
+            return r.json().then(function (data) {
+                if (r.ok) {
+                    alert("Voiceprint added! (" + (data.duration || 0).toFixed(1) + "s)");
+                    var cbs = segmentsContainer.querySelectorAll(".segment-checkbox:checked");
+                    for (var j = 0; j < cbs.length; j++) cbs[j].checked = false;
+                    updateVoiceprintSelection();
+                    // Refresh speakers cache
+                    loadSpeakersCache().then(function () { updateVoiceprintSpeakerSelect(); });
+                } else {
+                    alert("Error: " + (data.error || "unknown"));
+                }
+            });
+        }).catch(function (e) {
+            alert("Failed: " + e.message);
+        }).finally(function () {
+            voiceprintAddBtn.disabled = false;
+            voiceprintAddBtn.textContent = "Add to voiceprint";
+            voiceprintNewSpeaker.classList.add("hidden");
+            voiceprintNewName.value = "";
+            voiceprintNewIsUser.checked = false;
+        });
+    }
 
     voiceprintAddBtn.addEventListener("click", function () {
         var speakerId = voiceprintSpeakerSelect.value;
         if (!speakerId) {
-            alert("Select a speaker first");
+            alert("Select a speaker or create a new one");
             return;
         }
 
@@ -1433,33 +1493,40 @@
         for (var i = 0; i < checked.length; i++) {
             indices.push(parseInt(checked[i].getAttribute("data-idx"), 10));
         }
-
         var session = currentDetailDate + "/" + currentDetailTime;
-        voiceprintAddBtn.disabled = true;
-        voiceprintAddBtn.textContent = "Adding...";
 
-        fetch("/api/speakers/" + speakerId + "/voiceprint", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session: session, segment_indices: indices }),
-        }).then(function (r) {
-            return r.json().then(function (data) {
-                if (r.ok) {
-                    alert("Voiceprint added! (" + (data.duration || 0).toFixed(1) + "s)");
-                    // Uncheck all
-                    var cbs = segmentsContainer.querySelectorAll(".segment-checkbox:checked");
-                    for (var j = 0; j < cbs.length; j++) cbs[j].checked = false;
-                    updateVoiceprintSelection();
+        if (speakerId === "__new__") {
+            // Create new speaker first, then add voiceprint
+            var name = voiceprintNewName.value.trim();
+            if (!name) {
+                alert("Enter a speaker name");
+                voiceprintNewName.focus();
+                return;
+            }
+            var isUser = voiceprintNewIsUser.checked;
+            voiceprintAddBtn.disabled = true;
+            voiceprintAddBtn.textContent = "Creating...";
+
+            fetch("/api/speakers/add", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: name, is_user: isUser }),
+            }).then(function (r) { return r.json(); }).then(function (sp) {
+                if (sp && sp.id) {
+                    addVoiceprintToSpeaker(sp.id, indices, session);
                 } else {
-                    alert("Error: " + (data.error || "unknown"));
+                    alert("Failed to create speaker");
+                    voiceprintAddBtn.disabled = false;
+                    voiceprintAddBtn.textContent = "Add to voiceprint";
                 }
+            }).catch(function (e) {
+                alert("Failed to create speaker: " + e.message);
+                voiceprintAddBtn.disabled = false;
+                voiceprintAddBtn.textContent = "Add to voiceprint";
             });
-        }).catch(function (e) {
-            alert("Failed: " + e.message);
-        }).finally(function () {
-            voiceprintAddBtn.disabled = false;
-            voiceprintAddBtn.textContent = "Add to voiceprint";
-        });
+        } else {
+            addVoiceprintToSpeaker(speakerId, indices, session);
+        }
     });
 
     // ============================================================

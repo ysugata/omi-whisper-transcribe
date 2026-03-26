@@ -13,8 +13,8 @@ VRAM フロー:
 必要パッケージ:
   pip install torch whisperx
 
-pyannote/speaker-diarization-3.1 は gated model のため HF トークン必須:
-  https://huggingface.co/pyannote/speaker-diarization-3.1
+pyannote/speaker-diarization-community-1 は gated model のため HF トークン必須:
+  https://huggingface.co/pyannote/speaker-diarization-community-1
   https://huggingface.co/pyannote/segmentation-3.0
 """
 
@@ -63,20 +63,25 @@ class Diarizer:
         segments: list[dict],
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-    ) -> list[dict]:
-        """音声ファイルに対して話者分離を実行し、更新されたセグメントを返す。
+    ) -> tuple[list[dict], bool]:
+        """音声ファイルに対して話者分離を実行し、(更新セグメント, 成功フラグ) を返す。
 
-        エラー時は元のセグメントをそのまま返す (テキストを失わない)。
+        エラー時は (元のセグメント, False) を返す (テキストを失わない)。
         """
-        if not self._enabled or not segments:
-            return segments
+        if not self._enabled:
+            log.warning("Diarizer is disabled (no HF token)")
+            return segments, False
+        if not segments:
+            log.warning("No segments to diarize")
+            return segments, False
 
         try:
-            return self._run_pipeline(audio_path, segments, min_speakers, max_speakers)
+            result = self._run_pipeline(audio_path, segments, min_speakers, max_speakers)
+            return result, True
         except Exception as e:
-            log.error(f"Diarization failed (original segments preserved): {e}", exc_info=True)
+            log.error(f"Diarization FAILED (original segments preserved): {e}", exc_info=True)
             self._free_vram()
-            return segments
+            return segments, False
 
     def _run_pipeline(
         self,
@@ -94,29 +99,60 @@ class Diarizer:
 
         # 音声ロード
         audio = whisperx.load_audio(audio_path)
-        log.info(f"Audio loaded: {len(audio) / 16000:.1f}s")
+        audio_duration = len(audio) / 16000.0
+        log.info(f"Audio loaded: {audio_duration:.1f}s")
+
+        if audio_duration < 1.0:
+            log.warning(f"Audio too short for diarization: {audio_duration:.1f}s")
+            raise ValueError(f"Audio too short: {audio_duration:.1f}s")
+
+        # セグメントのタイムスタンプを音声長にクランプし、無効なものを除去
+        wx_segments = []
+        for s in segments:
+            text = s.get("text", "").strip()
+            if not text:
+                continue
+            start = max(0.0, min(s.get("start", 0.0), audio_duration))
+            end = max(0.0, min(s.get("end", 0.0), audio_duration))
+            if start >= end:
+                end = min(start + 0.5, audio_duration)
+            if start >= audio_duration:
+                continue
+            wx_segments.append({"text": text, "start": start, "end": end})
+
+        if not wx_segments:
+            log.warning("No valid segments after timestamp clamping")
+            raise ValueError("No valid segments for alignment")
+
+        log.info(f"Prepared {len(wx_segments)} segments for alignment "
+                 f"(from {len(segments)} original, audio={audio_duration:.1f}s)")
 
         # --- Step 1: Alignment (wav2vec2) ---
         log.info("Step 1/3: Loading alignment model (wav2vec2)...")
-        model_a, metadata = whisperx.load_align_model(
-            language_code=self._language,
-            device=self._device,
-        )
-
-        wx_segments = [
-            {"text": s["text"], "start": s["start"], "end": s["end"]}
-            for s in segments
-        ]
+        try:
+            model_a, metadata = whisperx.load_align_model(
+                language_code=self._language,
+                device=self._device,
+            )
+        except Exception as e:
+            log.error(f"Failed to load alignment model for '{self._language}': {e}")
+            raise
 
         log.info(f"Aligning {len(wx_segments)} segments...")
-        aligned = whisperx.align(
-            wx_segments,
-            model_a,
-            metadata,
-            audio,
-            self._device,
-            return_char_alignments=False,
-        )
+        try:
+            aligned = whisperx.align(
+                wx_segments,
+                model_a,
+                metadata,
+                audio,
+                self._device,
+                return_char_alignments=False,
+            )
+        except Exception as e:
+            log.error(f"Alignment failed: {e}")
+            del model_a, metadata
+            self._free_vram()
+            raise
 
         del model_a, metadata
         self._free_vram()
@@ -124,10 +160,15 @@ class Diarizer:
 
         # --- Step 2: Diarization (pyannote) ---
         log.info("Step 2/3: Loading diarization model (pyannote)...")
-        diarize_model = DiarizationPipeline(
-            use_auth_token=self._hf_token,
-            device=self._device,
-        )
+        try:
+            diarize_model = DiarizationPipeline(
+                model_name="pyannote/speaker-diarization-community-1",
+                token=self._hf_token,
+                device=self._device,
+            )
+        except Exception as e:
+            log.error(f"Failed to load diarization model (check HF token and model access): {e}")
+            raise
 
         diarize_kwargs = {}
         if min_speakers is not None:
@@ -136,7 +177,13 @@ class Diarizer:
             diarize_kwargs["max_speakers"] = max_speakers
 
         log.info("Running diarization...")
-        diarize_result = diarize_model(audio, **diarize_kwargs)
+        try:
+            diarize_result = diarize_model(audio, **diarize_kwargs)
+        except Exception as e:
+            log.error(f"Diarization inference failed: {e}")
+            del diarize_model
+            self._free_vram()
+            raise
 
         del diarize_model
         self._free_vram()
@@ -144,8 +191,16 @@ class Diarizer:
 
         # --- Step 3: Speaker assignment ---
         log.info("Step 3/3: Assigning speakers...")
-        result = whisperx.assign_word_speakers(diarize_result, aligned)
+        try:
+            result = whisperx.assign_word_speakers(diarize_result, aligned)
+        except Exception as e:
+            log.error(f"Speaker assignment failed: {e}")
+            raise
         wx_result_segs = result.get("segments", [])
+
+        if not wx_result_segs:
+            log.warning("whisperx returned 0 segments after speaker assignment")
+            raise ValueError("Speaker assignment produced no segments")
 
         updated = self._merge_speakers(segments, wx_result_segs)
 
