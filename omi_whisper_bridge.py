@@ -84,6 +84,9 @@ NORMALIZE_TARGET_DBFS = float(os.environ.get("NORMALIZE_TARGET_DBFS", "-16.0"))
 NOISE_REDUCE_ENABLED = os.environ.get("NOISE_REDUCE_ENABLED", "false").lower() in ("true", "1", "yes")
 NOISE_REDUCE_PROP_DECREASE = float(os.environ.get("NOISE_REDUCE_PROP_DECREASE", "0.8"))
 
+# --- セグメント分割設定 ---
+SEGMENT_MAX_DURATION = float(os.environ.get("SEGMENT_MAX_DURATION", "15.0"))  # 秒 (0=無効)
+
 # --- VAD セグメンテーション設定 ---
 VAD_SEG_ENABLED = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
 VAD_CHECK_INTERVAL = float(os.environ.get("VAD_CHECK_INTERVAL", "1.0"))       # VAD チェック間隔 (秒)
@@ -522,6 +525,169 @@ def _clean_trailing_fragments(text: str) -> str:
     return cleaned
 
 
+# ギブリッシュ仮名フィルタ: Whisper が非音声を無理やりカタカナ/ひらがなに変換したノイズを除去
+# 文法的助詞パターン (ひらがな + 前後文字で文法的かどうかを判定)
+_PARTICLE_PATTERNS = re.compile(
+    r'[ぁ-ん\u30a0-\u30ff](は|が|を|へ|から|まで|より|ばかり|さえ|すら|だけ|ほど)[ぁ-ん\u30a0-\u30ff]'
+)
+
+_GIBBERISH_LOGPROB_THRESHOLD = -0.5
+
+
+def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
+    """テキストが意味不明なカタカナ/ひらがな羅列 (ギブリッシュ) かどうかを判定する。
+
+    Whisper が非音声 (電車の走行音、空調ノイズ等) を無理やり文字化した場合に
+    生成される、意味のないカタカナ/ひらがなの連続を検出する。
+
+    偽陽性防止のため、以下の場合はスキップ:
+    - 高い信頼度 (avg_logprob >= -0.3)
+    - 漢字を含む (通常の日本語文)
+    - 7文字以下 (短い正当な外来語)
+    - 文法的な助詞パターンを含む (文法的に正しい文)
+    """
+    # High confidence → skip
+    if avg_logprob >= -0.3:
+        return False
+
+    # Strip punctuation, commas, spaces to get the "body"
+    body = re.sub(r'[\s,，、。.!?？！・…―「」\-\'\"]+', '', text)
+
+    if len(body) <= 7:
+        return False
+
+    # Contains kanji → legitimate Japanese
+    if re.search(r'[\u4e00-\u9fff]', body):
+        return False
+
+    # Count kana ratios
+    katakana_count = len(re.findall(r'[\u30a0-\u30ff]', body))
+    hiragana_count = len(re.findall(r'[\u3040-\u309f]', body))
+    body_len = len(body)
+
+    katakana_ratio = katakana_count / body_len if body_len else 0
+    hiragana_ratio = hiragana_count / body_len if body_len else 0
+
+    # Must be kana-dominant (70%+)
+    if katakana_ratio < 0.7 and hiragana_ratio < 0.7:
+        return False
+
+    # Low confidence required
+    if avg_logprob >= _GIBBERISH_LOGPROB_THRESHOLD:
+        return False
+
+    # Contains grammatical particle patterns → likely real Japanese
+    if _PARTICLE_PATTERNS.search(body):
+        return False
+
+    return True
+
+
+# 句読点正規化
+def _normalize_punctuation(text: str) -> str:
+    """句読点を正規化する。
+
+    1. 日本語文字に囲まれた `.` → `。` (数字の小数点は除外)
+    2. `- ` で始まる発話区切りマーカーを除去
+    3. 末尾のカンマ `,` `、` を除去
+    4. 連続する同一句読点を1つにまとめる
+    """
+    # 1. Period after Japanese text → 。 (exclude decimal points like 3.14)
+    #    Matches: period preceded by non-digit, non-space AND followed by non-digit or end of string
+    result = re.sub(
+        r'(?<=[^\d\s])\.(?=[^\d\s]|$)',
+        '。',
+        text,
+    )
+
+    # 2. Remove dash speech delimiters: "- 楽しかった?- 美味しかった" → "楽しかった? 美味しかった"
+    #    Match dash followed by space (dialogue marker style)
+    result = re.sub(r'\s*-\s+', ' ', result).strip()
+
+    # 3. Remove trailing commas
+    result = re.sub(r'[,，、]+\s*$', '', result)
+
+    # 4. Collapse consecutive identical punctuation
+    result = re.sub(r'([。、!?！？])\1+', r'\1', result)
+
+    return result.strip()
+
+
+# セグメント分割: 長いセグメントを文境界で分割
+_SEGMENT_SPLIT_RE = re.compile(
+    r'(?<=[。.!?？！])|'    # Sentence-ending punctuation
+    r'(?<=けど\s)|'         # Conjunction + space
+    r'(?<=から\s)|'
+    r'(?<=のに\s)|'
+    r'(?<=ので\s)|'
+    r'(?<=けれど\s)'
+)
+
+
+def _split_long_segment(seg_dict: dict, max_duration: float) -> list[dict]:
+    """長いセグメントを文境界で分割する。
+
+    タイムスタンプは文字数比で按分。
+    5文字未満の断片は隣接セグメントにマージ。
+    分割不能な場合は元のまま返す。
+    """
+    text = seg_dict["text"]
+    start = seg_dict["start"]
+    end = seg_dict["end"]
+    duration = end - start
+
+    if duration <= max_duration:
+        return [seg_dict]
+
+    # Split by sentence boundaries
+    parts = _SEGMENT_SPLIT_RE.split(text)
+    parts = [p for p in parts if p]  # remove empty strings
+
+    if len(parts) <= 1:
+        return [seg_dict]
+
+    # Merge short fragments (< 5 chars) into neighbors
+    merged = []
+    for p in parts:
+        if merged and len(p.strip()) < 5:
+            merged[-1] += p
+        else:
+            merged.append(p)
+
+    # If last part is too short, merge into previous
+    if len(merged) > 1 and len(merged[-1].strip()) < 5:
+        merged[-2] += merged[-1]
+        merged.pop()
+
+    if len(merged) <= 1:
+        return [seg_dict]
+
+    # Compute timestamps proportionally by character count
+    total_chars = sum(len(p) for p in merged)
+    if total_chars == 0:
+        return [seg_dict]
+
+    result = []
+    current_start = start
+    for i, part in enumerate(merged):
+        ratio = len(part) / total_chars
+        part_duration = duration * ratio
+        part_end = current_start + part_duration
+        if i == len(merged) - 1:
+            part_end = end  # last segment gets exact end time
+
+        new_seg = dict(seg_dict)
+        new_seg["text"] = part.strip()
+        new_seg["start"] = round(current_start, 2)
+        new_seg["end"] = round(part_end, 2)
+        if new_seg["text"]:  # skip empty
+            result.append(new_seg)
+
+        current_start = part_end
+
+    return result if result else [seg_dict]
+
+
 # プロンプトエコー検出用の区切り文字パターン
 _PROMPT_SPLIT_RE = re.compile(r"[、。,.\s:：]+")
 
@@ -641,6 +807,11 @@ def transcribe_audio(
             log.debug(f"Short low-confidence segment dropped: '{text}' (logprob={seg.avg_logprob:.2f})")
             continue
 
+        # ギブリッシュ仮名フィルタ (意味不明なカタカナ/ひらがな羅列を除去)
+        if _is_gibberish_kana(text, seg.avg_logprob):
+            log.info(f"Gibberish kana filtered: '{text[:80]}' (logprob={seg.avg_logprob:.2f})")
+            continue
+
         # タイムスタンプをチャンク長にクランプ
         seg_start = max(0.0, min(seg.start, chunk_duration))
         seg_end = max(0.0, min(seg.end, chunk_duration))
@@ -663,6 +834,11 @@ def transcribe_audio(
         # 末尾カンマ断片クリーナー
         text = _clean_trailing_fragments(text)
 
+        # 句読点正規化
+        text = _normalize_punctuation(text)
+        if not text:
+            continue
+
         # プロンプトエコー検出
         if initial_prompt and _is_prompt_echo(text, initial_prompt):
             continue
@@ -681,7 +857,13 @@ def transcribe_audio(
         }
         if LANGUAGE is None:
             seg_dict["language"] = info.language
-        segments_out.append(seg_dict)
+
+        # セグメント分割 (長いセグメントを文境界で分割)
+        if SEGMENT_MAX_DURATION > 0 and (seg_end - seg_start) > SEGMENT_MAX_DURATION:
+            split_segs = _split_long_segment(seg_dict, SEGMENT_MAX_DURATION)
+            segments_out.extend(split_segs)
+        else:
+            segments_out.append(seg_dict)
 
     return segments_out
 
