@@ -483,8 +483,10 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"^\s*\.+\s*$"),
     re.compile(r"(.{2,}?)\1{3,}"),  # 同一フレーズの4回以上繰り返し
     re.compile(r"(F\d+[・,、]\s*){3,}"),  # F-key 暴走パターン (F1・F2・F3...)
-    re.compile(r"([ぁ-ん]{1,3}[,，、]\s*){5,}[ぁ-ん]*"),  # カンマ/中黒区切りの単音節羅列 (背景音楽ハルシネーション)
+    re.compile(r"([ぁ-ん]{1,4}[,，、]\s*){3,}[ぁ-ん]*"),  # カンマ区切りの短いひらがな羅列 (hotwords/背景音汚染)
+    re.compile(r"([ァ-ヴー]{1,4}[,，、]\s*){3,}[ァ-ヴー]*"),  # カタカナ版
     re.compile(r"^[。、.,!?・…―\s]+$"),  # 句読点・記号のみ
+    re.compile(r"\ufffd"),  # Unicode replacement character (音声デコードエラー)
 ]
 
 
@@ -556,10 +558,10 @@ def transcribe_audio(
         language=LANGUAGE,
         vad_filter=VAD_FILTER,
         vad_parameters=dict(
-            min_speech_duration_ms=250,
+            min_speech_duration_ms=500,   # 500ms (was 250ms) — reject short noise bursts
             min_silence_duration_ms=500,
             speech_pad_ms=200,
-            threshold=0.4,
+            threshold=0.5,                # 0.5 (was 0.4) — stricter speech detection
         ),
         word_timestamps=False,
         condition_on_previous_text=False,
@@ -576,8 +578,8 @@ def transcribe_audio(
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
     for seg in segments:
-        # 確信度フィルタ 1: 非常に高い無音確率 → 単独で除去
-        if seg.no_speech_prob > 0.85:
+        # 確信度フィルタ 1: 高い無音確率 → 単独で除去
+        if seg.no_speech_prob > 0.8:
             log.info(
                 f"Segment FILTERED (high no_speech): no_speech_prob={seg.no_speech_prob:.2f}, "
                 f"text='{seg.text.strip()[:80]}'"
@@ -585,7 +587,7 @@ def transcribe_audio(
             continue
 
         # 確信度フィルタ 2: 両方悪い場合に除去
-        if seg.avg_logprob < -0.7 and seg.no_speech_prob > 0.5:
+        if seg.avg_logprob < -0.6 and seg.no_speech_prob > 0.4:
             log.info(
                 f"Segment FILTERED (low quality): avg_logprob={seg.avg_logprob:.2f}, "
                 f"no_speech_prob={seg.no_speech_prob:.2f}, text='{seg.text.strip()[:80]}'"
@@ -596,11 +598,16 @@ def transcribe_audio(
         if not text:
             continue
 
+        # Unicode replacement character (音声デコードエラー由来)
+        if '\ufffd' in text:
+            log.debug(f"Segment with replacement char dropped: '{text[:40]}'")
+            continue
+
         # 短すぎるセグメントでかつ信頼度が低い場合は除去
         if len(text) <= 1:
             log.debug(f"Single-char segment dropped: '{text}'")
             continue
-        if len(text) <= 3 and seg.avg_logprob < -0.5:
+        if len(text) <= 3 and seg.avg_logprob < -0.4:
             log.debug(f"Short low-confidence segment dropped: '{text}' (logprob={seg.avg_logprob:.2f})")
             continue
 

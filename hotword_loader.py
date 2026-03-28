@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_SETTINGS = {
     "enabled": True,
     "max_total": 500,
+    "min_length": 3,  # Filter out short entries that cause noise contamination
     "categories": {
         "place": {"enabled": True, "max": 200},
         "company": {"enabled": True, "max": 100},
@@ -159,18 +160,31 @@ class HotwordLoader:
         """設定に基づいてキャッシュされた hotword リストを再構築する。"""
         words: list[str] = []
         max_total = self._settings.get("max_total", 500)
+        min_length = self._settings.get("min_length", 3)
         cat_settings = self._settings.get("categories", {})
 
-        # カテゴリ別に追加
+        # カテゴリ別に追加 (min_length 未満のエントリはスキップ)
         categories = self._hotwords_data.get("categories", {})
+        filtered_count = 0
         for cat_name, cat_words in categories.items():
             cs = cat_settings.get(cat_name, {})
             if not cs.get("enabled", True):
                 continue
             cat_max = cs.get("max", 100)
-            words.extend(cat_words[:cat_max])
+            added = 0
+            for w in cat_words:
+                if added >= cat_max:
+                    break
+                if len(w) < min_length:
+                    filtered_count += 1
+                    continue
+                words.append(w)
+                added += 1
 
-        # カスタム words を追加 (カスタムは常に含める)
+        if filtered_count:
+            log.info(f"Hotwords: filtered {filtered_count} entries shorter than {min_length} chars")
+
+        # カスタム words を追加 (カスタムは min_length 対象外、常に含める)
         words.extend(self._custom_words)
 
         # 重複排除 (順序維持)
@@ -214,6 +228,8 @@ class HotwordLoader:
             self._settings["enabled"] = bool(settings["enabled"])
         if "max_total" in settings:
             self._settings["max_total"] = int(settings["max_total"])
+        if "min_length" in settings:
+            self._settings["min_length"] = max(1, int(settings["min_length"]))
         if "categories" in settings:
             for cat, val in settings["categories"].items():
                 if cat in self._settings["categories"]:
