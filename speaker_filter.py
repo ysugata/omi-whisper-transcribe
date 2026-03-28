@@ -85,6 +85,7 @@ class SpeakerFilter:
         gc.collect()
         try:
             import torch
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
         except ImportError:
             pass
@@ -105,6 +106,7 @@ class SpeakerFilter:
         gc.collect()
         try:
             import torch
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
         except ImportError:
             pass

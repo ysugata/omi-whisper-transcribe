@@ -53,6 +53,7 @@ class Diarizer:
         gc.collect()
         try:
             import torch
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
         except ImportError:
             pass
@@ -203,6 +204,11 @@ class Diarizer:
             raise ValueError("Speaker assignment produced no segments")
 
         updated = self._merge_speakers(segments, wx_result_segs)
+
+        # Free intermediate variables to ensure VRAM is fully released
+        # before returning (prevents OOM when caller releases gpu_lock)
+        del audio, aligned, diarize_result, result, wx_result_segs
+        self._free_vram()
 
         speakers = sorted(set(s["speaker"] for s in updated))
         log.info(f"Diarization complete: {len(speakers)} speaker(s): {speakers}")
