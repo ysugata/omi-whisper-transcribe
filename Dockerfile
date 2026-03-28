@@ -17,7 +17,6 @@ RUN pip3 install --no-cache-dir -r requirements-docker.txt
 
 COPY omi_whisper_bridge.py .
 COPY model_manager.py .
-COPY prompt_builder.py .
 COPY term_corrector.py .
 COPY llm_corrector.py .
 COPY diarizer.py .
