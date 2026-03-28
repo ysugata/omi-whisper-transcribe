@@ -476,11 +476,8 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"チャンネル登録"),
     re.compile(r"高評価"),
     re.compile(r"ご清聴ありがとうございま(した|す)"),
-    re.compile(r"お(つかれさま|疲れ様)でした"),
-    re.compile(r"(ではまた|また次回)"),
     re.compile(r"最後まで(ご覧|見て)いただき.*"),
     re.compile(r"ご覧いただきありがとうございま(した|す)"),
-    re.compile(r"おやすみなさい"),
     re.compile(r"字幕.*?(視聴者|翻訳|提供)"),
     re.compile(r"Thanks? for watching\.?", re.IGNORECASE),
     re.compile(r"See you next time\.?", re.IGNORECASE),
@@ -490,16 +487,26 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"^\s*\.+\s*$"),
     re.compile(r"(.{2,}?)\1{3,}"),  # 同一フレーズの4回以上繰り返し
     re.compile(r"(F\d+[・,、]\s*){3,}"),  # F-key 暴走パターン (F1・F2・F3...)
-    re.compile(r"([ぁ-ん]{1,4}[,，、]\s*){3,}[ぁ-ん]*"),  # カンマ区切りの短いひらがな羅列 (hotwords/背景音汚染)
-    re.compile(r"([ァ-ヴー]{1,4}[,，、]\s*){3,}[ァ-ヴー]*"),  # カタカナ版
-    re.compile(r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,4}[,，、]\s*){3,}"),  # 漢字+仮名の短い断片が3回以上
     re.compile(r"^[。、.,!?・…―\s]+$"),  # 句読点・記号のみ
     re.compile(r"\ufffd"),  # Unicode replacement character (音声デコードエラー)
+]
+
+# 全文一致専用パターン: セグメント全体がこのフレーズのみの場合だけ除去
+# (実際の会話で使われうるが、セグメント全体がこれだけなら Whisper のハルシネーション)
+_HALLUCINATION_FULL_MATCH = [
+    re.compile(r"^お(つかれさま|疲れ様)でした[。.!]*$"),
+    re.compile(r"^(ではまた|また次回)[。.!]*$"),
+    re.compile(r"^おやすみなさい[。.!]*$"),
 ]
 
 
 def _remove_hallucinations(text: str) -> str:
     """既知のハルシネーションパターンを除去し、残りテキストを返す"""
+    stripped = text.strip()
+    # Full-match patterns: only remove if entire segment matches
+    for pattern in _HALLUCINATION_FULL_MATCH:
+        if pattern.match(stripped):
+            return ""
     cleaned = text
     for pattern in _HALLUCINATION_PATTERNS:
         cleaned = pattern.sub("", cleaned)
@@ -507,9 +514,9 @@ def _remove_hallucinations(text: str) -> str:
     return cleaned
 
 
-# 末尾カンマ断片クリーナー: 1-3文字の断片がカンマ区切りで3回以上末尾に連続
+# 末尾カンマ断片クリーナー: 1-6文字の断片がカンマ区切りで2回以上末尾に連続
 _TRAILING_FRAGMENT_RE = re.compile(
-    r"([,，、]\s*[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fffa-zA-Z]{1,3}){3,}\s*$"
+    r"([,，、]\s*[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fffa-zA-Z]{1,6}){2,}\s*$"
 )
 
 
@@ -528,16 +535,18 @@ def _clean_trailing_fragments(text: str) -> str:
 # ギブリッシュ仮名フィルタ: Whisper が非音声を無理やりカタカナ/ひらがなに変換したノイズを除去
 # 文法的助詞パターン (前後に仮名がある助詞)
 _PARTICLE_PATTERNS = re.compile(
-    r'[ぁ-ん\u30a0-\u30ff](は|が|を|へ|から|まで|より|ばかり|さえ|すら|だけ|ほど)[ぁ-ん\u30a0-\u30ff]'
+    r'[ぁ-ん\u30a0-\u30ff](は|が|を|へ|から|まで|より|ばかり|さえ|すら|だけ|ほど|の|で|と|に|も|や)[ぁ-ん\u30a0-\u30ff]'
 )
 # 文法的語尾パターン (ギブリッシュには現れない日本語特有の活用形)
 _GRAMMATICAL_ENDINGS = re.compile(
     r'(です|ます|ました|ません|でした|ている|ていた|ていない|ないで|なかった'
     r'|ことが|ものが|ように|ようだ|だろう|でしょう|ですか|ますか|ますよ|ですね'
-    r'|ですよ|ましょう|ください|ながら|けれど|ったら|ったり|のです|んです)'
+    r'|ですよ|ましょう|ください|ながら|けれど|ったら|ったり|のです|んです'
+    r'|よかった|じゃない|なさい|だよ|だね|だな|てる|てた|ちゃう|ちゃった'
+    r'|って|かな|かも|でしょ|っけ|じゃん|んだ|のに|けど)'
 )
 
-_GIBBERISH_LOGPROB_THRESHOLD = -0.5
+_GIBBERISH_LOGPROB_THRESHOLD = -0.7
 
 
 def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
@@ -549,7 +558,7 @@ def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
     偽陽性防止のため、以下の場合はスキップ:
     - 高い信頼度 (avg_logprob >= -0.3)
     - 漢字を含む (通常の日本語文)
-    - 7文字以下 (短い正当な外来語)
+    - 15文字以下 (口語は仮名のみ8〜14文字が普通)
     - 文法的な助詞パターンを含む (文法的に正しい文)
     """
     # High confidence → skip
@@ -559,7 +568,7 @@ def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
     # Strip punctuation, commas, spaces to get the "body"
     body = re.sub(r'[\s,，、。.!?？！・…―「」\-\'\"]+', '', text)
 
-    if len(body) <= 7:
+    if len(body) <= 15:
         return False
 
     # Contains kanji → legitimate Japanese
