@@ -59,9 +59,11 @@ COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD"
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
-LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "5"))
+LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
+LLM_BATCH_INTERVAL = float(os.environ.get("LLM_BATCH_INTERVAL", "60"))   # Batch flush interval (seconds)
+LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "20"))             # Flush when this many segments accumulate
 
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
@@ -523,7 +525,6 @@ def transcribe_audio(
     model,
     session_offset: float = 0.0,
     initial_prompt: str = "",
-    known_terms: list[str] | None = None,
     hotwords: str = "",
 ) -> list[dict]:
     """PCM 16-bit LE の音声バイト列を受け取り、
@@ -534,7 +535,6 @@ def transcribe_audio(
         model: ロード済みの WhisperModel インスタンス
         session_offset: タイムスタンプオフセット (秒)
         initial_prompt: Layer 1 で構築した initial_prompt
-        known_terms: Layer 3 LLM 補正用の参考用語リスト
         hotwords: カンマ区切りの hotwords 文字列 (デコーダバイアス用)
     """
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -639,19 +639,6 @@ def transcribe_audio(
             "is_user": True,
             "person_id": None,
         })
-
-    # Layer 3: LLM 後処理
-    if llm_corrector and segments_out:
-        originals = [seg["text"] for seg in segments_out]
-        segments_out = llm_corrector.correct_segments(
-            segments_out,
-            known_terms=known_terms,
-            min_text_length=LLM_MIN_TEXT_LENGTH,
-        )
-        try:
-            _save_llm_suggestions(originals, segments_out)
-        except Exception as e:
-            log.warning(f"Failed to save LLM suggestions: {e}")
 
     return segments_out
 
@@ -1076,6 +1063,10 @@ async def handle_connection(websocket):
         if session_hotwords:
             log.info(f"Hotwords: {hotword_loader.get_count()} terms active")
 
+    # Layer 3: Deferred LLM batch correction
+    llm_pending: list[dict] = []   # Segment dicts awaiting LLM correction (same refs as recorder.all_segments)
+    last_llm_flush = time.time()
+
     # モデル確保 (未ロードなら自動ロード)
     try:
         model, executor = await model_manager.acquire()
@@ -1109,7 +1100,7 @@ async def handle_connection(websocket):
         loop = asyncio.get_running_loop()
         raw_segments = await loop.run_in_executor(
             executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_known_terms, session_hotwords),
+            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_hotwords),
         )
 
         elapsed = time.time() - t0
@@ -1120,6 +1111,10 @@ async def handle_connection(websocket):
             # 録音ログ: WAV ファイル内の位置に合わせたオフセット (先に保存)
             rec_segments = _offset_segments(raw_segments, rec_offset)
             recorder.add_segments(rec_segments)
+
+            # Queue for deferred LLM batch correction
+            if llm_corrector:
+                llm_pending.extend(recorder.all_segments[-len(rec_segments):])
 
             log.info(
                 f"Transcribed {len(raw_segments)} segment(s) "
@@ -1133,6 +1128,53 @@ async def handle_connection(websocket):
             await websocket.send(json.dumps(response))
         else:
             log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
+
+    async def _flush_llm():
+        """Flush accumulated segments to LLM for batch correction."""
+        nonlocal last_llm_flush
+        if not llm_corrector or not llm_pending:
+            return
+
+        segments_to_correct = list(llm_pending)
+        originals = [seg["text"] for seg in segments_to_correct]
+
+        log.info(f"LLM batch: correcting {len(segments_to_correct)} segments")
+
+        loop = asyncio.get_running_loop()
+        corrected = await loop.run_in_executor(
+            None,
+            lambda segs=segments_to_correct, terms=session_known_terms: llm_corrector.correct_segments(
+                segs,
+                known_terms=terms,
+                min_text_length=LLM_MIN_TEXT_LENGTH,
+            ),
+        )
+
+        # Apply corrections in place (same objects as recorder.all_segments)
+        changed = 0
+        for orig_seg, corrected_seg in zip(segments_to_correct, corrected):
+            if orig_seg["text"] != corrected_seg["text"]:
+                orig_seg["text"] = corrected_seg["text"]
+                changed += 1
+
+        if changed:
+            log.info(f"LLM batch: {changed}/{len(segments_to_correct)} segments corrected")
+
+        try:
+            _save_llm_suggestions(originals, corrected)
+        except Exception as e:
+            log.warning(f"Failed to save LLM suggestions: {e}")
+
+        llm_pending.clear()
+        last_llm_flush = time.time()
+
+    async def _maybe_flush_llm():
+        """Check if LLM batch should be flushed and do so if needed."""
+        if not llm_corrector or not llm_pending:
+            return
+        if (len(llm_pending) >= LLM_BATCH_SIZE or
+                time.time() - last_llm_flush >= LLM_BATCH_INTERVAL):
+            await _flush_llm()
 
     try:
         async for message in websocket:
@@ -1174,6 +1216,7 @@ async def handle_connection(websocket):
                     # 発話なし — セッションタイムアウト判定
                     elapsed_silence = time.time() - last_speech_time
                     if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
+                        await _flush_llm()
                         recorder.finalize()
                         log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                         recorder = None
@@ -1214,6 +1257,7 @@ async def handle_connection(websocket):
                                  f"{trailing_silence:.1f}s trailing silence)")
 
                     await _transcribe_chunk(chunk)
+                    await _maybe_flush_llm()
 
             else:
                 # ============================================================
@@ -1229,6 +1273,7 @@ async def handle_connection(websocket):
                         if rms < SILENCE_THRESHOLD:
                             elapsed_silence = time.time() - last_speech_time
                             if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
+                                await _flush_llm()
                                 recorder.finalize()
                                 log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                                 recorder = None
@@ -1237,6 +1282,7 @@ async def handle_connection(websocket):
                         last_speech_time = time.time()
 
                     await _transcribe_chunk(chunk)
+                    await _maybe_flush_llm()
 
     except websockets.exceptions.ConnectionClosed:
         log.info(f"Connection closed: {remote}")
@@ -1259,10 +1305,12 @@ async def handle_connection(websocket):
 
                 log.info("Processing remaining buffer...")
                 try:
-                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_known_terms, session_hotwords)
+                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_hotwords)
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
+                        if llm_corrector:
+                            llm_pending.extend(recorder.all_segments[-len(rec_segments):])
                         try:
                             ws_segments = _offset_segments(raw_segments, total_audio_seconds)
                             await websocket.send(json.dumps({"segments": ws_segments}))
@@ -1270,6 +1318,12 @@ async def handle_connection(websocket):
                             pass
                 except Exception as e:
                     log.error(f"Error processing remaining buffer: {e}", exc_info=True)
+
+        # Flush remaining LLM corrections before finalize
+        try:
+            await _flush_llm()
+        except Exception as e:
+            log.warning(f"Failed to flush LLM on session end: {e}")
 
         # セッション終了: whisper モデルを解放
         model_manager.release()
@@ -1314,7 +1368,8 @@ async def main():
     else:
         log.info("Initial prompt: (none — set via viewer or INITIAL_PROMPT env)")
     if llm_corrector:
-        log.info(f"Layer 3 LLM: {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, timeout={LLM_TIMEOUT}s)")
+        log.info(f"Layer 3 LLM: {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, "
+                 f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")
     else:
         reason = "DISABLED" if not LLM_ENABLED else "no GEMINI_API_KEY"
         log.info(f"Layer 3 LLM: {reason}")
