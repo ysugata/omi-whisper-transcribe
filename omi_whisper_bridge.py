@@ -793,11 +793,13 @@ def transcribe_audio(
         )
 
     for seg in segments:
-        # 確信度フィルタ 1: 高い無音確率 → 単独で除去
-        if seg.no_speech_prob > 0.8:
+        # 確信度フィルタ 1: 高い無音確率 → logprob も考慮して除去
+        # logprob が高い (>= -0.3) 場合は Whisper が自信を持って文字起こし
+        # できているので、VAD の no_speech 判定を無視して保持する
+        if seg.no_speech_prob > 0.8 and seg.avg_logprob < -0.3:
             log.info(
                 f"Segment FILTERED (high no_speech): no_speech_prob={seg.no_speech_prob:.2f}, "
-                f"text='{seg.text.strip()[:80]}'"
+                f"avg_logprob={seg.avg_logprob:.2f}, text='{seg.text.strip()[:80]}'"
             )
             continue
 

@@ -252,15 +252,23 @@ class TestTranscribeFilters(unittest.TestCase):
 
     # --- 信頼度フィルタ ---
 
-    def test_high_no_speech_prob_filtered(self):
-        """no_speech_prob > 0.85 は単独で除去される"""
+    def test_high_no_speech_low_logprob_filtered(self):
+        """no_speech_prob > 0.8 AND avg_logprob < -0.3 → 除去"""
         result = _run_transcribe([
-            {"text": "何かのテスト", "no_speech_prob": 0.9, "avg_logprob": -0.2},
+            {"text": "何かのテスト", "no_speech_prob": 0.9, "avg_logprob": -0.5},
         ])
         self.assertEqual(len(result), 0)
 
+    def test_high_no_speech_high_logprob_kept(self):
+        """no_speech_prob > 0.8 でも avg_logprob >= -0.3 なら保持 (Whisper が自信あり)"""
+        result = _run_transcribe([
+            {"text": "GPUがあるパソコンで", "no_speech_prob": 0.85, "avg_logprob": -0.16},
+        ])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "GPUがあるパソコンで")
+
     def test_dual_filter_triggers(self):
-        """avg_logprob < -0.7 AND no_speech_prob > 0.5 で除去"""
+        """avg_logprob < -0.6 AND no_speech_prob > 0.4 で除去"""
         result = _run_transcribe([
             {"text": "何かテスト", "avg_logprob": -0.8, "no_speech_prob": 0.55},
         ])
