@@ -727,6 +727,8 @@
         updateDiarizeUI(state);
     }
 
+    var diarizeCancelTime = null;
+
     function updateDiarizeUI(state) {
         var done = (state.processed || 0) + (state.failed || 0);
         var total = state.total || 0;
@@ -736,8 +738,17 @@
         diarizeProgressText.textContent = done + " / " + total;
 
         if (state.running) {
-            diarizeStatusText.textContent = state.cancel_requested ? "Cancelling..." : "Processing...";
-            diarizeCancelBtn.style.display = "";
+            if (state.cancel_requested) {
+                diarizeStatusText.textContent = "Cancelling...";
+                diarizeCancelBtn.style.display = "none";
+                // Auto-hide panel after 30s if cancel is stuck
+                if (diarizeCancelTime && Date.now() - diarizeCancelTime > 30000) {
+                    diarizeStatusText.textContent = "Cancelled (waiting for current session to finish)";
+                }
+            } else {
+                diarizeStatusText.textContent = "Processing...";
+                diarizeCancelBtn.style.display = "";
+            }
             if (state.current_session) {
                 diarizeCurrent.textContent = state.current_session;
             } else {
@@ -746,6 +757,7 @@
         } else {
             diarizeCancelBtn.style.display = "none";
             diarizeCurrent.textContent = "";
+            diarizeCancelTime = null;
             if (state.finished_at) {
                 var msg = "Done: " + (state.processed || 0) + " processed";
                 if (state.failed > 0) msg += ", " + state.failed + " failed";
@@ -809,6 +821,9 @@
     });
 
     diarizeCancelBtn.addEventListener("click", function () {
+        diarizeCancelTime = Date.now();
+        diarizeCancelBtn.style.display = "none";
+        diarizeStatusText.textContent = "Cancelling...";
         fetch("/api/diarize/cancel", { method: "POST" }).catch(function () {});
     });
 
@@ -1166,6 +1181,7 @@
     var tagProgressFill = document.getElementById("tag-progress-fill");
     var tagCurrent = document.getElementById("tag-current");
     var tagTimer = null;
+    var tagCancelTime = null;
 
     function showTagPanel(state) {
         tagPanel.classList.remove("hidden");
@@ -1181,12 +1197,21 @@
         tagProgressText.textContent = done + " / " + total;
 
         if (state.running) {
-            tagStatusText.textContent = state.cancel_requested ? "Cancelling..." : "Tagging...";
-            tagCancelBtn.style.display = "";
+            if (state.cancel_requested) {
+                tagStatusText.textContent = "Cancelling...";
+                tagCancelBtn.style.display = "none";
+                if (tagCancelTime && Date.now() - tagCancelTime > 30000) {
+                    tagStatusText.textContent = "Cancelled (waiting for current session to finish)";
+                }
+            } else {
+                tagStatusText.textContent = "Tagging...";
+                tagCancelBtn.style.display = "";
+            }
             tagCurrent.textContent = state.current_session || "";
         } else {
             tagCancelBtn.style.display = "none";
             tagCurrent.textContent = "";
+            tagCancelTime = null;
             if (state.finished_at) {
                 var msg = "Done: " + (state.processed || 0) + " tagged";
                 if (state.failed > 0) msg += ", " + state.failed + " failed";
@@ -1246,6 +1271,9 @@
     });
 
     tagCancelBtn.addEventListener("click", function () {
+        tagCancelTime = Date.now();
+        tagCancelBtn.style.display = "none";
+        tagStatusText.textContent = "Cancelling...";
         fetch("/api/speakers/tag/cancel", { method: "POST" }).catch(function () {});
     });
 

@@ -980,7 +980,17 @@ async def _batch_diarize_task(force: bool = False):
             log.info(f"Batch diarize: {sess['path']}")
 
             try:
+                # Check cancel before acquiring GPU lock (may block a while)
+                if _batch_state["cancel_requested"]:
+                    log.info("Batch diarization cancelled by user (before GPU lock)")
+                    break
+
                 async with model_manager.gpu_lock:
+                    # Check cancel again after acquiring GPU lock
+                    if _batch_state["cancel_requested"]:
+                        log.info("Batch diarization cancelled by user (after GPU lock)")
+                        break
+
                     await model_manager.unload_model()
 
                     updated, success = await loop.run_in_executor(
@@ -1130,7 +1140,15 @@ async def _batch_tag_task(force: bool = False):
         # embedding モデルを一度だけロード
         inference = None
         try:
+            if _batch_tag_state["cancel_requested"]:
+                log.info("Batch speaker tagging cancelled by user (before GPU lock)")
+                return
+
             async with model_manager.gpu_lock:
+                if _batch_tag_state["cancel_requested"]:
+                    log.info("Batch speaker tagging cancelled by user (after GPU lock)")
+                    return
+
                 await model_manager.unload_model()
                 inference = await loop.run_in_executor(
                     None, speaker_filter._load_model
