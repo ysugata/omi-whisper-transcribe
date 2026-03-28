@@ -32,13 +32,13 @@ SYSTEM_PROMPT = """あなたは音声文字起こしテキストの校正者で�
 
 
 class LLMCorrector:
-    """Gemini 2.5 Flash を使った文字起こしテキストの後処理補正。"""
+    """Gemini 2.5 Flash-Lite を使った文字起こしテキストの後処理補正。"""
 
     def __init__(
         self,
         api_key: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-2.5-flash-lite",
         temperature: float = 0,
         max_tokens: int = 2048,
         timeout: int = 10,
