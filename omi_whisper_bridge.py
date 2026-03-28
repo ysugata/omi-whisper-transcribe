@@ -489,7 +489,7 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"(F\d+[・,、]\s*){3,}"),  # F-key 暴走パターン (F1・F2・F3...)
     re.compile(r"([ぁ-ん]{1,4}[,，、]\s*){3,}[ぁ-ん]*"),  # カンマ区切りの短いひらがな羅列 (hotwords/背景音汚染)
     re.compile(r"([ァ-ヴー]{1,4}[,，、]\s*){3,}[ァ-ヴー]*"),  # カタカナ版
-    re.compile(r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,8}[,，、]\s*){3,}"),  # 漢字+仮名の短い断片が3回以上
+    re.compile(r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,4}[,，、]\s*){3,}"),  # 漢字+仮名の短い断片が3回以上
     re.compile(r"^[。、.,!?・…―\s]+$"),  # 句読点・記号のみ
     re.compile(r"\ufffd"),  # Unicode replacement character (音声デコードエラー)
 ]
@@ -504,9 +504,9 @@ def _remove_hallucinations(text: str) -> str:
     return cleaned
 
 
-# 末尾カンマ断片クリーナー: 1-6文字の断片がカンマ区切りで2回以上末尾に連続
+# 末尾カンマ断片クリーナー: 1-3文字の断片がカンマ区切りで3回以上末尾に連続
 _TRAILING_FRAGMENT_RE = re.compile(
-    r"([,，、]\s*[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fffa-zA-Z]{1,6}){2,}\s*$"
+    r"([,，、]\s*[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fffa-zA-Z]{1,3}){3,}\s*$"
 )
 
 
