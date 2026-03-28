@@ -1,0 +1,402 @@
+"""Tests for CUDA OOM fix: gpu_lock holding pattern and VRAM cleanup.
+
+Verifies that:
+1. diarizer._free_vram() calls torch.cuda.synchronize() before empty_cache()
+2. speaker_filter._free_vram() and _unload_model() call torch.cuda.synchronize()
+3. _batch_diarize_task() holds gpu_lock for the entire session loop
+4. _batch_tag_task() holds gpu_lock from model load through all sessions to unload
+"""
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, AsyncMock, patch, call
+
+import pytest
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# =====================================================================
+# Helper: mock heavy dependencies for omi_whisper_bridge import
+# =====================================================================
+
+def _mock_bridge_deps():
+    """Pre-mock modules that omi_whisper_bridge imports at top level.
+
+    These packages (faster_whisper, whisperx, torch, etc.) are only
+    available inside the Docker container, so we stub them out for
+    host-side unit testing.
+    """
+    stubs = {}
+    for mod_name in [
+        "faster_whisper", "faster_whisper.vad",
+        "torch", "torch.cuda",
+        "whisperx", "whisperx.diarize",
+        "pyannote", "pyannote.audio",
+        "torchaudio", "torchaudio.functional",
+        "noisereduce",
+        "openai",
+    ]:
+        if mod_name not in sys.modules:
+            stubs[mod_name] = MagicMock()
+
+    # faster_whisper.vad needs specific names
+    if "faster_whisper.vad" in stubs:
+        stubs["faster_whisper.vad"].get_speech_timestamps = MagicMock()
+        stubs["faster_whisper.vad"].VadOptions = MagicMock()
+
+    sys.modules.update(stubs)
+    return stubs
+
+
+# =====================================================================
+# 1. diarizer._free_vram() — torch.cuda.synchronize() call
+# =====================================================================
+
+class TestDiarizerFreeVram:
+    def test_free_vram_calls_synchronize_before_empty_cache(self):
+        """_free_vram() must call synchronize() before empty_cache()."""
+        from diarizer import Diarizer
+
+        d = Diarizer(hf_token="dummy", device="cpu")
+
+        call_order = []
+        mock_torch = MagicMock()
+        mock_torch.cuda.synchronize = lambda: call_order.append("synchronize")
+        mock_torch.cuda.empty_cache = lambda: call_order.append("empty_cache")
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            d._free_vram()
+
+        assert "synchronize" in call_order, "synchronize() was not called"
+        assert "empty_cache" in call_order, "empty_cache() was not called"
+        assert call_order.index("synchronize") < call_order.index("empty_cache"), \
+            "synchronize() must be called before empty_cache()"
+
+    def test_run_pipeline_cleans_up_before_return(self):
+        """_run_pipeline() should call _free_vram() after speaker assignment
+        to release intermediate VRAM before returning."""
+        from diarizer import Diarizer
+
+        d = Diarizer(hf_token="dummy", device="cpu")
+
+        # Count _free_vram calls
+        free_vram_calls = []
+        def counting_free_vram():
+            free_vram_calls.append(1)
+        d._free_vram = counting_free_vram
+
+        segments = [{"text": "hello", "start": 0.0, "end": 1.0}]
+
+        mock_whisperx = MagicMock()
+        mock_whisperx.load_audio.return_value = MagicMock(__len__=lambda self: 32000)  # 2s
+        mock_whisperx.load_align_model.return_value = (MagicMock(), MagicMock())
+        mock_whisperx.align.return_value = {"segments": [{"text": "hello", "start": 0.0, "end": 1.0}]}
+        mock_whisperx.assign_word_speakers.return_value = {
+            "segments": [{"text": "hello", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
+        }
+
+        mock_diarize_pipeline = MagicMock()
+        mock_diarize_pipeline_instance = MagicMock()
+        mock_diarize_pipeline.return_value = mock_diarize_pipeline_instance
+
+        with patch.dict("sys.modules", {
+            "torch": MagicMock(),
+            "whisperx": mock_whisperx,
+            "whisperx.diarize": MagicMock(DiarizationPipeline=mock_diarize_pipeline),
+        }):
+            result = d._run_pipeline("dummy.wav", segments, None, None)
+
+        # Should have 3 _free_vram calls:
+        # 1. After alignment model release
+        # 2. After diarization model release
+        # 3. After speaker assignment (new: cleanup before return)
+        assert len(free_vram_calls) >= 3, \
+            f"Expected at least 3 _free_vram() calls, got {len(free_vram_calls)}"
+
+
+# =====================================================================
+# 2. speaker_filter._free_vram() and _unload_model()
+# =====================================================================
+
+class TestSpeakerFilterVram:
+    def test_free_vram_calls_synchronize(self):
+        """_free_vram() must call torch.cuda.synchronize()."""
+        from speaker_filter import SpeakerFilter
+
+        call_order = []
+        mock_torch = MagicMock()
+        mock_torch.cuda.synchronize = lambda: call_order.append("synchronize")
+        mock_torch.cuda.empty_cache = lambda: call_order.append("empty_cache")
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            SpeakerFilter._free_vram()
+
+        assert "synchronize" in call_order
+        assert call_order.index("synchronize") < call_order.index("empty_cache")
+
+    def test_unload_model_calls_synchronize(self):
+        """_unload_model() must call torch.cuda.synchronize()."""
+        from speaker_filter import SpeakerFilter
+
+        call_order = []
+        mock_torch = MagicMock()
+        mock_torch.cuda.synchronize = lambda: call_order.append("synchronize")
+        mock_torch.cuda.empty_cache = lambda: call_order.append("empty_cache")
+
+        mock_inference = MagicMock()
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            SpeakerFilter._unload_model(mock_inference)
+
+        assert "synchronize" in call_order
+        assert call_order.index("synchronize") < call_order.index("empty_cache")
+
+
+# =====================================================================
+# 3. _batch_diarize_task() — gpu_lock held for entire loop
+# =====================================================================
+
+class TestBatchDiarizeLock:
+    """Verify gpu_lock is held for the entire batch, not per-session."""
+
+    @pytest.fixture
+    def recordings_dir(self, tmp_path):
+        """Create a temp recordings dir with 2 sessions."""
+        for i, time_name in enumerate(["10-00-00", "11-00-00"]):
+            session_dir = tmp_path / "2026-03-29" / time_name
+            session_dir.mkdir(parents=True)
+            (session_dir / "audio.ogg").write_bytes(b"\x00" * 100)
+            transcript = {
+                "session": {"audio_file": "audio.ogg"},
+                "segments": [{"text": f"test{i}", "start": 0.0, "end": 1.0}],
+            }
+            with open(session_dir / "transcript.json", "w") as f:
+                json.dump(transcript, f)
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_gpu_lock_held_for_entire_batch(self, recordings_dir):
+        """gpu_lock must be acquired once and held for all sessions."""
+        _mock_bridge_deps()
+
+        lock_events = []
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+            async def __aenter__(self):
+                await self._lock.acquire()
+                lock_events.append("acquire")
+                return self
+            async def __aexit__(self, *args):
+                lock_events.append("release")
+                self._lock.release()
+
+        mock_mm = MagicMock()
+        mock_mm.gpu_lock = TrackingLock()
+        mock_mm.unload_model = AsyncMock(return_value=True)
+
+        mock_diarizer = MagicMock()
+        mock_diarizer.diarize.return_value = (
+            [{"text": "test", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}],
+            True,
+        )
+
+        import omi_whisper_bridge as bridge
+        original_mm = bridge.model_manager
+        original_diarizer = bridge.diarizer
+        original_recordings = bridge.RECORDINGS_DIR
+
+        try:
+            bridge.model_manager = mock_mm
+            bridge.diarizer = mock_diarizer
+            bridge.RECORDINGS_DIR = str(recordings_dir)
+
+            await bridge._batch_diarize_task(force=True)
+        finally:
+            bridge.model_manager = original_mm
+            bridge.diarizer = original_diarizer
+            bridge.RECORDINGS_DIR = original_recordings
+
+        assert lock_events.count("acquire") == 1, \
+            f"gpu_lock should be acquired once, got {lock_events.count('acquire')}"
+        assert lock_events.count("release") == 1, \
+            f"gpu_lock should be released once, got {lock_events.count('release')}"
+        assert mock_mm.unload_model.call_count == 1, \
+            f"unload_model should be called once, got {mock_mm.unload_model.call_count}"
+        assert mock_diarizer.diarize.call_count == 2, \
+            f"Both sessions should be processed, got {mock_diarizer.diarize.call_count}"
+
+    @pytest.mark.asyncio
+    async def test_cancel_breaks_loop_releases_lock(self, recordings_dir):
+        """Cancel should break the loop but still release the lock."""
+        _mock_bridge_deps()
+
+        lock_released = []
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+            async def __aenter__(self):
+                await self._lock.acquire()
+                return self
+            async def __aexit__(self, *args):
+                lock_released.append(True)
+                self._lock.release()
+
+        mock_mm = MagicMock()
+        mock_mm.gpu_lock = TrackingLock()
+        mock_mm.unload_model = AsyncMock(return_value=True)
+
+        import omi_whisper_bridge as bridge
+
+        def diarize_with_cancel(*args, **kwargs):
+            bridge._batch_state["cancel_requested"] = True
+            return ([{"text": "t", "start": 0, "end": 1, "speaker": "SPEAKER_00"}], True)
+
+        mock_diarizer = MagicMock()
+        mock_diarizer.diarize.side_effect = diarize_with_cancel
+
+        original_mm = bridge.model_manager
+        original_diarizer = bridge.diarizer
+        original_recordings = bridge.RECORDINGS_DIR
+
+        try:
+            bridge.model_manager = mock_mm
+            bridge.diarizer = mock_diarizer
+            bridge.RECORDINGS_DIR = str(recordings_dir)
+
+            await bridge._batch_diarize_task(force=True)
+        finally:
+            bridge.model_manager = original_mm
+            bridge.diarizer = original_diarizer
+            bridge.RECORDINGS_DIR = original_recordings
+
+        assert len(lock_released) == 1, "gpu_lock must be released after cancel"
+        # Only first session processed before cancel
+        assert mock_diarizer.diarize.call_count == 1
+
+
+# =====================================================================
+# 4. _batch_tag_task() — gpu_lock held for load→process→unload
+# =====================================================================
+
+class TestBatchTagLock:
+    """Verify gpu_lock is held from model load through all sessions to unload."""
+
+    @pytest.fixture
+    def recordings_dir(self, tmp_path):
+        for i, time_name in enumerate(["10-00-00", "11-00-00"]):
+            session_dir = tmp_path / "2026-03-29" / time_name
+            session_dir.mkdir(parents=True)
+            (session_dir / "audio.ogg").write_bytes(b"\x00" * 100)
+            transcript = {
+                "session": {"audio_file": "audio.ogg"},
+                "segments": [{"text": f"test{i}", "start": 0.0, "end": 1.0}],
+            }
+            with open(session_dir / "transcript.json", "w") as f:
+                json.dump(transcript, f)
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_gpu_lock_held_for_entire_tag_batch(self, recordings_dir):
+        """gpu_lock must wrap model load, all sessions, and model unload."""
+        _mock_bridge_deps()
+
+        lock_events = []
+        processing_while_locked = []
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self.is_locked = False
+            async def __aenter__(self):
+                await self._lock.acquire()
+                self.is_locked = True
+                lock_events.append("acquire")
+                return self
+            async def __aexit__(self, *args):
+                self.is_locked = False
+                lock_events.append("release")
+                self._lock.release()
+
+        tracking_lock = TrackingLock()
+
+        mock_mm = MagicMock()
+        mock_mm.gpu_lock = tracking_lock
+        mock_mm.unload_model = AsyncMock(return_value=True)
+
+        mock_inference = MagicMock()
+
+        mock_sf = MagicMock()
+        mock_sf._load_model.return_value = mock_inference
+        mock_sf.tag_segments_with_model.side_effect = lambda inf, audio, segs: (
+            processing_while_locked.append(tracking_lock.is_locked),
+            segs,
+        )[1]
+        mock_sf._unload_model = MagicMock()
+
+        import omi_whisper_bridge as bridge
+        original_mm = bridge.model_manager
+        original_sf = bridge.speaker_filter
+        original_recordings = bridge.RECORDINGS_DIR
+
+        try:
+            bridge.model_manager = mock_mm
+            bridge.speaker_filter = mock_sf
+            bridge.RECORDINGS_DIR = str(recordings_dir)
+
+            await bridge._batch_tag_task(force=True)
+        finally:
+            bridge.model_manager = original_mm
+            bridge.speaker_filter = original_sf
+            bridge.RECORDINGS_DIR = original_recordings
+
+        assert lock_events.count("acquire") == 1
+        assert lock_events.count("release") == 1
+        assert all(processing_while_locked), \
+            f"All tag operations must happen while gpu_lock is held, got {processing_while_locked}"
+        assert mock_mm.unload_model.call_count == 1
+        assert mock_sf._unload_model.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_model_unloaded_even_on_error(self, recordings_dir):
+        """Embedding model must be unloaded even if processing fails."""
+        _mock_bridge_deps()
+
+        mock_mm = MagicMock()
+        mock_mm.gpu_lock = asyncio.Lock()
+        mock_mm.unload_model = AsyncMock(return_value=True)
+
+        mock_inference = MagicMock()
+        mock_sf = MagicMock()
+        mock_sf._load_model.return_value = mock_inference
+        mock_sf.tag_segments_with_model.side_effect = RuntimeError("GPU error")
+        mock_sf._unload_model = MagicMock()
+
+        import omi_whisper_bridge as bridge
+        original_mm = bridge.model_manager
+        original_sf = bridge.speaker_filter
+        original_recordings = bridge.RECORDINGS_DIR
+
+        try:
+            bridge.model_manager = mock_mm
+            bridge.speaker_filter = mock_sf
+            bridge.RECORDINGS_DIR = str(recordings_dir)
+
+            await bridge._batch_tag_task(force=True)
+        finally:
+            bridge.model_manager = original_mm
+            bridge.speaker_filter = original_sf
+            bridge.RECORDINGS_DIR = original_recordings
+
+        assert mock_sf._unload_model.call_count == 1, \
+            "Embedding model must be unloaded even after errors"
+        assert not mock_mm.gpu_lock.locked(), \
+            "gpu_lock must be released after batch completes"
