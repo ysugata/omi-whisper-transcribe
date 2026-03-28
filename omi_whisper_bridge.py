@@ -526,9 +526,15 @@ def _clean_trailing_fragments(text: str) -> str:
 
 
 # ギブリッシュ仮名フィルタ: Whisper が非音声を無理やりカタカナ/ひらがなに変換したノイズを除去
-# 文法的助詞パターン (ひらがな + 前後文字で文法的かどうかを判定)
+# 文法的助詞パターン (前後に仮名がある助詞)
 _PARTICLE_PATTERNS = re.compile(
     r'[ぁ-ん\u30a0-\u30ff](は|が|を|へ|から|まで|より|ばかり|さえ|すら|だけ|ほど)[ぁ-ん\u30a0-\u30ff]'
+)
+# 文法的語尾パターン (ギブリッシュには現れない日本語特有の活用形)
+_GRAMMATICAL_ENDINGS = re.compile(
+    r'(です|ます|ました|ません|でした|ている|ていた|ていない|ないで|なかった'
+    r'|ことが|ものが|ように|ようだ|だろう|でしょう|ですか|ますか|ますよ|ですね'
+    r'|ですよ|ましょう|ください|ながら|けれど|ったら|ったり|のです|んです)'
 )
 
 _GIBBERISH_LOGPROB_THRESHOLD = -0.5
@@ -578,6 +584,10 @@ def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
 
     # Contains grammatical particle patterns → likely real Japanese
     if _PARTICLE_PATTERNS.search(body):
+        return False
+
+    # Contains grammatical endings (です/ます/ました etc.) → real Japanese
+    if _GRAMMATICAL_ENDINGS.search(body):
         return False
 
     return True
