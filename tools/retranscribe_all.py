@@ -272,7 +272,6 @@ def retranscribe_all(
                 pcm_bytes,
                 model,
                 session_offset=0.0,
-                initial_prompt="",
                 hotwords=hotwords_str,
             )
         except Exception as e:

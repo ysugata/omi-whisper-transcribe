@@ -49,7 +49,7 @@ SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))                # Omi �
 
 # --- Whisper 精度改善パラメータ ---
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "./config")                       # 設定ファイルディレクトリ
-INITIAL_PROMPT = os.environ.get("INITIAL_PROMPT", "")                     # 固有名詞等を含むプロンプト (空=なし, 設定ファイル優先)
+
 NO_REPEAT_NGRAM_SIZE = int(os.environ.get("NO_REPEAT_NGRAM_SIZE", "3"))   # 繰り返し防止 n-gram サイズ (0=無効)
 LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セグメント平均対数確率の閾値
 NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
@@ -121,7 +121,6 @@ log = logging.getLogger("omi-whisper")
 # Layer 1 + Layer 2: 固有名詞改善
 # ============================================================
 
-from prompt_builder import build_prompt
 from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
 from diarizer import Diarizer
@@ -130,7 +129,6 @@ from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
-_PROMPT_SETTINGS_PATH = os.path.join(CONFIG_DIR, "prompt_settings.json")
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
 
 term_corrector = TermCorrector(_TERM_CORRECTIONS_PATH)
@@ -173,37 +171,6 @@ if HF_AUTH_TOKEN:
         config_dir=CONFIG_DIR,
         hf_token=HF_AUTH_TOKEN,
     )
-
-
-def _get_initial_prompt() -> str:
-    """セッション開始時に initial_prompt を決定する。
-
-    優先順位:
-    1. prompt_settings.json がある場合、その内容から構築 (topic, participants のみ)
-    2. INITIAL_PROMPT 環境変数
-    3. デフォルトの短いプロンプト
-
-    固有名詞・用語の認識は hotwords (デコーダバイアス) で処理するため、
-    initial_prompt には含めない。
-    """
-    try:
-        if os.path.exists(_PROMPT_SETTINGS_PATH):
-            with open(_PROMPT_SETTINGS_PATH, encoding="utf-8") as f:
-                settings = json.load(f)
-            prompt = build_prompt(
-                topic=settings.get("topic", ""),
-                participants=settings.get("participants", []),
-            )
-            if prompt:
-                log.info(f"Prompt from settings: {prompt[:80]}...")
-                return prompt
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning(f"prompt_settings.json 読み込みエラー: {e}")
-
-    if INITIAL_PROMPT:
-        return INITIAL_PROMPT
-
-    return ""
 
 
 def _get_known_terms() -> list[str]:
@@ -707,34 +674,10 @@ def _split_long_segment(seg_dict: dict, max_duration: float) -> list[dict]:
     return result if result else [seg_dict]
 
 
-# プロンプトエコー検出用の区切り文字パターン
-_PROMPT_SPLIT_RE = re.compile(r"[、。,.\s:：]+")
-
-
-def _is_prompt_echo(text: str, prompt: str, threshold: float = 0.6) -> bool:
-    """テキストが initial_prompt のエコー (プロンプト内容の誤出力) かどうかを判定する。
-
-    テキスト中の単語の60%以上がプロンプトに含まれていればエコーと判定。
-    """
-    if not prompt:
-        return False
-    text_words = set(w for w in _PROMPT_SPLIT_RE.split(text) if len(w) >= 2)
-    if not text_words:
-        return False
-    prompt_words = set(w for w in _PROMPT_SPLIT_RE.split(prompt) if len(w) >= 2)
-    overlap = len(text_words & prompt_words)
-    ratio = overlap / len(text_words)
-    if ratio >= threshold:
-        log.debug(f"Prompt echo detected ({ratio:.0%}): '{text[:60]}'")
-        return True
-    return False
-
-
 def transcribe_audio(
     audio_bytes: bytes,
     model,
     session_offset: float = 0.0,
-    initial_prompt: str = "",
     hotwords: str = "",
 ) -> list[dict]:
     """PCM 16-bit LE の音声バイト列を受け取り、
@@ -744,7 +687,6 @@ def transcribe_audio(
         audio_bytes: PCM 16-bit LE 音声データ
         model: ロード済みの WhisperModel インスタンス
         session_offset: タイムスタンプオフセット (秒)
-        initial_prompt: Layer 1 で構築した initial_prompt
         hotwords: カンマ区切りの hotwords 文字列 (デコーダバイアス用)
     """
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -778,8 +720,6 @@ def transcribe_audio(
         log_prob_threshold=LOG_PROB_THRESHOLD,
         no_speech_threshold=NO_SPEECH_THRESHOLD,
     )
-    if initial_prompt:
-        transcribe_kwargs["initial_prompt"] = initial_prompt
     if hotwords:
         transcribe_kwargs["hotwords"] = hotwords
 
@@ -858,10 +798,6 @@ def transcribe_audio(
         # 句読点正規化
         text = _normalize_punctuation(text)
         if not text:
-            continue
-
-        # プロンプトエコー検出
-        if initial_prompt and _is_prompt_echo(text, initial_prompt):
             continue
 
         # Layer 2: 用語補正
@@ -1298,8 +1234,6 @@ async def handle_connection(websocket):
         speech_pad_ms=VAD_SPEECH_PAD_MS,
     )
 
-    # Layer 1: セッション開始時に initial_prompt を構築
-    session_prompt = _get_initial_prompt()
     # Layer 3 用の参考用語リスト
     session_known_terms = _get_known_terms() if llm_corrector else None
     # Hotwords (デコーダバイアス)
@@ -1346,7 +1280,7 @@ async def handle_connection(websocket):
         loop = asyncio.get_running_loop()
         raw_segments = await loop.run_in_executor(
             executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_prompt, session_hotwords),
+            lambda: transcribe_audio(chunk, model, 0.0, session_hotwords),
         )
 
         elapsed = time.time() - t0
@@ -1551,7 +1485,7 @@ async def handle_connection(websocket):
 
                 log.info("Processing remaining buffer...")
                 try:
-                    raw_segments = transcribe_audio(remaining, model, 0.0, session_prompt, session_hotwords)
+                    raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords)
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
@@ -1608,11 +1542,6 @@ async def main():
              f"compression_ratio_thresh={COMPRESSION_RATIO_THRESHOLD}")
     log.info(f"Config dir: {CONFIG_DIR}")
     log.info(f"Term corrections: {_TERM_CORRECTIONS_PATH} ({len(term_corrector.list_corrections())} entries)")
-    startup_prompt = _get_initial_prompt()
-    if startup_prompt:
-        log.info(f"Initial prompt: {startup_prompt[:100]}{'...' if len(startup_prompt) > 100 else ''}")
-    else:
-        log.info("Initial prompt: (none — set via viewer or INITIAL_PROMPT env)")
     if llm_corrector:
         log.info(f"Layer 3 LLM: {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, "
                  f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")

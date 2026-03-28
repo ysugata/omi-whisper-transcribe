@@ -363,12 +363,11 @@
 
     function openSettings() {
         settingsModal.classList.remove("hidden");
-        loadPromptSettings();
         loadTerms();
         loadAutoDetected();
         loadSuggestions();
         loadSuggestionCount();
-        loadPresets();
+
         loadHotwordsSettings();
         loadVoiceSettings();
     }
@@ -394,95 +393,6 @@
             document.getElementById(targetId).classList.add("active");
         });
     }
-
-    // --- Prompt settings ---
-
-    var promptTopic = document.getElementById("prompt-topic");
-    var promptParticipants = document.getElementById("prompt-participants");
-    var promptPreview = document.getElementById("prompt-preview");
-    var promptCharCount = document.getElementById("prompt-char-count");
-    var promptWarnings = document.getElementById("prompt-warnings");
-    var savePromptBtn = document.getElementById("save-prompt");
-    var promptStatus = document.getElementById("prompt-status");
-
-    function buildPreview() {
-        var topic = promptTopic.value.trim();
-        var parts = [];
-        if (topic) parts.push(topic + "に関する会議です。");
-
-        var pp = promptParticipants.value.trim();
-        if (pp) {
-            var names = pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean);
-            if (names.length) parts.push("参加者: " + names.join("、") + "。");
-        }
-
-        var text = parts.length ? parts.join("") : "";
-
-        // Update char count
-        if (text) {
-            var len = text.length;
-            promptCharCount.textContent = len + " / 180文字";
-            if (len > 180) {
-                promptCharCount.style.color = "#e74c3c";
-            } else {
-                promptCharCount.style.color = "";
-            }
-        } else {
-            promptCharCount.textContent = "";
-        }
-
-        // Warnings
-        var warnings = [];
-        if (text && text.length > 180) {
-            warnings.push("文字数が180文字を超えています。Whisperの精度が低下する可能性があります。");
-        }
-        if (text && /[。.]$/.test(text)) {
-            warnings.push("末尾が句点で終わっています。Whisperが句点をエコーする場合があります。");
-        }
-        if (warnings.length > 0) {
-            promptWarnings.innerHTML = warnings.map(function (w) {
-                return '<span class="warning-text">' + escapeHtml(w) + '</span>';
-            }).join("");
-        } else {
-            promptWarnings.innerHTML = "";
-        }
-
-        if (text) {
-            if (text.length > 180) text = text.substring(0, 180) + "...";
-            promptPreview.textContent = text;
-        } else {
-            promptPreview.textContent = "プロンプトなし";
-        }
-    }
-
-    promptTopic.addEventListener("input", buildPreview);
-    promptParticipants.addEventListener("input", buildPreview);
-
-    function loadPromptSettings() {
-        fetch("/api/prompt-settings").then(function (r) { return r.json(); }).then(function (data) {
-            promptTopic.value = data.topic || "";
-            promptParticipants.value = (data.participants || []).join(", ");
-            buildPreview();
-        });
-    }
-
-    savePromptBtn.addEventListener("click", function () {
-        var pp = promptParticipants.value.trim();
-        var participants = pp ? pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-
-        fetch("/api/prompt-settings", {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                topic: promptTopic.value.trim(),
-                participants: participants,
-                terms: [],
-            }),
-        }).then(function (r) { return r.json(); }).then(function () {
-            promptStatus.textContent = "Saved!";
-            setTimeout(function () { promptStatus.textContent = ""; }, 2000);
-        });
-    });
 
     // --- Term corrections ---
 
@@ -768,78 +678,6 @@
     // ============================================================
     // Presets
     // ============================================================
-
-    var presetSelect = document.getElementById("preset-select");
-    var presetSaveBtn = document.getElementById("preset-save-btn");
-    var presetDeleteBtn = document.getElementById("preset-delete-btn");
-
-    function loadPresets() {
-        fetch("/api/presets").then(function (r) { return r.json(); }).then(function (presets) {
-            // Preserve current selection if possible
-            var currentVal = presetSelect.value;
-            presetSelect.innerHTML = '<option value="">-- Select Preset --</option>';
-            presets.forEach(function (p) {
-                var opt = document.createElement("option");
-                opt.value = p.id;
-                opt.textContent = p.name;
-                opt.dataset.topic = p.topic || "";
-                opt.dataset.participants = (p.participants || []).join(", ");
-                presetSelect.appendChild(opt);
-            });
-            // Restore selection
-            if (currentVal) {
-                presetSelect.value = currentVal;
-            }
-        });
-    }
-
-    presetSelect.addEventListener("change", function () {
-        var opt = presetSelect.options[presetSelect.selectedIndex];
-        if (!opt || !opt.value) return;
-
-        promptTopic.value = opt.dataset.topic || "";
-        promptParticipants.value = opt.dataset.participants || "";
-        buildPreview();
-    });
-
-    presetSaveBtn.addEventListener("click", function () {
-        var name = prompt("Preset name:");
-        if (!name || !name.trim()) return;
-
-        var pp = promptParticipants.value.trim();
-        var participants = pp ? pp.split(/[,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-
-        fetch("/api/presets", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                name: name.trim(),
-                topic: promptTopic.value.trim(),
-                participants: participants,
-                terms: [],
-            }),
-        }).then(function (r) { return r.json(); }).then(function (preset) {
-            loadPresets();
-            // Select the newly created preset
-            setTimeout(function () {
-                presetSelect.value = preset.id;
-            }, 200);
-        });
-    });
-
-    presetDeleteBtn.addEventListener("click", function () {
-        var pid = presetSelect.value;
-        if (!pid) return;
-        var name = presetSelect.options[presetSelect.selectedIndex].textContent;
-        if (!confirm('Delete preset "' + name + '"?')) return;
-
-        fetch("/api/presets/" + pid, {
-            method: "DELETE",
-        }).then(function (r) { return r.json(); }).then(function () {
-            presetSelect.value = "";
-            loadPresets();
-        });
-    });
 
     // Escape key closes whichever modal is open
     document.addEventListener("keydown", function (e) {

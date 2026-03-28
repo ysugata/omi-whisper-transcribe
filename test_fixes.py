@@ -40,7 +40,7 @@ for mod_name, mock_mod in _MOCK_MODULES.items():
 
 # omi_whisper_bridge がキャッシュされないようにする
 for mod in list(sys.modules.keys()):
-    if mod in ("omi_whisper_bridge", "model_manager", "prompt_builder",
+    if mod in ("omi_whisper_bridge", "model_manager",
                "term_corrector", "llm_corrector", "diarizer",
                "audio_preprocessor"):
         del sys.modules[mod]
@@ -52,7 +52,6 @@ sys.modules["model_manager"] = MagicMock()
 import omi_whisper_bridge  # noqa: E402
 from omi_whisper_bridge import (
     _remove_hallucinations,
-    _is_prompt_echo,
     _is_gibberish_kana,
     _clean_trailing_fragments,
     transcribe_audio,
@@ -185,27 +184,7 @@ class TestTrailingFragments(unittest.TestCase):
 
 
 # ============================================================
-# テスト 2: プロンプトエコー検出
-# ============================================================
-
-class TestPromptEcho(unittest.TestCase):
-
-    def test_echo_detected(self):
-        prompt = "Docker、Kubernetes、API設計の会議"
-        text = "Docker、Kubernetes、API設計"
-        self.assertTrue(_is_prompt_echo(text, prompt))
-
-    def test_normal_text_not_echo(self):
-        prompt = "Docker、Kubernetes"
-        text = "今日は天気がいいですね"
-        self.assertFalse(_is_prompt_echo(text, prompt))
-
-    def test_empty_prompt_no_echo(self):
-        self.assertFalse(_is_prompt_echo("テスト", ""))
-
-
-# ============================================================
-# テスト 3: transcribe_audio フィルタリング
+# テスト 2: transcribe_audio フィルタリング
 # ============================================================
 
 @dataclass

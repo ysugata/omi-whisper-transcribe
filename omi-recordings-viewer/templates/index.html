@@ -85,41 +85,14 @@
 
             <!-- Tabs -->
             <div class="tabs">
-                <button class="tab active" data-tab="prompt-tab">Prompt Settings</button>
-                <button class="tab" data-tab="terms-tab">Term Corrections</button>
+                <button class="tab active" data-tab="terms-tab">Term Corrections</button>
                 <button class="tab" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
                 <button class="tab" data-tab="voice-tab">Voice</button>
             </div>
 
-            <!-- Prompt settings tab -->
-            <div id="prompt-tab" class="tab-content active">
-                <div class="preset-bar">
-                    <select id="preset-select">
-                        <option value="">-- Select Preset --</option>
-                    </select>
-                    <button id="preset-save-btn" class="btn-sm" title="Save current as preset">Save</button>
-                    <button id="preset-delete-btn" class="btn-sm btn-danger" title="Delete selected preset">Del</button>
-                </div>
-                <div class="form-group">
-                    <label for="prompt-topic">Topic</label>
-                    <input type="text" id="prompt-topic" placeholder="e.g. マイクロサービス基盤のリアーキテクチャ">
-                </div>
-                <div class="form-group">
-                    <label for="prompt-participants">Participants (comma separated)</label>
-                    <input type="text" id="prompt-participants" placeholder="e.g. 田中部長, 佐藤">
-                </div>
-                <div class="form-group">
-                    <label>Preview <span id="prompt-char-count" class="text-dim"></span></label>
-                    <div id="prompt-preview" class="prompt-preview"></div>
-                </div>
-                <div id="prompt-warnings" class="prompt-warnings"></div>
-                <button id="save-prompt" class="btn-primary">Save Prompt Settings</button>
-                <span id="prompt-status" class="save-status"></span>
-            </div>
-
             <!-- Term corrections tab -->
-            <div id="terms-tab" class="tab-content">
+            <div id="terms-tab" class="tab-content active">
                 <div class="term-add-row">
                     <input type="text" id="term-wrong" placeholder="Wrong (e.g. クーバネティス)">
                     <input type="text" id="term-correct" placeholder="Correct (e.g. Kubernetes)">

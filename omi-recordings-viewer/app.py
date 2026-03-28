@@ -4,8 +4,8 @@ import asyncio
 import json
 import logging
 import os
-import uuid
-from datetime import datetime
+
+
 from pathlib import Path
 
 import aiohttp
@@ -28,9 +28,7 @@ PORT = int(os.environ.get("PORT", "8092"))
 BRIDGE_MGMT_URL = os.environ.get("BRIDGE_MGMT_URL", "")
 
 _TERM_CORRECTIONS_PATH = Path(CONFIG_DIR) / "term_corrections.json"
-_PROMPT_SETTINGS_PATH = Path(CONFIG_DIR) / "prompt_settings.json"
 _PENDING_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_suggestions.json"
-_PROMPT_PRESETS_PATH = Path(CONFIG_DIR) / "prompt_presets.json"
 _AUTO_DETECTED_PATH = Path(CONFIG_DIR) / "auto_detected_terms.json"
 _HOTWORDS_CUSTOM_PATH = Path(CONFIG_DIR) / "hotwords_custom.json"
 
@@ -137,28 +135,6 @@ async def handle_audio(request: web.Request) -> web.FileResponse:
 
     mime = _AUDIO_MIME.get(audio_path.suffix, "application/octet-stream")
     return web.FileResponse(audio_path, headers={"Content-Type": mime})
-
-
-# ============================================================
-# 設定 API: プロンプト設定
-# ============================================================
-
-async def handle_get_prompt_settings(request: web.Request) -> web.Response:
-    default = {"topic": "", "participants": [], "terms": []}
-    data = _read_json(_PROMPT_SETTINGS_PATH, default)
-    return web.json_response(data)
-
-
-async def handle_put_prompt_settings(request: web.Request) -> web.Response:
-    body = await request.json()
-    settings = {
-        "topic": str(body.get("topic", "")),
-        "participants": list(body.get("participants", [])),
-        "terms": list(body.get("terms", [])),
-    }
-    _write_json(_PROMPT_SETTINGS_PATH, settings)
-    logger.info(f"Prompt settings updated: topic={settings['topic'][:50]}")
-    return web.json_response({"status": "ok"})
 
 
 # ============================================================
@@ -299,72 +275,6 @@ async def handle_update_suggestion(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-# ============================================================
-# 設定 API: プリセット
-# ============================================================
-
-async def handle_get_presets(request: web.Request) -> web.Response:
-    data = _read_json(_PROMPT_PRESETS_PATH, [])
-    return web.json_response(data)
-
-
-async def handle_post_preset(request: web.Request) -> web.Response:
-    body = await request.json()
-    now = datetime.now().isoformat()
-    preset = {
-        "id": str(uuid.uuid4())[:8],
-        "name": str(body.get("name", "")).strip() or "Untitled",
-        "topic": str(body.get("topic", "")),
-        "participants": list(body.get("participants", [])),
-        "terms": list(body.get("terms", [])),
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    presets = _read_json(_PROMPT_PRESETS_PATH, [])
-    presets.append(preset)
-    _write_json(_PROMPT_PRESETS_PATH, presets)
-    logger.info(f"Preset created: {preset['name']} ({preset['id']})")
-    return web.json_response(preset, status=201)
-
-
-async def handle_put_preset(request: web.Request) -> web.Response:
-    pid = request.match_info["id"]
-    body = await request.json()
-
-    presets = _read_json(_PROMPT_PRESETS_PATH, [])
-    found = False
-    for p in presets:
-        if p["id"] == pid:
-            if "name" in body:
-                p["name"] = str(body["name"]).strip() or p["name"]
-            if "topic" in body:
-                p["topic"] = str(body["topic"])
-            if "participants" in body:
-                p["participants"] = list(body["participants"])
-            if "terms" in body:
-                p["terms"] = list(body["terms"])
-            p["updated_at"] = datetime.now().isoformat()
-            found = True
-            break
-    if not found:
-        return web.json_response({"error": "not found"}, status=404)
-
-    _write_json(_PROMPT_PRESETS_PATH, presets)
-    return web.json_response({"status": "ok"})
-
-
-async def handle_delete_preset(request: web.Request) -> web.Response:
-    pid = request.match_info["id"]
-    presets = _read_json(_PROMPT_PRESETS_PATH, [])
-    presets = [p for p in presets if p["id"] != pid]
-    _write_json(_PROMPT_PRESETS_PATH, presets)
-
-    # current_prompt をクリア (プリセット削除時)
-    settings = _read_json(_PROMPT_SETTINGS_PATH, {"topic": "", "participants": [], "terms": []})
-    _write_json(_PROMPT_SETTINGS_PATH, settings)
-
-    return web.json_response({"status": "ok"})
 
 
 # ============================================================
@@ -535,8 +445,7 @@ def create_app() -> web.Application:
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)
 
     # 設定 API
-    app.router.add_get("/api/prompt-settings", handle_get_prompt_settings)
-    app.router.add_put("/api/prompt-settings", handle_put_prompt_settings)
+
     app.router.add_get("/api/terms", handle_get_terms)
     app.router.add_post("/api/terms", handle_post_term)
     app.router.add_delete("/api/terms", handle_delete_term)
@@ -550,11 +459,6 @@ def create_app() -> web.Application:
     app.router.add_post("/api/suggestions/{id}/reject", handle_reject_suggestion)
     app.router.add_put("/api/suggestions/{id}", handle_update_suggestion)
 
-    # プリセット API
-    app.router.add_get("/api/presets", handle_get_presets)
-    app.router.add_post("/api/presets", handle_post_preset)
-    app.router.add_put("/api/presets/{id}", handle_put_preset)
-    app.router.add_delete("/api/presets/{id}", handle_delete_preset)
 
     # Diarization プロキシ API
     app.router.add_post("/api/diarize/start", handle_diarize_start)
