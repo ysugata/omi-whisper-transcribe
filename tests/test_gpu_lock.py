@@ -5,6 +5,8 @@ Verifies that:
 2. speaker_filter._free_vram() and _unload_model() call torch.cuda.synchronize()
 3. _batch_diarize_task() holds gpu_lock for the entire session loop
 4. _batch_tag_task() holds gpu_lock from model load through all sessions to unload
+5. ModelManager.force_unload() ignores session_count and always unloads
+6. Batch tasks use force_unload() instead of unload_model()
 """
 
 import asyncio
@@ -200,7 +202,7 @@ class TestBatchDiarizeLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = TrackingLock()
-        mock_mm.unload_model = AsyncMock(return_value=True)
+        mock_mm.force_unload = AsyncMock(return_value=True)
 
         mock_diarizer = MagicMock()
         mock_diarizer.diarize.return_value = (
@@ -228,8 +230,8 @@ class TestBatchDiarizeLock:
             f"gpu_lock should be acquired once, got {lock_events.count('acquire')}"
         assert lock_events.count("release") == 1, \
             f"gpu_lock should be released once, got {lock_events.count('release')}"
-        assert mock_mm.unload_model.call_count == 1, \
-            f"unload_model should be called once, got {mock_mm.unload_model.call_count}"
+        assert mock_mm.force_unload.call_count == 1, \
+            f"force_unload should be called once, got {mock_mm.force_unload.call_count}"
         assert mock_diarizer.diarize.call_count == 2, \
             f"Both sessions should be processed, got {mock_diarizer.diarize.call_count}"
 
@@ -252,7 +254,7 @@ class TestBatchDiarizeLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = TrackingLock()
-        mock_mm.unload_model = AsyncMock(return_value=True)
+        mock_mm.force_unload = AsyncMock(return_value=True)
 
         import omi_whisper_bridge as bridge
 
@@ -330,7 +332,7 @@ class TestBatchTagLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = tracking_lock
-        mock_mm.unload_model = AsyncMock(return_value=True)
+        mock_mm.force_unload = AsyncMock(return_value=True)
 
         mock_inference = MagicMock()
 
@@ -362,7 +364,7 @@ class TestBatchTagLock:
         assert lock_events.count("release") == 1
         assert all(processing_while_locked), \
             f"All tag operations must happen while gpu_lock is held, got {processing_while_locked}"
-        assert mock_mm.unload_model.call_count == 1
+        assert mock_mm.force_unload.call_count == 1
         assert mock_sf._unload_model.call_count == 1
 
     @pytest.mark.asyncio
@@ -372,7 +374,7 @@ class TestBatchTagLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = asyncio.Lock()
-        mock_mm.unload_model = AsyncMock(return_value=True)
+        mock_mm.force_unload = AsyncMock(return_value=True)
 
         mock_inference = MagicMock()
         mock_sf = MagicMock()
@@ -400,3 +402,72 @@ class TestBatchTagLock:
             "Embedding model must be unloaded even after errors"
         assert not mock_mm.gpu_lock.locked(), \
             "gpu_lock must be released after batch completes"
+
+
+# =====================================================================
+# 5. ModelManager.force_unload() — ignores session_count
+# =====================================================================
+
+class TestModelManagerForceUnload:
+    """Verify force_unload() always unloads regardless of session_count."""
+
+    @pytest.mark.asyncio
+    async def test_force_unload_with_active_sessions(self):
+        """force_unload() must unload even when session_count > 0."""
+        from model_manager import ModelManager
+
+        mm = ModelManager("tiny", "int8")
+        # Simulate a loaded model with active sessions
+        mm._model = MagicMock()
+        mm._executor = MagicMock()
+        mm._session_count = 3
+
+        # Patch torch to avoid ImportError
+        mock_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            result = await mm.force_unload()
+
+        assert result is True
+        assert mm._model is None
+        assert mm._executor is None
+        # session_count is NOT reset — callers handle reconnection
+        assert mm._session_count == 3
+
+    @pytest.mark.asyncio
+    async def test_force_unload_already_unloaded(self):
+        """force_unload() returns True when model is already unloaded."""
+        from model_manager import ModelManager
+
+        mm = ModelManager("tiny", "int8")
+        mm._model = None
+
+        result = await mm.force_unload()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_unload_model_rejected_with_active_sessions(self):
+        """Regular unload_model() must be rejected when sessions are active."""
+        from model_manager import ModelManager
+
+        mm = ModelManager("tiny", "int8")
+        mm._model = MagicMock()
+        mm._session_count = 1
+
+        result = await mm.unload_model()
+        assert result is False
+        assert mm._model is not None  # Not unloaded
+
+    @pytest.mark.asyncio
+    async def test_force_unload_calls_unload_model_internal(self):
+        """force_unload() must call _unload_model() (the internal method)."""
+        from model_manager import ModelManager
+
+        mm = ModelManager("tiny", "int8")
+        mm._model = MagicMock()
+        mm._session_count = 2
+
+        with patch.object(mm, "_unload_model") as mock_internal:
+            result = await mm.force_unload()
+
+        assert result is True
+        mock_internal.assert_called_once()

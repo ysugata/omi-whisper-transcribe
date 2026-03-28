@@ -978,7 +978,9 @@ async def _batch_diarize_task(force: bool = False):
         # Hold gpu_lock for the entire batch to prevent WS connections
         # from loading Whisper while diarize models occupy VRAM (OOM fix)
         async with model_manager.gpu_lock:
-            await model_manager.unload_model()
+            # force_unload: session_count>0 でも強制アンロード
+            # (既存 WS は CUDA エラー→切断→バッチ後に自動再接続)
+            await model_manager.force_unload()
 
             for sess in sessions:
                 if _batch_state["cancel_requested"]:
@@ -1141,7 +1143,9 @@ async def _batch_tag_task(force: bool = False):
         # to prevent WS connections from loading Whisper while embedding
         # model occupies VRAM (OOM fix)
         async with model_manager.gpu_lock:
-            await model_manager.unload_model()
+            # force_unload: session_count>0 でも強制アンロード
+            # (既存 WS は CUDA エラー→切断→バッチ後に自動再接続)
+            await model_manager.force_unload()
 
             inference = None
             try:

@@ -103,6 +103,19 @@ class ModelManager:
             self._unload_model()
             return True
 
+    async def force_unload(self) -> bool:
+        """バッチ処理用。session_count を無視して強制アンロード。
+
+        既存 WS セッションの model 参照は無効になるため、
+        呼び出し元が gpu_lock を保持していることが前提。
+        """
+        async with self._lock:
+            if self._model is None:
+                return True
+            log.warning(f"force_unload: unloading with session_count={self._session_count}")
+            self._unload_model()
+            return True
+
     def status(self) -> dict:
         """状態を返す。"""
         return {
