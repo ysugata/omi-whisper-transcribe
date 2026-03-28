@@ -81,6 +81,8 @@ MAX_RECORDING_DAYS = int(os.environ.get("MAX_RECORDING_DAYS", "30"))     # 自�
 # --- 音声前処理設定 ---
 NORMALIZE_ENABLED = os.environ.get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
 NORMALIZE_TARGET_DBFS = float(os.environ.get("NORMALIZE_TARGET_DBFS", "-16.0"))
+NOISE_REDUCE_ENABLED = os.environ.get("NOISE_REDUCE_ENABLED", "false").lower() in ("true", "1", "yes")
+NOISE_REDUCE_PROP_DECREASE = float(os.environ.get("NOISE_REDUCE_PROP_DECREASE", "0.8"))
 
 # --- VAD セグメンテーション設定 ---
 VAD_SEG_ENABLED = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -148,12 +150,14 @@ if HF_AUTH_TOKEN:
         language=LANGUAGE or "ja",
     )
 
-# 音声前処理 (ラウドネス正規化)
+# 音声前処理 (ノイズ除去 + ラウドネス正規化)
 audio_preprocessor: AudioPreprocessor | None = None
-if NORMALIZE_ENABLED:
+if NORMALIZE_ENABLED or NOISE_REDUCE_ENABLED:
     audio_preprocessor = AudioPreprocessor(
-        normalize_enabled=True,
+        normalize_enabled=NORMALIZE_ENABLED,
         normalize_target_dbfs=NORMALIZE_TARGET_DBFS,
+        noise_reduce_enabled=NOISE_REDUCE_ENABLED,
+        noise_reduce_prop_decrease=NOISE_REDUCE_PROP_DECREASE,
     )
 
 # Hotwords ローダー
@@ -195,6 +199,10 @@ def _get_initial_prompt() -> str:
 
     if INITIAL_PROMPT:
         return INITIAL_PROMPT
+
+    # auto モード: 日本語バイアスのデフォルトプロンプト
+    if LANGUAGE is None:
+        return "日本語の会議音声です。英語の固有名詞や技術用語が含まれる場合があります。"
 
     return ""
 
@@ -485,6 +493,7 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"(F\d+[・,、]\s*){3,}"),  # F-key 暴走パターン (F1・F2・F3...)
     re.compile(r"([ぁ-ん]{1,4}[,，、]\s*){3,}[ぁ-ん]*"),  # カンマ区切りの短いひらがな羅列 (hotwords/背景音汚染)
     re.compile(r"([ァ-ヴー]{1,4}[,，、]\s*){3,}[ァ-ヴー]*"),  # カタカナ版
+    re.compile(r"([\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]{1,8}[,，、]\s*){3,}"),  # 漢字+仮名の短い断片が3回以上
     re.compile(r"^[。、.,!?・…―\s]+$"),  # 句読点・記号のみ
     re.compile(r"\ufffd"),  # Unicode replacement character (音声デコードエラー)
 ]
@@ -496,6 +505,24 @@ def _remove_hallucinations(text: str) -> str:
     for pattern in _HALLUCINATION_PATTERNS:
         cleaned = pattern.sub("", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+# 末尾カンマ断片クリーナー: 1-6文字の断片がカンマ区切りで2回以上末尾に連続
+_TRAILING_FRAGMENT_RE = re.compile(
+    r"([,，、]\s*[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fffa-zA-Z]{1,6}){2,}\s*$"
+)
+
+
+def _clean_trailing_fragments(text: str) -> str:
+    """セグメント末尾のカンマ区切り断片ノイズを除去する。
+
+    例: "全部で, でも多いな, カマイブレもらいたいから" → "全部で"
+    全部消えた場合は元テキストを保持。
+    """
+    cleaned = _TRAILING_FRAGMENT_RE.sub("", text).strip()
+    if not cleaned:
+        return text
     return cleaned
 
 
@@ -577,6 +604,13 @@ def transcribe_audio(
 
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
+    # auto モード時に検出言語をログ出力
+    if LANGUAGE is None:
+        log.info(
+            f"Language detected: {info.language} "
+            f"(probability={info.language_probability:.2f})"
+        )
+
     for seg in segments:
         # 確信度フィルタ 1: 高い無音確率 → 単独で除去
         if seg.no_speech_prob > 0.8:
@@ -630,6 +664,9 @@ def transcribe_audio(
             continue
         text = cleaned
 
+        # 末尾カンマ断片クリーナー
+        text = _clean_trailing_fragments(text)
+
         # プロンプトエコー検出
         if initial_prompt and _is_prompt_echo(text, initial_prompt):
             continue
@@ -637,7 +674,7 @@ def transcribe_audio(
         # Layer 2: 用語補正
         text = term_corrector.correct(text)
 
-        segments_out.append({
+        seg_dict = {
             "text": text,
             "speaker": "SPEAKER_00",
             "speaker_id": 0,
@@ -645,7 +682,10 @@ def transcribe_audio(
             "end": round(seg_end + session_offset, 2),
             "is_user": True,
             "person_id": None,
-        })
+        }
+        if LANGUAGE is None:
+            seg_dict["language"] = info.language
+        segments_out.append(seg_dict)
 
     return segments_out
 
@@ -1385,7 +1425,8 @@ async def main():
         log.info(f"Diarization: AVAILABLE ({auto})")
     else:
         log.info("Diarization: UNAVAILABLE (no HF_AUTH_TOKEN)")
-    log.info(f"Normalize: {'ON (' + str(NORMALIZE_TARGET_DBFS) + 'dBFS)' if audio_preprocessor else 'OFF'}")
+    log.info(f"Normalize: {'ON (' + str(NORMALIZE_TARGET_DBFS) + 'dBFS)' if NORMALIZE_ENABLED else 'OFF'}")
+    log.info(f"Noise reduce: {'ON (prop=' + str(NOISE_REDUCE_PROP_DECREASE) + ')' if NOISE_REDUCE_ENABLED else 'OFF'}")
     if HOTWORDS_ENABLED:
         hw_settings = hotword_loader.get_settings()
         if hw_settings.get("enabled", True):
