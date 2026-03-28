@@ -200,10 +200,6 @@ def _get_initial_prompt() -> str:
     if INITIAL_PROMPT:
         return INITIAL_PROMPT
 
-    # auto モード: 日本語バイアスのデフォルトプロンプト
-    if LANGUAGE is None:
-        return "日本語の会議音声です。英語の固有名詞や技術用語が含まれる場合があります。"
-
     return ""
 
 
