@@ -213,10 +213,13 @@ class Indexer:
         since_date = await self._get_latest_date()
         on_disk = self._scan_sessions(since_date)
         indexed = await self._get_indexed(since_date)
-        untagged = await self._get_untagged(since_date)
 
-        # New sessions + previously indexed but now tagged sessions (need re-index)
-        new = [(d, t) for d, t in on_disk if (d, t) not in indexed or (d, t) in untagged]
+        # New sessions from recent dates
+        new = [(d, t) for d, t in on_disk if (d, t) not in indexed]
+
+        # Also re-index ALL untagged sessions (batch tagging may update old dates)
+        all_untagged = await self._get_untagged()
+        new.extend((d, t) for d, t in all_untagged if (d, t) not in set(new))
 
         if not new:
             return 0
@@ -244,7 +247,8 @@ class Indexer:
             count += 1
 
         await self._db.commit()
-        logger.info("Indexed %d new sessions", count)
+        if count:
+            logger.info("Indexed %d new/updated sessions", count)
         return count
 
     async def get_sessions(
