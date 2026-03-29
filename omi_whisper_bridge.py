@@ -1032,6 +1032,10 @@ async def _batch_diarize_task(force: bool = False):
             try:
                 # Per-session gpu_lock: allows WS handlers to run between sessions
                 async with model_manager.gpu_lock:
+                    # Whisper が (セッション間に) 再ロードされた場合に備え強制アンロード
+                    if model_manager.loaded:
+                        log.info("Force-unloading Whisper before diarize session")
+                        await model_manager.force_unload()
                     updated, success = await loop.run_in_executor(
                         None,
                         lambda s=sess: diarizer.diarize(
@@ -1198,6 +1202,10 @@ async def _batch_tag_task(force: bool = False):
             try:
                 # Per-session gpu_lock: load → tag → unload → release
                 async with model_manager.gpu_lock:
+                    # Whisper が (セッション間に) 再ロードされた場合に備え強制アンロード
+                    if model_manager.loaded:
+                        log.info("Force-unloading Whisper before speaker tag session")
+                        await model_manager.force_unload()
                     inference = await loop.run_in_executor(
                         None, speaker_filter._load_model
                     )
@@ -1455,8 +1463,14 @@ async def handle_connection(websocket):
     last_llm_flush = time.time()
 
     # モデル確保 (未ロードなら自動ロード)
+    # バッチ処理中 (diarize/speaker-tag) は gpu_lock が保持されるため
+    # タイムアウトで早期にリジェクトする
     try:
-        model, executor = await model_manager.acquire()
+        model, executor = await model_manager.acquire(timeout=30)
+    except TimeoutError:
+        log.warning(f"WebSocket rejected: GPU busy (batch operation in progress) [{remote}]")
+        await websocket.close(1013, "GPU busy — batch operation in progress")
+        return
     except Exception as e:
         log.error(f"Failed to acquire model: {e}", exc_info=True)
         await websocket.close(1013, "Model unavailable")

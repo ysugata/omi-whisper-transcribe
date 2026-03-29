@@ -51,14 +51,28 @@ class ModelManager:
     # Public API
     # ------------------------------------------------------------------
 
-    async def acquire(self) -> tuple:
+    async def acquire(self, timeout: float = 30) -> tuple:
         """
         WS 接続時に呼ぶ。未ロードなら自動ロード。
         GPU 排他ロック (diarization 等) が解放されるまで待機する。
 
+        Args:
+            timeout: gpu_lock 待機のタイムアウト (秒)。
+                     バッチ処理中は gpu_lock が保持されるため、
+                     無期限待ちを防ぐ。
+
         Returns: (model, executor)
+
+        Raises:
+            TimeoutError: gpu_lock 取得がタイムアウトした場合
         """
-        async with self._gpu_lock:
+        try:
+            await asyncio.wait_for(self._gpu_lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"GPU busy (lock timeout {timeout}s) — batch operation in progress?"
+            )
+        try:
             async with self._lock:
                 self._session_count += 1
                 log.info(f"acquire: session_count={self._session_count}")
@@ -73,6 +87,8 @@ class ModelManager:
                     raise
 
                 return self._model, self._executor
+        finally:
+            self._gpu_lock.release()
 
     def release(self):
         """WS 切断時に呼ぶ。"""
