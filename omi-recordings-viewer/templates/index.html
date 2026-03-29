@@ -35,6 +35,9 @@
             <option value="excited">Excited</option>
             <option value="frustrated">Frustrated</option>
         </select>
+        <select id="filter-user-tag" class="filter-select" title="Filter by user tag">
+            <option value="">User Tag</option>
+        </select>
         <button id="diarize-btn" class="diarize-btn hidden" title="Batch Speaker Diarization">Diarize</button>
         <button id="session-tag-btn" class="diarize-btn" title="Batch Session Tagging">Tag</button>
         <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
@@ -91,6 +94,7 @@
         <div class="modal-content">
             <button class="modal-close" id="modal-close">&times;</button>
             <div id="detail-header" class="detail-header"></div>
+            <div id="detail-user-tags" class="detail-user-tags"></div>
             <div id="audio-player-container" class="audio-player-container"></div>
             <div id="voiceprint-bar" class="voiceprint-bar">
                 <span id="voiceprint-selected-count">0 selected</span>
@@ -125,6 +129,7 @@
                 <button class="tab" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
                 <button class="tab" data-tab="voice-tab">Voice</button>
+                <button class="tab" data-tab="user-tags-tab">Tags</button>
             </div>
 
             <!-- Term corrections tab -->
@@ -170,6 +175,17 @@
                 </div>
                 <button id="save-hotwords-settings" class="btn-primary">Save Settings</button>
                 <span id="hotwords-status" class="save-status"></span>
+            </div>
+
+            <!-- User Tags tab -->
+            <div id="user-tags-tab" class="tab-content">
+                <div class="user-tag-add-row">
+                    <input type="text" id="user-tag-name" placeholder="Tag name (e.g. 仕事)">
+                    <input type="color" id="user-tag-color" value="#6c9bff" title="Tag color">
+                    <input type="text" id="user-tag-desc" placeholder="Description (optional)">
+                    <button id="user-tag-add-btn" class="btn-primary">Add</button>
+                </div>
+                <div id="user-tags-list" class="user-tags-list"></div>
             </div>
 
             <!-- Voice tab -->

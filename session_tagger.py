@@ -7,6 +7,7 @@ Uses OpenAI-compatible API (same as LLMCorrector).
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -75,12 +76,18 @@ class SessionTagger:
         temperature: float = 0,
         max_tokens: int = 512,
         timeout: int = 15,
+        user_tags_path: str = "",
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._client = None
+        self._user_tags_path = user_tags_path
+        self._user_tags: list[dict] = []
+
+        if user_tags_path:
+            self._load_user_tags()
 
         if self._enabled:
             try:
@@ -95,9 +102,44 @@ class SessionTagger:
                 log.error(f"SessionTagger init failed: {e}")
                 self._enabled = False
 
+    def _load_user_tags(self) -> None:
+        """Load user tag definitions from JSON file."""
+        if not self._user_tags_path or not os.path.exists(self._user_tags_path):
+            self._user_tags = []
+            return
+        try:
+            with open(self._user_tags_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._user_tags = data
+                log.info(f"SessionTagger: loaded {len(data)} user tag definitions")
+            else:
+                self._user_tags = []
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"SessionTagger: failed to load user tags: {e}")
+            self._user_tags = []
+
+    def reload_user_tags(self) -> None:
+        """Reload user tag definitions (called when tags are updated via CRUD)."""
+        self._load_user_tags()
+
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt, including user tag definitions if any."""
+        prompt = SYSTEM_PROMPT
+        if self._user_tags:
+            prompt += "\n\n### user_tags (ユーザー定義タグ、該当するもの全て)\n"
+            prompt += "利用可能なタグ:\n"
+            for tag in self._user_tags:
+                name = tag.get("name", "")
+                desc = tag.get("description", "")
+                if name:
+                    prompt += f'- "{name}": {desc}\n' if desc else f'- "{name}"\n'
+            prompt += '該当するタグ名のリストを user_tags に入れてください。該当なしなら空配列。'
+        return prompt
 
     def _build_input(self, segments: list[dict]) -> str:
         """Build session text from segments."""
@@ -171,6 +213,20 @@ class SessionTagger:
         summary = str(tags.get("summary", "")).strip()
         result["summary"] = summary[:200] if summary else ""
 
+        # user_tags: list of tag names → convert to tag IDs
+        user_tags_raw = tags.get("user_tags", [])
+        if isinstance(user_tags_raw, list) and self._user_tags:
+            # Build name→id map
+            name_to_id = {t["name"]: t["id"] for t in self._user_tags if t.get("name") and t.get("id")}
+            resolved = []
+            for tag_name in user_tags_raw:
+                tag_name_str = str(tag_name).strip()
+                if tag_name_str in name_to_id:
+                    resolved.append(name_to_id[tag_name_str])
+            result["user_tags"] = resolved
+        else:
+            result["user_tags"] = []
+
         return result
 
     def tag_session(self, segments: list[dict]) -> Optional[dict]:
@@ -190,10 +246,11 @@ class SessionTagger:
             return None
 
         try:
+            system_prompt = self._build_system_prompt()
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": session_text},
                 ],
                 temperature=self._temperature,

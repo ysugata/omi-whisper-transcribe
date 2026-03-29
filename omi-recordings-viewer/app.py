@@ -31,6 +31,7 @@ _TERM_CORRECTIONS_PATH = Path(CONFIG_DIR) / "term_corrections.json"
 _PENDING_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_suggestions.json"
 _AUTO_DETECTED_PATH = Path(CONFIG_DIR) / "auto_detected_terms.json"
 _HOTWORDS_CUSTOM_PATH = Path(CONFIG_DIR) / "hotwords_custom.json"
+_USER_TAGS_PATH = Path(CONFIG_DIR) / "user_tags.json"
 
 # 初期辞書 (term_corrector.py と同じもの、viewer 単体でも初期生成できるように)
 _INITIAL_DICT = {
@@ -100,9 +101,10 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
 
     activity = request.query.get("activity", "").strip()
     mood = request.query.get("mood", "").strip()
+    user_tag = request.query.get("user_tag", "").strip()
 
     try:
-        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood)
+        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood, user_tag=user_tag)
     except Exception as e:
         logger.exception("Failed to query sessions")
         return web.json_response({"error": str(e)}, status=500)
@@ -278,6 +280,145 @@ async def handle_update_suggestion(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+
+
+# ============================================================
+# ユーザータグ CRUD API
+# ============================================================
+
+def _generate_tag_id() -> str:
+    """Generate a short unique tag ID."""
+    import uuid
+    return "ut_" + uuid.uuid4().hex[:6]
+
+
+async def handle_get_user_tags(request: web.Request) -> web.Response:
+    data = _read_json(_USER_TAGS_PATH, [])
+    return web.json_response(data)
+
+
+async def handle_post_user_tag(request: web.Request) -> web.Response:
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return web.json_response({"error": "name is required"}, status=400)
+    color = str(body.get("color", "#6c9bff")).strip()
+    description = str(body.get("description", "")).strip()
+
+    tags = _read_json(_USER_TAGS_PATH, [])
+    new_tag = {
+        "id": _generate_tag_id(),
+        "name": name,
+        "color": color,
+        "description": description,
+    }
+    tags.append(new_tag)
+    _write_json(_USER_TAGS_PATH, tags)
+
+    # Notify Bridge to reload user tags
+    await _notify_bridge_user_tags_reload(request)
+
+    return web.json_response(new_tag, status=201)
+
+
+async def handle_put_user_tag(request: web.Request) -> web.Response:
+    tag_id = request.match_info["id"]
+    body = await request.json()
+
+    tags = _read_json(_USER_TAGS_PATH, [])
+    target = None
+    for t in tags:
+        if t.get("id") == tag_id:
+            target = t
+            break
+    if not target:
+        return web.json_response({"error": "not found"}, status=404)
+
+    if "name" in body:
+        target["name"] = str(body["name"]).strip()
+    if "color" in body:
+        target["color"] = str(body["color"]).strip()
+    if "description" in body:
+        target["description"] = str(body["description"]).strip()
+
+    _write_json(_USER_TAGS_PATH, tags)
+    await _notify_bridge_user_tags_reload(request)
+    return web.json_response({"status": "ok"})
+
+
+async def handle_delete_user_tag(request: web.Request) -> web.Response:
+    tag_id = request.match_info["id"]
+    tags = _read_json(_USER_TAGS_PATH, [])
+    new_tags = [t for t in tags if t.get("id") != tag_id]
+    if len(new_tags) == len(tags):
+        return web.json_response({"error": "not found"}, status=404)
+    _write_json(_USER_TAGS_PATH, new_tags)
+    await _notify_bridge_user_tags_reload(request)
+    return web.json_response({"status": "ok"})
+
+
+async def _notify_bridge_user_tags_reload(request: web.Request) -> None:
+    """Notify Bridge to reload user tag definitions."""
+    if not BRIDGE_MGMT_URL:
+        return
+    session: aiohttp.ClientSession = request.app["bridge_session"]
+    try:
+        timeout = aiohttp.ClientTimeout(total=3)
+        await session.post(f"{BRIDGE_MGMT_URL}/user-tags/reload", timeout=timeout)
+    except Exception as e:
+        logger.debug(f"Bridge user-tags reload notification failed: {e}")
+
+
+# ============================================================
+# セッションユーザータグ更新 API
+# ============================================================
+
+async def handle_put_session_user_tags(request: web.Request) -> web.Response:
+    """Update user_tags on a session's transcript.json and re-index."""
+    date = request.match_info["date"]
+    time = request.match_info["time"]
+    body = await request.json()
+    user_tags = body.get("user_tags", [])
+    if not isinstance(user_tags, list):
+        return web.json_response({"error": "user_tags must be a list"}, status=400)
+
+    transcript_path = Path(RECORDINGS_DIR) / date / time / "transcript.json"
+    if not transcript_path.exists():
+        return web.json_response({"error": "session not found"}, status=404)
+
+    try:
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return web.json_response({"error": "transcript read error"}, status=500)
+
+    session = data.setdefault("session", {})
+    tags = session.setdefault("tags", {})
+    tags["user_tags"] = user_tags
+    transcript_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Trigger re-index
+    indexer: Indexer = request.app["indexer"]
+    try:
+        info = indexer._parse_transcript(date, time)
+        await indexer._db.execute(
+            """INSERT OR REPLACE INTO sessions
+               (date, time, start_at, end_at, duration_seconds,
+                audio_size_mb, model, language, transcript_text, segment_count,
+                tags_topics, tags_activity, tags_intent, tags_mood,
+                tags_quality, tags_entities, tags_summary, session_tagged, tags_user)
+               VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
+                       :audio_size_mb, :model, :language, :transcript_text, :segment_count,
+                       :tags_topics, :tags_activity, :tags_intent, :tags_mood,
+                       :tags_quality, :tags_entities, :tags_summary, :session_tagged, :tags_user)""",
+            info,
+        )
+        await indexer._db.commit()
+    except Exception as e:
+        logger.warning(f"Re-index after user-tags update failed: {e}")
+
+    return web.json_response({"status": "ok", "user_tags": user_tags})
 
 
 # ============================================================
@@ -478,6 +619,15 @@ def create_app() -> web.Application:
     app.router.add_post("/api/suggestions/{id}/reject", handle_reject_suggestion)
     app.router.add_put("/api/suggestions/{id}", handle_update_suggestion)
 
+
+    # User tags CRUD API
+    app.router.add_get("/api/user-tags", handle_get_user_tags)
+    app.router.add_post("/api/user-tags", handle_post_user_tag)
+    app.router.add_put("/api/user-tags/{id}", handle_put_user_tag)
+    app.router.add_delete("/api/user-tags/{id}", handle_delete_user_tag)
+
+    # Session user-tags update
+    app.router.add_put("/api/sessions/{date}/{time}/user-tags", handle_put_session_user_tags)
 
     # Diarization プロキシ API
     app.router.add_post("/api/diarize/start", handle_diarize_start)

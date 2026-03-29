@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_entities TEXT,
     tags_summary TEXT,
     session_tagged INTEGER DEFAULT 0,
+    tags_user TEXT,
     UNIQUE(date, time)
 );
 
@@ -51,6 +52,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_entities TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_summary TEXT",
     "ALTER TABLE sessions ADD COLUMN session_tagged INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_user TEXT",
 ]
 
 FTS_SCHEMA = """
@@ -172,6 +174,7 @@ class Indexer:
         tags = session.get("tags", {})
         tags_topics = ",".join(tags.get("topics", [])) if tags.get("topics") else None
         tags_entities = ",".join(tags.get("entities", [])) if tags.get("entities") else None
+        tags_user = ",".join(tags.get("user_tags", [])) if tags.get("user_tags") else None
 
         return {
             "date": date,
@@ -192,6 +195,7 @@ class Indexer:
             "tags_entities": tags_entities,
             "tags_summary": tags.get("summary"),
             "session_tagged": 1 if session.get("session_tagged") else 0,
+            "tags_user": tags_user,
         }
 
     async def _get_untagged(self, since_date: str | None = None) -> set[tuple[str, str]]:
@@ -237,11 +241,11 @@ class Indexer:
                    (date, time, start_at, end_at, duration_seconds,
                     audio_size_mb, model, language, transcript_text, segment_count,
                     tags_topics, tags_activity, tags_intent, tags_mood,
-                    tags_quality, tags_entities, tags_summary, session_tagged)
+                    tags_quality, tags_entities, tags_summary, session_tagged, tags_user)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                           :tags_quality, :tags_entities, :tags_summary, :session_tagged)""",
+                           :tags_quality, :tags_entities, :tags_summary, :session_tagged, :tags_user)""",
                 info,
             )
             count += 1
@@ -253,7 +257,7 @@ class Indexer:
 
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
-        activity: str = "", mood: str = "",
+        activity: str = "", mood: str = "", user_tag: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -272,6 +276,11 @@ class Indexer:
         if mood:
             where_clauses.append("tags_mood = ?")
             params.append(mood)
+
+        if user_tag:
+            where_clauses.append("(tags_user LIKE ? OR tags_user = ?)")
+            params.append("%" + user_tag + "%")
+            params.append(user_tag)
 
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 

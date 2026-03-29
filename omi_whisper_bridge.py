@@ -178,12 +178,15 @@ if HF_AUTH_TOKEN:
     )
 
 # セッションタグ付け (LLM API キーがあれば利用可能)
+_USER_TAGS_PATH = os.path.join(CONFIG_DIR, "user_tags.json")
+
 session_tagger: SessionTagger | None = None
 if TAGGING_ENABLED and LLM_API_KEY:
     session_tagger = SessionTagger(
         api_key=LLM_API_KEY,
         base_url=LLM_BASE_URL,
         model=TAGGING_MODEL,
+        user_tags_path=_USER_TAGS_PATH,
     )
 
 
@@ -2070,6 +2073,13 @@ async def main():
         speaker_filter.delete_all()
         return web.json_response({"status": "ok"})
 
+    # --- User Tags reload API ---
+
+    async def handle_user_tags_reload(request):
+        if session_tagger is not None:
+            session_tagger.reload_user_tags()
+        return web.json_response({"status": "ok"})
+
     # --- Session Tagging バッチ API ---
 
     async def handle_session_tag_start(request):
@@ -2132,6 +2142,8 @@ async def main():
     mgmt_app.router.add_delete("/speakers/{id}", handle_speakers_delete)
     mgmt_app.router.add_post("/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
     mgmt_app.router.add_delete("/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
+    # User tags reload
+    mgmt_app.router.add_post("/user-tags/reload", handle_user_tags_reload)
     # Session tagging batch API
     mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
     mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)

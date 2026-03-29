@@ -31,6 +31,11 @@
     var speakersCache = [];
     var segmentFilter = "all";
 
+    // User tags
+    var userTagsCache = [];
+    var currentSessionUserTags = [];  // tag IDs for current detail session
+    var currentSessionAutoUserTags = [];  // auto-assigned tag IDs (from LLM)
+
     // --- Helpers ---
 
     function formatDuration(sec) {
@@ -61,12 +66,14 @@
 
     var filterActivity = document.getElementById("filter-activity");
     var filterMood = document.getElementById("filter-mood");
+    var filterUserTag = document.getElementById("filter-user-tag");
 
     function fetchSessions(page, query) {
         var url = "/api/sessions?page=" + page + "&per_page=20";
         if (query) url += "&q=" + encodeURIComponent(query);
         if (filterActivity && filterActivity.value) url += "&activity=" + encodeURIComponent(filterActivity.value);
         if (filterMood && filterMood.value) url += "&mood=" + encodeURIComponent(filterMood.value);
+        if (filterUserTag && filterUserTag.value) url += "&user_tag=" + encodeURIComponent(filterUserTag.value);
         return fetch(url).then(function (r) { return r.json(); });
     }
 
@@ -118,6 +125,27 @@
                     }
                 }
                 html += '</div>';
+            }
+            // User tag badges
+            if (s.tags_user && userTagsCache.length > 0) {
+                var uTagIds = s.tags_user.split(",");
+                var uTagHtml = '';
+                for (var ui = 0; ui < uTagIds.length; ui++) {
+                    var utId = uTagIds[ui].trim();
+                    var utDef = userTagsCache.find(function(t) { return t.id === utId; });
+                    if (utDef) {
+                        uTagHtml += '<span class="user-tag-card-badge" style="background:' + escapeHtml(utDef.color) + '">' + escapeHtml(utDef.name) + '</span>';
+                    }
+                }
+                if (uTagHtml) {
+                    if (!s.tags_activity && !s.tags_mood && !s.tags_topics) {
+                        html += '<div class="session-tags">' + uTagHtml + '</div>';
+                    } else {
+                        // Append to existing tags div — we need to inject before closing
+                        // Actually since we already closed the div above, just add another row
+                        html += '<div class="session-tags">' + uTagHtml + '</div>';
+                    }
+                }
             }
             if (s.tags_summary) {
                 html += '<div class="session-summary">' + escapeHtml(s.tags_summary) + '</div>';
@@ -215,6 +243,10 @@
                 detailHeader.innerHTML += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
             }
         }
+
+        // User tags section in detail modal
+        currentSessionUserTags = (tags && tags.user_tags) ? tags.user_tags.slice() : [];
+        renderDetailUserTags();
 
         var audioFile = (t && t.session && t.session.audio_file) ? t.session.audio_file : "audio.ogg";
         audioContainer.innerHTML =
@@ -369,14 +401,16 @@
         detailHeader.innerHTML = '<div class="loading">Loading...</div>';
         audioContainer.innerHTML = "";
         segmentsContainer.innerHTML = "";
+        document.getElementById("detail-user-tags").innerHTML = "";
         segmentFilter = "all";
         modal.classList.remove("hidden");
 
-        // Load speakers list and session detail in parallel, render when both ready
+        // Load speakers list, user tags, and session detail in parallel
         var speakersPromise = loadSpeakersCache();
+        var userTagsPromise = loadUserTagsCache();
         var detailPromise = fetchSessionDetail(date, time);
-        Promise.all([speakersPromise, detailPromise]).then(function (results) {
-            renderDetail(results[1]);
+        Promise.all([speakersPromise, userTagsPromise, detailPromise]).then(function (results) {
+            renderDetail(results[2]);
         });
     }
 
@@ -405,6 +439,7 @@
     });
     if (filterActivity) filterActivity.addEventListener("change", function () { loadPage(1); });
     if (filterMood) filterMood.addEventListener("change", function () { loadPage(1); });
+    if (filterUserTag) filterUserTag.addEventListener("change", function () { loadPage(1); });
     modalClose.addEventListener("click", closeModal);
     modal.addEventListener("click", function (e) {
         if (e.target === modal) closeModal();
@@ -423,6 +458,7 @@
 
         loadHotwordsSettings();
         loadVoiceSettings();
+        loadUserTagsSettings();
     }
 
     function closeSettings() {
@@ -1586,8 +1622,185 @@
         }).catch(function () {});
     }
 
+    // ============================================================
+    // User Tags Management
+    // ============================================================
+
+    var userTagNameInput = document.getElementById("user-tag-name");
+    var userTagColorInput = document.getElementById("user-tag-color");
+    var userTagDescInput = document.getElementById("user-tag-desc");
+    var userTagAddBtn = document.getElementById("user-tag-add-btn");
+    var userTagsListEl = document.getElementById("user-tags-list");
+
+    function loadUserTagsCache() {
+        return fetch("/api/user-tags").then(function (r) { return r.json(); }).then(function (data) {
+            userTagsCache = data || [];
+            populateUserTagFilter();
+        }).catch(function () {
+            userTagsCache = [];
+        });
+    }
+
+    function populateUserTagFilter() {
+        if (!filterUserTag) return;
+        var currentVal = filterUserTag.value;
+        filterUserTag.innerHTML = '<option value="">User Tag</option>';
+        userTagsCache.forEach(function (t) {
+            var opt = document.createElement("option");
+            opt.value = t.id;
+            opt.textContent = t.name;
+            filterUserTag.appendChild(opt);
+        });
+        filterUserTag.value = currentVal;
+    }
+
+    function loadUserTagsSettings() {
+        fetch("/api/user-tags").then(function (r) { return r.json(); }).then(function (data) {
+            userTagsCache = data || [];
+            renderUserTagsSettings(data || []);
+            populateUserTagFilter();
+        }).catch(function () {
+            userTagsListEl.innerHTML = '<div class="loading">Failed to load tags</div>';
+        });
+    }
+
+    function renderUserTagsSettings(tags) {
+        if (tags.length === 0) {
+            userTagsListEl.innerHTML = '<div class="loading">No custom tags defined</div>';
+            return;
+        }
+        var html = "";
+        tags.forEach(function (t) {
+            html += '<div class="user-tag-row" data-id="' + escapeHtml(t.id) + '">';
+            html += '<span class="user-tag-badge" style="background:' + escapeHtml(t.color) + '">' + escapeHtml(t.name) + '</span>';
+            html += '<span class="user-tag-desc">' + escapeHtml(t.description || "") + '</span>';
+            html += '<button class="btn-edit user-tag-edit" data-id="' + escapeHtml(t.id) + '">Edit</button>';
+            html += '<button class="btn-danger user-tag-del" data-id="' + escapeHtml(t.id) + '">Del</button>';
+            html += '</div>';
+        });
+        userTagsListEl.innerHTML = html;
+
+        var delBtns = userTagsListEl.querySelectorAll(".user-tag-del");
+        for (var i = 0; i < delBtns.length; i++) {
+            delBtns[i].addEventListener("click", function () {
+                var id = this.getAttribute("data-id");
+                if (!confirm("Delete this tag?")) return;
+                fetch("/api/user-tags/" + id, { method: "DELETE" })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { loadUserTagsSettings(); });
+            });
+        }
+
+        var editBtns = userTagsListEl.querySelectorAll(".user-tag-edit");
+        for (var j = 0; j < editBtns.length; j++) {
+            editBtns[j].addEventListener("click", function () {
+                editUserTag(this.getAttribute("data-id"));
+            });
+        }
+    }
+
+    function editUserTag(id) {
+        var t = userTagsCache.find(function (tag) { return tag.id === id; });
+        if (!t) return;
+        var newName = prompt("Tag name:", t.name);
+        if (!newName || !newName.trim()) return;
+        var newDesc = prompt("Description:", t.description || "");
+        fetch("/api/user-tags/" + id, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName.trim(), description: (newDesc || "").trim() }),
+        }).then(function (r) { return r.json(); })
+          .then(function () { loadUserTagsSettings(); });
+    }
+
+    if (userTagAddBtn) {
+        userTagAddBtn.addEventListener("click", addUserTag);
+    }
+    if (userTagNameInput) {
+        userTagNameInput.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") addUserTag();
+        });
+    }
+
+    function addUserTag() {
+        var name = userTagNameInput.value.trim();
+        if (!name) return;
+        var color = userTagColorInput.value || "#6c9bff";
+        var desc = userTagDescInput.value.trim();
+        fetch("/api/user-tags", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name, color: color, description: desc }),
+        }).then(function (r) { return r.json(); }).then(function () {
+            userTagNameInput.value = "";
+            userTagDescInput.value = "";
+            loadUserTagsSettings();
+        });
+    }
+
+    // --- Detail modal user tag chips ---
+
+    function renderDetailUserTags() {
+        var container = document.getElementById("detail-user-tags");
+        if (!container) return;
+        if (userTagsCache.length === 0) {
+            container.innerHTML = "";
+            return;
+        }
+        var html = '<div class="detail-user-tags">';
+        userTagsCache.forEach(function (t) {
+            var isActive = currentSessionUserTags.indexOf(t.id) !== -1;
+            html += '<span class="user-tag-chip' + (isActive ? ' active' : '') + '" ' +
+                'data-tag-id="' + escapeHtml(t.id) + '" ' +
+                'style="background:' + escapeHtml(t.color) + '">' +
+                escapeHtml(t.name) +
+                '</span>';
+        });
+        html += '</div>';
+        container.innerHTML = html;
+
+        var chips = container.querySelectorAll(".user-tag-chip");
+        for (var i = 0; i < chips.length; i++) {
+            chips[i].addEventListener("click", function () {
+                var tagId = this.getAttribute("data-tag-id");
+                toggleDetailUserTag(tagId);
+            });
+        }
+    }
+
+    var _userTagSaveTimer = null;
+
+    function toggleDetailUserTag(tagId) {
+        var idx = currentSessionUserTags.indexOf(tagId);
+        if (idx === -1) {
+            currentSessionUserTags.push(tagId);
+        } else {
+            currentSessionUserTags.splice(idx, 1);
+        }
+        renderDetailUserTags();
+
+        // Debounced save
+        if (_userTagSaveTimer) clearTimeout(_userTagSaveTimer);
+        _userTagSaveTimer = setTimeout(function () {
+            saveSessionUserTags();
+        }, 500);
+    }
+
+    function saveSessionUserTags() {
+        if (!currentDetailDate || !currentDetailTime) return;
+        fetch("/api/sessions/" + currentDetailDate + "/" + currentDetailTime + "/user-tags", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_tags: currentSessionUserTags }),
+        }).then(function (r) { return r.json(); }).catch(function (e) {
+            console.error("Failed to save user tags:", e);
+        });
+    }
+
     // --- Init ---
-    loadPage(1);
+    loadUserTagsCache().then(function () {
+        loadPage(1);
+    });
     checkDiarizeAvailability();
     loadHotwordsStatus();
     checkTagStatus();
