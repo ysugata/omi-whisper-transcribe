@@ -67,7 +67,7 @@ services:
     ports:
       - "${VIEWER_PORT:-8092}:8092"
     volumes:
-      - ./recordings:/app/recordings:ro
+      - ./recordings:/app/recordings
       - ./config:/app/config
       - viewer-data:/app/data
     environment:
