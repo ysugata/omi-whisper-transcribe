@@ -425,7 +425,9 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
 # Diarization プロキシ API (Bridge へ中継)
 # ============================================================
 
-async def _proxy_bridge(request: web.Request, method: str, path: str) -> web.Response:
+async def _proxy_bridge(
+    request: web.Request, method: str, path: str, timeout_sec: float = 5,
+) -> web.Response:
     """Bridge 管理 API へリクエストをプロキシする共通ロジック。"""
     if not BRIDGE_MGMT_URL:
         return web.json_response({"error": "bridge not configured"}, status=503)
@@ -433,7 +435,7 @@ async def _proxy_bridge(request: web.Request, method: str, path: str) -> web.Res
     session: aiohttp.ClientSession = request.app["bridge_session"]
     url = f"{BRIDGE_MGMT_URL}{path}"
     try:
-        timeout = aiohttp.ClientTimeout(total=5)
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
         if method == "GET":
             resp = await session.get(url, timeout=timeout)
         else:
@@ -461,6 +463,9 @@ async def _proxy_bridge(request: web.Request, method: str, path: str) -> web.Res
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.warning(f"Bridge proxy error ({path}): {e}")
         return web.json_response({"error": "bridge unavailable"}, status=502)
+    except Exception as e:
+        logger.error(f"Bridge proxy unexpected error ({path}): {e}", exc_info=True)
+        return web.json_response({"error": str(e)}, status=502)
 
 
 async def handle_diarize_start(request: web.Request) -> web.Response:
@@ -527,7 +532,8 @@ async def handle_speakers_delete(request: web.Request) -> web.Response:
 
 async def handle_speakers_add_voiceprint(request: web.Request) -> web.Response:
     speaker_id = request.match_info["id"]
-    return await _proxy_bridge(request, "POST", f"/speakers/{speaker_id}/voiceprint")
+    # Voiceprint extraction involves GPU lock + model load/unload — needs longer timeout
+    return await _proxy_bridge(request, "POST", f"/speakers/{speaker_id}/voiceprint", timeout_sec=120)
 
 
 async def handle_speakers_remove_voiceprint(request: web.Request) -> web.Response:
