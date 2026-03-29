@@ -23,11 +23,16 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム文字起こし | WebSocket で受信した音声を faster-whisper で逐次処理 |
 | VAD ベースセグメンテーション | Silero VAD で発話区間を検出し、自然な区切りで文字起こし |
 | 無音検出 | RMS ベースで無音を判定し、GPU リソースを節約 |
+| 音声前処理 | ラウドネス正規化 + ノイズ除去 (スペクトルゲーティング) |
+| ハルシネーションフィルタ | 異常出力・ギブリッシュ仮名・句読点のみ等を除去 |
+| セグメント分割 | 長いセグメントを文境界で自然に分割 |
+| Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
+| LLM 後処理 | Gemini によるバッチ用語修正・提案 (コスト最適化済み) |
+| セッションタグ | LLM による自動タグ付け (活動・気分・トピック・要約) |
+| カスタムユーザータグ | ユーザー定義タグの作成・付与・LLM 自動適用 |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
-| Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
-| ハルシネーションフィルタ | F キー連打・かなバブル・句読点のみ等の異常出力を除去 |
-| LLM 後処理 | Gemini による用語修正・提案 |
+| 空セッションスキップ | セグメントのないセッションは自動削除 |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
 ## 必要環境
@@ -47,7 +52,7 @@ cd omi_whisper_transcribe
 cp .env.example .env
 # .env を編集して以下を設定:
 #   HF_AUTH_TOKEN=hf_xxx    (話者分離・声紋登録に必須。pyannote の利用規約同意が必要)
-#   GEMINI_API_KEY=...      (LLM 後処理を使う場合)
+#   GEMINI_API_KEY=...      (LLM 後処理・セッションタグに必須)
 #   OMI_WHISPER_TOKEN=...   (Cloudflare Tunnel 経由で公開する場合)
 ```
 
@@ -125,6 +130,20 @@ open http://localhost:8092
 | POST | `/speakers/tag/cancel` | タグ付けをキャンセル |
 | DELETE | `/speakers/all` | 全話者を削除 |
 
+### セッションタグ
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/session-tags/start` | バッチセッションタグ付けを開始 |
+| GET | `/session-tags/status` | タグ付け進捗を返す |
+| POST | `/session-tags/cancel` | タグ付けをキャンセル |
+
+### ユーザータグ
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/user-tags/reload` | ユーザータグ定義を再読み込み |
+
 ## 環境変数
 
 ### Whisper モデル
@@ -176,6 +195,26 @@ open http://localhost:8092
 |------|-----------|------|
 | `NORMALIZE_ENABLED` | `true` | ラウドネス正規化 |
 | `NORMALIZE_TARGET_DBFS` | `-16.0` | ターゲットラウドネス (dBFS) |
+| `NOISE_REDUCE_ENABLED` | `false` | スペクトルゲーティング方式のノイズ除去 |
+| `NOISE_REDUCE_PROP_DECREASE` | `0.8` | ノイズ低減率 (0.0〜1.0) |
+
+### LLM 後処理
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `LLM_ENABLED` | `true` | LLM 後処理の有効化 |
+| `LLM_MODEL` | `gemini-2.5-flash-lite` | LLM モデル名 |
+| `LLM_TIMEOUT` | `10` | リクエストタイムアウト (秒) |
+| `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
+| `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
+| `LLM_BATCH_SIZE` | `20` | バッチフラッシュのセグメント数 |
+
+### セッションタグ
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
+| `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
 
 ### 機能フラグ
 
@@ -183,18 +222,13 @@ open http://localhost:8092
 |------|-----------|------|
 | `DIARIZATION_ENABLED` | `false` | セッション終了時の自動話者分離 |
 | `HOTWORDS_ENABLED` | `true` | Hotwords (デコーダバイアス) |
-| `LLM_ENABLED` | `true` | LLM 後処理 |
 
 ### 外部サービス
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `HF_AUTH_TOKEN` | (空) | HuggingFace トークン (話者分離・声紋登録に必須) |
-| `GEMINI_API_KEY` | (空) | Google Gemini API キー (LLM 後処理に必須) |
-| `LLM_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai/` | LLM API ベース URL |
-| `LLM_MODEL` | `gemini-2.5-flash` | LLM モデル名 |
-| `LLM_TIMEOUT` | `10` | LLM リクエストタイムアウト (秒) |
-| `LLM_MIN_TEXT_LENGTH` | `5` | LLM 処理の最小テキスト長 |
+| `GEMINI_API_KEY` | (空) | Google Gemini API キー (LLM 後処理・セッションタグに必須) |
 
 ### ネットワーク・認証
 
@@ -225,6 +259,27 @@ RMS ベースの無音判定で GPU リソースを節約:
 - WebSocket 接続自体は切断しない (Omi 側のライフサイクルに任せる)
 
 `SILENCE_THRESHOLD=0` で無効化可能。閾値 200 は環境ノイズ (50〜300) をカットし、小声 (500〜) は通す設定。
+
+## 音声前処理
+
+音声が Whisper に渡される前に 2 段階の前処理を実行:
+
+1. **ノイズ除去** (`NOISE_REDUCE_ENABLED=true` で有効): noisereduce ライブラリのスペクトルゲーティングで定常騒音 (空調、エンジン音、電車走行音) を除去。CPU (numpy) ベースのため VRAM 消費なし
+2. **ラウドネス正規化** (`NORMALIZE_ENABLED=true`): ターゲット dBFS に音量を正規化。音量のばらつきを抑えて認識精度を安定化
+
+## ハルシネーションフィルタ
+
+Whisper 特有の異常出力を後処理で除去:
+
+- **繰り返しパターン**: 同じフレーズや文字の連続出力
+- **ギブリッシュ仮名**: 低信頼度 + 意味のないカタカナ/ひらがな羅列 (助詞・文法パターンがあれば保持)
+- **句読点・記号のみ**: 実質内容のないセグメント
+- **末尾カンマ断片**: 漢字仮名の短い断片がカンマ区切りで連続するパターン
+- **no_speech 判定**: `no_speech_prob` が高く、かつ Whisper 信頼度が低いセグメント
+
+## セグメント分割
+
+15秒を超える長いセグメントを文境界 (`。` `？` `！`) で自動分割。タイムスタンプは文字数比で按分し、5 文字未満の断片は前のセグメントにマージ。`SEGMENT_MAX_DURATION=0` で無効化。
 
 ## バッチ話者分離
 
@@ -268,21 +323,46 @@ Viewer の「Diarize」ボタンから、未処理の全録音に対して一括
 - カスタム語の追加も可能
 - `HOTWORDS_ENABLED=false` で無効化
 
-## ハルシネーションフィルタ
-
-Whisper 特有の異常出力を後処理で除去:
-
-- **F キー連打**: `F1・F2・F3...` のような無意味な出力
-- **かなバブル**: `, ぬ, ぐん, ごう...` のような意味のないかな羅列
-- **句読点のみ**: `。` だけのセグメント
-
 ## LLM 後処理
 
-Gemini API を使い、文字起こし結果の用語修正と新規用語の提案を行います。
+Gemini API を使い、文字起こし結果の用語修正と新規用語の提案をバッチで行います。
 
-- 登録済み用語辞書 (`config/terms.json`) に基づく自動修正
+- セグメントを `LLM_BATCH_INTERVAL` 秒 (デフォルト 60) または `LLM_BATCH_SIZE` 個 (デフォルト 20) ごとにまとめて 1 回の API コールで処理
+- セッション終了・無音タイムアウト時にも自動フラッシュ
+- 登録済み用語辞書 (`config/term_corrections.json`) に基づく自動修正
 - 未知の技術用語・固有名詞の修正候補を提案 (`config/pending_suggestions.json`)
 - Viewer の Settings > LLM Suggestions で提案を承認/却下
+
+## セッションタグ
+
+Gemini API でセッション終了時に自動でメタデータタグを付与:
+
+| フィールド | 型 | 内容 |
+|-----------|-----|------|
+| `topics` | リスト | 会話の主要トピック |
+| `activity` | enum | 会話、ミーティング、移動中、作業中 等 |
+| `intent` | enum | 情報共有、相談、雑談、報告 等 |
+| `mood` | enum | ポジティブ、ニュートラル、ネガティブ |
+| `quality` | enum | 文字起こし品質 (clear, noisy, mixed) |
+| `entities` | リスト | 言及された固有名詞 |
+| `summary` | テキスト | 日本語の要約 (1〜2文) |
+
+- `TAGGING_ENABLED=true` でリアルタイム自動タグ付け
+- Viewer の「Tag」ボタンからバッチ実行も可能
+- `tools/tag_all.py` で CLI からも実行可能
+
+## カスタムユーザータグ
+
+ユーザーがシンプルラベル形式のカスタムタグ (名前・色・説明) を定義し、セッションに付与できます。
+
+### 仕組み
+
+1. **タグ定義**: Viewer の Settings > Tags タブで作成・編集・削除
+2. **手動付与**: セッション詳細モーダルでタグチップをクリックして ON/OFF
+3. **LLM 自動付与**: セッションタグ付け時にユーザータグ定義もプロンプトに含め、該当するタグを自動適用
+4. **フィルタ**: ヘッダーのドロップダウンでユーザータグ別に絞り込み
+
+タグ定義は `config/user_tags.json` に保存。
 
 ## 録音 Viewer
 
@@ -290,19 +370,32 @@ Gemini API を使い、文字起こし結果の用語修正と新規用語の提
 
 - 録音一覧・検索 (SQLite FTS)
 - 音声再生 + セグメントハイライト
+- セッションタグバッジ (活動・気分・トピック) + 要約表示
+- カスタムユーザータグバッジ + フィルタ
 - 話者バッジ表示 (緑=自分、青=登録話者、グレー=unknown)
 - セグメント選択による声紋登録 (新規話者のインライン作成対応)
-- バッチ話者分離・バッチ話者タグ付け (進捗パネル)
-- 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット、Hotwords、Voice)
+- バッチ処理パネル (話者分離・話者タグ付け・セッションタグ付け)
+- 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット、Hotwords、Voice、Tags)
 - 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
 
 ## 録音データ
 
 セッションごとに `recordings/YYYY-MM-DD/HH-MM-SS/` に保存:
 - `audio.ogg` -- Opus 圧縮 (or `audio.wav` -- PCM 16kHz 16-bit mono)
-- `transcript.json` -- メタデータ + 文字起こしセグメント
+- `transcript.json` -- メタデータ + 文字起こしセグメント + タグ
 
+セグメントのないセッション (無音のみ) は自動で削除されます。
 データ量目安: 常時 ON 8h/日で WAV 約 27GB/月。
+
+## ツール
+
+`tools/` に運用・保守用スクリプトを同梱:
+
+| スクリプト | 用途 |
+|-----------|------|
+| `tools/build_hotwords.py` | JMnedict から `config/hotwords.json` を生成 |
+| `tools/retranscribe_all.py` | 全セッションの再文字起こし (`--restore` で復元、`--verify` で検証) |
+| `tools/tag_all.py` | 全セッションの一括タグ付け (CLI) |
 
 ## GPU 共有デプロイ
 
@@ -318,6 +411,34 @@ omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて�
 3. `OMI_WHISPER_TOKEN` でアプリ側のトークン認証を有効化
 4. Omi アプリの Custom STT に `wss://whisper.example.com/transcribe?token=<TOKEN>` を設定
 
+## プロジェクト構成
+
+```
+omi_whisper_transcribe/
+├── omi_whisper_bridge.py     # メイン: WebSocket + 文字起こし + 管理 API
+├── gpu_manager.py            # GPU リソース管理 (qwen-tts との排他制御)
+├── model_manager.py          # Whisper モデルの外部制御 (gpu-shared 用)
+├── audio_preprocessor.py     # ノイズ除去 + ラウドネス正規化
+├── llm_corrector.py          # Gemini によるバッチ用語修正
+├── session_tagger.py         # Gemini によるセッションタグ付け
+├── diarizer.py               # pyannote バッチ話者分離
+├── speaker_filter.py         # 声紋登録・話者タグ付け
+├── hotword_loader.py         # Hotwords ロード・管理
+├── term_corrector.py         # 用語辞書管理
+├── tts_proxy.py              # TTS プロキシ (gpu-shared 連携)
+├── config/                   # 設定ファイル (JSON)
+├── tools/                    # 運用スクリプト
+├── tests/                    # ユニットテスト
+├── omi-recordings-viewer/    # Viewer Web アプリ
+│   ├── app.py                # aiohttp サーバー + API
+│   ├── indexer.py            # SQLite インデックス管理
+│   ├── templates/            # Jinja2 テンプレート
+│   └── static/               # JS + CSS
+├── Dockerfile                # Bridge コンテナ
+├── docker-compose.yml        # 単体デプロイ構成
+└── .env.example              # 環境変数テンプレート
+```
+
 ## トラブルシューティング
 
 | 症状 | 対処 |
@@ -328,13 +449,16 @@ omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて�
 | Unauthorized | `?token=` の値と `OMI_WHISPER_TOKEN` が一致しているか確認 |
 | 話者分離が 403 | `HF_AUTH_TOKEN` の権限を確認 (Access public gated repos が必要) |
 | Viewer が Loading で止まる | ブラウザのハードリロード (Cmd+Shift+R)、リトライ機能で自動復帰 |
+| バッチ処理中にシステム停止 | VRAM 不足の可能性。ログで OOM を確認。GPU ロックが自動でクリーンアップ |
 
 ## 使用モデル・ライセンス
 
-| モデル | 用途 | ライセンス |
-|--------|------|-----------|
+| モデル / ライブラリ | 用途 | ライセンス |
+|---------------------|------|-----------|
 | [faster-whisper large-v3](https://huggingface.co/Systran/faster-whisper-large-v3) | 文字起こし | MIT |
 | [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) | 話者分離 | CC-BY-4.0 |
 | [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) | 声紋抽出 | CC-BY-4.0 |
 | [JMnedict](https://www.edrdg.org/enamdict/enamdict_doc.html) | 固有名詞辞書 | CC-BY-SA 3.0 |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 音声区間検出 | MIT |
+| [noisereduce](https://github.com/timsainb/noisereduce) | ノイズ除去 | MIT |
+| [Gemini API](https://ai.google.dev/) | LLM 後処理・セッションタグ | Google ToS |
