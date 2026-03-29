@@ -157,7 +157,8 @@ open http://localhost:8092
 | `VAD_FILTER` | `true` | VAD フィルタ (ハルシネーション対策) |
 | `BUFFER_SECONDS` | `5.0` | 音声バッファ秒数 |
 | `INITIAL_PROMPT` | (空) | 初期プロンプト |
-| `NO_REPEAT_NGRAM_SIZE` | `3` | N-gram 繰り返し防止 (0=無効) |
+| `NO_REPEAT_NGRAM_SIZE` | `5` | N-gram 繰り返し防止 (0=無効) |
+| `PATIENCE` | `2` | ビームサーチ patience (探索深度、0=無効) |
 | `LOG_PROB_THRESHOLD` | `-0.5` | 対数確率の閾値 |
 | `NO_SPEECH_THRESHOLD` | `0.6` | 非発話判定の閾値 |
 | `COMPRESSION_RATIO_THRESHOLD` | `2.4` | 圧縮率の閾値 |

@@ -50,7 +50,8 @@ SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))                # Omi �
 # --- Whisper 精度改善パラメータ ---
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "./config")                       # 設定ファイルディレクトリ
 
-NO_REPEAT_NGRAM_SIZE = int(os.environ.get("NO_REPEAT_NGRAM_SIZE", "3"))   # 繰り返し防止 n-gram サイズ (0=無効)
+NO_REPEAT_NGRAM_SIZE = int(os.environ.get("NO_REPEAT_NGRAM_SIZE", "5"))   # 繰り返し防止 n-gram サイズ (0=無効)
+PATIENCE = float(os.environ.get("PATIENCE", "2"))                         # ビームサーチ patience (探索深度、0=無効)
 LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セグメント平均対数確率の閾値
 NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
@@ -739,6 +740,7 @@ def transcribe_audio(
         word_timestamps=False,
         condition_on_previous_text=False,
         no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+        patience=PATIENCE,
         compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
         log_prob_threshold=LOG_PROB_THRESHOLD,
         no_speech_threshold=NO_SPEECH_THRESHOLD,
@@ -1738,7 +1740,7 @@ async def main():
     log.info(f"Starting Omi-Whisper bridge on ws://{HOST}:{PORT}")
     log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
-    log.info(f"Quality: no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, "
+    log.info(f"Quality: no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, patience={PATIENCE}, "
              f"log_prob_thresh={LOG_PROB_THRESHOLD}, "
              f"no_speech_thresh={NO_SPEECH_THRESHOLD}, "
              f"compression_ratio_thresh={COMPRESSION_RATIO_THRESHOLD}")
