@@ -265,11 +265,14 @@ def _save_llm_suggestions(originals: list[str], corrected_segments: list[dict]) 
 # ============================================================
 
 from model_manager import ModelManager
+from engine_manager import EngineManager
 
 model_manager = ModelManager(
     model_name=WHISPER_MODEL,
     compute_type=COMPUTE_TYPE,
 )
+
+ASR_ENGINE = os.environ.get("ASR_ENGINE", "faster-whisper")
 
 # ============================================================
 # 古い録音の自動クリーンアップ
@@ -850,6 +853,15 @@ def transcribe_audio(
     return segments_out
 
 
+# Initialize EngineManager now that transcribe_audio is defined
+engine_manager = EngineManager(
+    default_engine=ASR_ENGINE,
+    model_manager=model_manager,
+    transcribe_fn=transcribe_audio,
+    term_corrector=term_corrector,
+)
+
+
 def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
     """セグメントのタイムスタンプにオフセットを加算したコピーを返す"""
     if offset == 0:
@@ -872,8 +884,8 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
     acquire() が呼ばれても、diarization 完了まで待機する。
     """
     try:
-        async with model_manager.gpu_lock:
-            unloaded = await model_manager.unload_model()
+        async with engine_manager.gpu_lock:
+            unloaded = await engine_manager.unload_current()
             if not unloaded:
                 log.info("Skipping diarization (other sessions active)")
                 recorder.finalize()
@@ -1013,9 +1025,9 @@ async def _batch_diarize_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Force-unload Whisper once before the batch
-        async with model_manager.gpu_lock:
-            await model_manager.force_unload()
+        # Force-unload ASR engine once before the batch
+        async with engine_manager.gpu_lock:
+            await engine_manager.force_unload_current()
 
         for sess in sessions:
             if _batch_state["cancel_requested"]:
@@ -1027,7 +1039,7 @@ async def _batch_diarize_task(force: bool = False):
 
             try:
                 # Per-session gpu_lock: allows WS handlers to run between sessions
-                async with model_manager.gpu_lock:
+                async with engine_manager.gpu_lock:
                     updated, success = await loop.run_in_executor(
                         None,
                         lambda s=sess: diarizer.diarize(
@@ -1179,9 +1191,9 @@ async def _batch_tag_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Force-unload Whisper once before the batch
-        async with model_manager.gpu_lock:
-            await model_manager.force_unload()
+        # Force-unload ASR engine once before the batch
+        async with engine_manager.gpu_lock:
+            await engine_manager.force_unload_current()
 
         for sess in sessions:
             if _batch_tag_state["cancel_requested"]:
@@ -1193,7 +1205,7 @@ async def _batch_tag_task(force: bool = False):
 
             try:
                 # Per-session gpu_lock: load → tag → unload → release
-                async with model_manager.gpu_lock:
+                async with engine_manager.gpu_lock:
                     inference = await loop.run_in_executor(
                         None, speaker_filter._load_model
                     )
@@ -1435,12 +1447,12 @@ async def handle_connection(websocket):
     llm_pending: list[dict] = []   # Segment dicts awaiting LLM correction (same refs as recorder.all_segments)
     last_llm_flush = time.time()
 
-    # モデル確保 (未ロードなら自動ロード)
+    # エンジン確保 (未ロードなら自動ロード)
     try:
-        model, executor = await model_manager.acquire()
+        engine, executor = await engine_manager.acquire()
     except Exception as e:
-        log.error(f"Failed to acquire model: {e}", exc_info=True)
-        await websocket.close(1013, "Model unavailable")
+        log.error(f"Failed to acquire engine: {e}", exc_info=True)
+        await websocket.close(1013, "Engine unavailable")
         return
 
     async def _transcribe_chunk(chunk: bytes):
@@ -1468,7 +1480,7 @@ async def handle_connection(websocket):
         loop = asyncio.get_running_loop()
         raw_segments = await loop.run_in_executor(
             executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_hotwords),
+            lambda: engine.transcribe(chunk, 0.0, session_hotwords),
         )
 
         elapsed = time.time() - t0
@@ -1709,8 +1721,8 @@ async def handle_connection(websocket):
         except Exception as e:
             log.warning(f"Failed to flush LLM on session end: {e}")
 
-        # セッション終了: whisper モデルを解放
-        model_manager.release()
+        # セッション終了: ASR エンジンを解放
+        engine_manager.release()
 
         # 話者分離 (バックグラウンドで実行、新セッションをブロックしない)
         if (DIARIZATION_ENABLED and diarizer and diarizer.enabled
@@ -1738,6 +1750,7 @@ async def handle_connection(websocket):
 
 async def main():
     log.info(f"Starting Omi-Whisper bridge on ws://{HOST}:{PORT}")
+    log.info(f"ASR Engine: {engine_manager.current_engine_name}")
     log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
     log.info(f"Quality: no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, patience={PATIENCE}, "
@@ -1798,20 +1811,36 @@ async def main():
     from aiohttp import web
 
     async def handle_model_load(request):
-        await model_manager.load_model()
+        await engine_manager.load_current()
         return web.json_response({"status": "loaded"})
 
     async def handle_model_unload(request):
-        ok = await model_manager.unload_model()
+        ok = await engine_manager.unload_current()
         if not ok:
             return web.json_response(
-                {"error": "active sessions", "session_count": model_manager.session_count},
+                {"error": "active sessions", "session_count": engine_manager.session_count},
                 status=409,
             )
         return web.json_response({"status": "unloaded"})
 
     async def handle_model_status(request):
-        return web.json_response(model_manager.status())
+        return web.json_response(engine_manager.status())
+
+    async def handle_engine_status(request):
+        return web.json_response(engine_manager.status())
+
+    async def handle_engine_switch(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        engine_name = body.get("engine", "")
+        if not engine_name:
+            return web.json_response({"error": "missing 'engine' field"}, status=400)
+        result = await engine_manager.switch_engine(engine_name)
+        if "error" in result:
+            return web.json_response(result, status=400)
+        return web.json_response(result)
 
     async def handle_batch_start(request):
         if diarizer is None:
@@ -1994,8 +2023,8 @@ async def main():
 
         loop = asyncio.get_running_loop()
         try:
-            async with model_manager.gpu_lock:
-                await model_manager.unload_model()
+            async with engine_manager.gpu_lock:
+                await engine_manager.force_unload_current()
                 sample = await loop.run_in_executor(
                     None,
                     lambda: speaker_filter.add_voiceprint(
@@ -2123,6 +2152,9 @@ async def main():
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)
+    # Engine management API
+    mgmt_app.router.add_get("/engine/status", handle_engine_status)
+    mgmt_app.router.add_post("/engine/switch", handle_engine_switch)
     mgmt_app.router.add_post("/diarize/start", handle_batch_start)
     mgmt_app.router.add_get("/diarize/status", handle_batch_status)
     mgmt_app.router.add_post("/diarize/cancel", handle_batch_cancel)
