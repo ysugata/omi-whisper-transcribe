@@ -217,7 +217,8 @@
                 var badgeCls = seg.is_user ? "speaker-badge user-speaker" : "speaker-badge known-speaker";
                 html += '<span class="' + badgeCls + '">' + escapeHtml(seg.person_name || seg.person_id) + "</span>";
             } else if (seg.person_id === "unknown") {
-                html += '<span class="speaker-badge unknown-speaker">?</span>';
+                var unknownLabel = seg.speaker ? ("? " + seg.speaker) : "?";
+                html += '<span class="speaker-badge unknown-speaker">' + escapeHtml(unknownLabel) + '</span>';
             } else {
                 html += '<span class="segment-speaker">' + (seg.speaker || "") + "</span>";
             }

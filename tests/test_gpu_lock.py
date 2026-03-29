@@ -3,10 +3,10 @@
 Verifies that:
 1. diarizer._free_vram() calls torch.cuda.synchronize() before empty_cache()
 2. speaker_filter._free_vram() and _unload_model() call torch.cuda.synchronize()
-3. _batch_diarize_task() holds gpu_lock for the entire session loop
-4. _batch_tag_task() holds gpu_lock from model load through all sessions to unload
+3. _batch_diarize_task() acquires gpu_lock per-session (not for entire batch)
+4. _batch_tag_task() acquires gpu_lock per-session (load→process→unload per session)
 5. ModelManager.force_unload() ignores session_count and always unloads
-6. Batch tasks use force_unload() instead of unload_model()
+6. Batch tasks use force_unload() once before the loop, then per-session locks
 """
 
 import asyncio
@@ -161,11 +161,11 @@ class TestSpeakerFilterVram:
 
 
 # =====================================================================
-# 3. _batch_diarize_task() — gpu_lock held for entire loop
+# 3. _batch_diarize_task() — per-session gpu_lock
 # =====================================================================
 
 class TestBatchDiarizeLock:
-    """Verify gpu_lock is held for the entire batch, not per-session."""
+    """Verify gpu_lock is acquired per-session to avoid system freeze."""
 
     @pytest.fixture
     def recordings_dir(self, tmp_path):
@@ -183,8 +183,8 @@ class TestBatchDiarizeLock:
         return tmp_path
 
     @pytest.mark.asyncio
-    async def test_gpu_lock_held_for_entire_batch(self, recordings_dir):
-        """gpu_lock must be acquired once and held for all sessions."""
+    async def test_gpu_lock_per_session(self, recordings_dir):
+        """gpu_lock must be acquired per-session (1 for force_unload + 1 per session)."""
         _mock_bridge_deps()
 
         lock_events = []
@@ -226,34 +226,76 @@ class TestBatchDiarizeLock:
             bridge.diarizer = original_diarizer
             bridge.RECORDINGS_DIR = original_recordings
 
-        assert lock_events.count("acquire") == 1, \
-            f"gpu_lock should be acquired once, got {lock_events.count('acquire')}"
-        assert lock_events.count("release") == 1, \
-            f"gpu_lock should be released once, got {lock_events.count('release')}"
+        # 1 acquire for force_unload + 2 acquires for 2 sessions = 3
+        assert lock_events.count("acquire") == 3, \
+            f"gpu_lock should be acquired 3 times (1 force_unload + 2 sessions), got {lock_events.count('acquire')}"
+        assert lock_events.count("release") == 3, \
+            f"gpu_lock should be released 3 times, got {lock_events.count('release')}"
         assert mock_mm.force_unload.call_count == 1, \
             f"force_unload should be called once, got {mock_mm.force_unload.call_count}"
         assert mock_diarizer.diarize.call_count == 2, \
             f"Both sessions should be processed, got {mock_diarizer.diarize.call_count}"
 
     @pytest.mark.asyncio
-    async def test_cancel_breaks_loop_releases_lock(self, recordings_dir):
-        """Cancel should break the loop but still release the lock."""
+    async def test_lock_released_between_sessions(self, recordings_dir):
+        """gpu_lock must be released between sessions so WS handlers can run."""
         _mock_bridge_deps()
 
-        lock_released = []
+        lock_held = []
 
         class TrackingLock:
             def __init__(self):
                 self._lock = asyncio.Lock()
+                self.is_locked = False
             async def __aenter__(self):
                 await self._lock.acquire()
+                self.is_locked = True
                 return self
             async def __aexit__(self, *args):
-                lock_released.append(True)
+                self.is_locked = False
                 self._lock.release()
 
+        tracking_lock = TrackingLock()
+
         mock_mm = MagicMock()
-        mock_mm.gpu_lock = TrackingLock()
+        mock_mm.gpu_lock = tracking_lock
+        mock_mm.force_unload = AsyncMock(return_value=True)
+
+        session_count = [0]
+        def diarize_check_lock(*args, **kwargs):
+            lock_held.append(tracking_lock.is_locked)
+            session_count[0] += 1
+            return ([{"text": "t", "start": 0, "end": 1, "speaker": "SPEAKER_00"}], True)
+
+        mock_diarizer = MagicMock()
+        mock_diarizer.diarize.side_effect = diarize_check_lock
+
+        import omi_whisper_bridge as bridge
+        original_mm = bridge.model_manager
+        original_diarizer = bridge.diarizer
+        original_recordings = bridge.RECORDINGS_DIR
+
+        try:
+            bridge.model_manager = mock_mm
+            bridge.diarizer = mock_diarizer
+            bridge.RECORDINGS_DIR = str(recordings_dir)
+
+            await bridge._batch_diarize_task(force=True)
+        finally:
+            bridge.model_manager = original_mm
+            bridge.diarizer = original_diarizer
+            bridge.RECORDINGS_DIR = original_recordings
+
+        assert all(lock_held), "diarize() must run while gpu_lock is held"
+        assert not tracking_lock.is_locked, "gpu_lock must be released after batch"
+
+    @pytest.mark.asyncio
+    async def test_cancel_breaks_loop_releases_lock(self, recordings_dir):
+        """Cancel should break the loop and release the lock."""
+        _mock_bridge_deps()
+
+        mock_mm = MagicMock()
+        mock_mm.gpu_lock = asyncio.Lock()
         mock_mm.force_unload = AsyncMock(return_value=True)
 
         import omi_whisper_bridge as bridge
@@ -280,17 +322,16 @@ class TestBatchDiarizeLock:
             bridge.diarizer = original_diarizer
             bridge.RECORDINGS_DIR = original_recordings
 
-        assert len(lock_released) == 1, "gpu_lock must be released after cancel"
-        # Only first session processed before cancel
+        assert not mock_mm.gpu_lock.locked(), "gpu_lock must be released after cancel"
         assert mock_diarizer.diarize.call_count == 1
 
 
 # =====================================================================
-# 4. _batch_tag_task() — gpu_lock held for load→process→unload
+# 4. _batch_tag_task() — per-session gpu_lock with load→process→unload
 # =====================================================================
 
 class TestBatchTagLock:
-    """Verify gpu_lock is held from model load through all sessions to unload."""
+    """Verify gpu_lock is acquired per-session with model load/unload each time."""
 
     @pytest.fixture
     def recordings_dir(self, tmp_path):
@@ -307,8 +348,8 @@ class TestBatchTagLock:
         return tmp_path
 
     @pytest.mark.asyncio
-    async def test_gpu_lock_held_for_entire_tag_batch(self, recordings_dir):
-        """gpu_lock must wrap model load, all sessions, and model unload."""
+    async def test_gpu_lock_per_session_tag(self, recordings_dir):
+        """gpu_lock must be acquired per-session (1 for force_unload + 1 per session)."""
         _mock_bridge_deps()
 
         lock_events = []
@@ -360,12 +401,16 @@ class TestBatchTagLock:
             bridge.speaker_filter = original_sf
             bridge.RECORDINGS_DIR = original_recordings
 
-        assert lock_events.count("acquire") == 1
-        assert lock_events.count("release") == 1
+        # 1 acquire for force_unload + 2 acquires for 2 sessions = 3
+        assert lock_events.count("acquire") == 3, \
+            f"gpu_lock should be acquired 3 times, got {lock_events.count('acquire')}"
+        assert lock_events.count("release") == 3
         assert all(processing_while_locked), \
             f"All tag operations must happen while gpu_lock is held, got {processing_while_locked}"
         assert mock_mm.force_unload.call_count == 1
-        assert mock_sf._unload_model.call_count == 1
+        # Model loaded/unloaded per session
+        assert mock_sf._load_model.call_count == 2
+        assert mock_sf._unload_model.call_count == 2
 
     @pytest.mark.asyncio
     async def test_model_unloaded_even_on_error(self, recordings_dir):
@@ -398,8 +443,9 @@ class TestBatchTagLock:
             bridge.speaker_filter = original_sf
             bridge.RECORDINGS_DIR = original_recordings
 
-        assert mock_sf._unload_model.call_count == 1, \
-            "Embedding model must be unloaded even after errors"
+        # Model should be unloaded for each session, even on error
+        assert mock_sf._unload_model.call_count == 2, \
+            f"Embedding model must be unloaded per session even after errors, got {mock_sf._unload_model.call_count}"
         assert not mock_mm.gpu_lock.locked(), \
             "gpu_lock must be released after batch completes"
 

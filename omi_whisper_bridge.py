@@ -975,22 +975,21 @@ async def _batch_diarize_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Hold gpu_lock for the entire batch to prevent WS connections
-        # from loading Whisper while diarize models occupy VRAM (OOM fix)
+        # Force-unload Whisper once before the batch
         async with model_manager.gpu_lock:
-            # force_unload: session_count>0 でも強制アンロード
-            # (既存 WS は CUDA エラー→切断→バッチ後に自動再接続)
             await model_manager.force_unload()
 
-            for sess in sessions:
-                if _batch_state["cancel_requested"]:
-                    log.info("Batch diarization cancelled by user")
-                    break
+        for sess in sessions:
+            if _batch_state["cancel_requested"]:
+                log.info("Batch diarization cancelled by user")
+                break
 
-                _batch_state["current_session"] = sess["path"]
-                log.info(f"Batch diarize: {sess['path']}")
+            _batch_state["current_session"] = sess["path"]
+            log.info(f"Batch diarize: {sess['path']}")
 
-                try:
+            try:
+                # Per-session gpu_lock: allows WS handlers to run between sessions
+                async with model_manager.gpu_lock:
                     updated, success = await loop.run_in_executor(
                         None,
                         lambda s=sess: diarizer.diarize(
@@ -998,34 +997,37 @@ async def _batch_diarize_task(force: bool = False):
                         ),
                     )
 
-                    if not success:
-                        _batch_state["failed"] += 1
-                        err_msg = f"{sess['path']}: diarization failed (see logs)"
-                        _batch_state["errors"].append(err_msg)
-                        log.warning(f"Batch diarize failed: {sess['path']}")
-                        continue
-
-                    # バックアップを作成してから transcript.json を更新
-                    bak_path = str(sess["transcript_path"]) + ".bak"
-                    shutil.copy2(sess["transcript_path"], bak_path)
-
-                    data = sess["data"]
-                    data["segments"] = updated
-                    data["session"]["diarized"] = True
-                    speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
-                    data["session"]["num_speakers"] = len(speakers)
-
-                    with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-
-                    _batch_state["processed"] += 1
-                    log.info(f"Batch diarize done: {sess['path']} ({len(speakers)} speakers)")
-
-                except Exception as e:
+                if not success:
                     _batch_state["failed"] += 1
-                    err_msg = f"{sess['path']}: {e}"
+                    err_msg = f"{sess['path']}: diarization failed (see logs)"
                     _batch_state["errors"].append(err_msg)
-                    log.error(f"Batch diarize error: {err_msg}", exc_info=True)
+                    log.warning(f"Batch diarize failed: {sess['path']}")
+                    continue
+
+                # バックアップを作成してから transcript.json を更新
+                bak_path = str(sess["transcript_path"]) + ".bak"
+                shutil.copy2(sess["transcript_path"], bak_path)
+
+                data = sess["data"]
+                data["segments"] = updated
+                data["session"]["diarized"] = True
+                speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
+                data["session"]["num_speakers"] = len(speakers)
+
+                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+
+                _batch_state["processed"] += 1
+                log.info(f"Batch diarize done: {sess['path']} ({len(speakers)} speakers)")
+
+            except Exception as e:
+                _batch_state["failed"] += 1
+                err_msg = f"{sess['path']}: {e}"
+                _batch_state["errors"].append(err_msg)
+                log.error(f"Batch diarize error: {err_msg}", exc_info=True)
+
+            # Yield to event loop between sessions
+            await asyncio.sleep(0)
 
     except Exception as e:
         log.error(f"Batch diarization task error: {e}", exc_info=True)
@@ -1139,32 +1141,24 @@ async def _batch_tag_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Hold gpu_lock for the entire batch (load → process → unload)
-        # to prevent WS connections from loading Whisper while embedding
-        # model occupies VRAM (OOM fix)
+        # Force-unload Whisper once before the batch
         async with model_manager.gpu_lock:
-            # force_unload: session_count>0 でも強制アンロード
-            # (既存 WS は CUDA エラー→切断→バッチ後に自動再接続)
             await model_manager.force_unload()
 
-            inference = None
+        for sess in sessions:
+            if _batch_tag_state["cancel_requested"]:
+                log.info("Batch speaker tagging cancelled by user")
+                break
+
+            _batch_tag_state["current_session"] = sess["path"]
+            log.info(f"Batch tag: {sess['path']}")
+
             try:
-                if _batch_tag_state["cancel_requested"]:
-                    log.info("Batch speaker tagging cancelled by user (after GPU lock)")
-                    return
-
-                inference = await loop.run_in_executor(
-                    None, speaker_filter._load_model
-                )
-
-                for sess in sessions:
-                    if _batch_tag_state["cancel_requested"]:
-                        log.info("Batch speaker tagging cancelled by user")
-                        break
-
-                    _batch_tag_state["current_session"] = sess["path"]
-                    log.info(f"Batch tag: {sess['path']}")
-
+                # Per-session gpu_lock: load → tag → unload → release
+                async with model_manager.gpu_lock:
+                    inference = await loop.run_in_executor(
+                        None, speaker_filter._load_model
+                    )
                     try:
                         updated = await loop.run_in_executor(
                             None,
@@ -1172,32 +1166,33 @@ async def _batch_tag_task(force: bool = False):
                                 inference, str(s["audio"]), s["data"]["segments"]
                             ),
                         )
+                    finally:
+                        await loop.run_in_executor(
+                            None, lambda: speaker_filter._unload_model(inference)
+                        )
 
-                        # バックアップを作成してから transcript.json を更新
-                        bak_path = str(sess["transcript_path"]) + ".bak"
-                        shutil.copy2(sess["transcript_path"], bak_path)
+                # バックアップを作成してから transcript.json を更新
+                bak_path = str(sess["transcript_path"]) + ".bak"
+                shutil.copy2(sess["transcript_path"], bak_path)
 
-                        data = sess["data"]
-                        data["segments"] = updated
-                        data["session"]["speaker_tagged"] = True
+                data = sess["data"]
+                data["segments"] = updated
+                data["session"]["speaker_tagged"] = True
 
-                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
 
-                        _batch_tag_state["processed"] += 1
-                        log.info(f"Batch tag done: {sess['path']}")
+                _batch_tag_state["processed"] += 1
+                log.info(f"Batch tag done: {sess['path']}")
 
-                    except Exception as e:
-                        _batch_tag_state["failed"] += 1
-                        err_msg = f"{sess['path']}: {e}"
-                        _batch_tag_state["errors"].append(err_msg)
-                        log.error(f"Batch tag error: {err_msg}", exc_info=True)
+            except Exception as e:
+                _batch_tag_state["failed"] += 1
+                err_msg = f"{sess['path']}: {e}"
+                _batch_tag_state["errors"].append(err_msg)
+                log.error(f"Batch tag error: {err_msg}", exc_info=True)
 
-            finally:
-                if inference is not None:
-                    await loop.run_in_executor(
-                        None, lambda: speaker_filter._unload_model(inference)
-                    )
+            # Yield to event loop between sessions
+            await asyncio.sleep(0)
 
     except Exception as e:
         log.error(f"Batch speaker tagging task error: {e}", exc_info=True)
