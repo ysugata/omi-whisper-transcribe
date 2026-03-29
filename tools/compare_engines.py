@@ -159,7 +159,8 @@ def run_qwen_asr(samples: list[dict]) -> list[dict]:
     from term_corrector import TermCorrector
 
     engine = QwenASREngine()
-    tc = TermCorrector(config_dir=os.environ.get("CONFIG_DIR", "./config"))
+    config_dir = os.environ.get("CONFIG_DIR", "./config")
+    tc = TermCorrector(os.path.join(config_dir, "term_corrections.json"))
     engine.set_term_corrector(tc)
 
     log.info("=" * 60)
