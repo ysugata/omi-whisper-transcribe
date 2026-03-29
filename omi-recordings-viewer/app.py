@@ -573,18 +573,6 @@ async def handle_session_tag_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
-# ASR Engine プロキシ API (Bridge へ中継)
-# ============================================================
-
-async def handle_engine_status(request: web.Request) -> web.Response:
-    return await _proxy_bridge(request, "GET", "/engine/status")
-
-
-async def handle_engine_switch(request: web.Request) -> web.Response:
-    return await _proxy_bridge(request, "POST", "/engine/switch")
-
-
-# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -671,10 +659,6 @@ def create_app() -> web.Application:
     app.router.add_post("/api/session-tags/start", handle_session_tag_start)
     app.router.add_get("/api/session-tags/status", handle_session_tag_status)
     app.router.add_post("/api/session-tags/cancel", handle_session_tag_cancel)
-
-    # Engine management プロキシ API
-    app.router.add_get("/api/engine/status", handle_engine_status)
-    app.router.add_post("/api/engine/switch", handle_engine_switch)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

@@ -459,7 +459,6 @@
         loadHotwordsSettings();
         loadVoiceSettings();
         loadUserTagsSettings();
-        loadEngineStatus();
     }
 
     function closeSettings() {
@@ -1795,63 +1794,6 @@
             body: JSON.stringify({ user_tags: currentSessionUserTags }),
         }).then(function (r) { return r.json(); }).catch(function (e) {
             console.error("Failed to save user tags:", e);
-        });
-    }
-
-    // ============================================================
-    // Engine Management
-    // ============================================================
-
-    var engineSelect = document.getElementById("engine-select");
-    var engineStatusEl = document.getElementById("engine-status");
-
-    function loadEngineStatus() {
-        fetch("/api/engine/status").then(function (r) {
-            return r.json();
-        }).then(function (data) {
-            if (data.current_engine) {
-                engineSelect.value = data.current_engine;
-                var eng = data.engines && data.engines[data.current_engine];
-                if (eng && eng.loaded) {
-                    engineStatusEl.textContent = "loaded" + (eng.model_name ? " (" + eng.model_name + ")" : "");
-                    engineStatusEl.style.color = "#28a745";
-                } else {
-                    engineStatusEl.textContent = "not loaded";
-                    engineStatusEl.style.color = "#888";
-                }
-            }
-        }).catch(function () {
-            engineStatusEl.textContent = "bridge unavailable";
-            engineStatusEl.style.color = "#dc3545";
-        });
-    }
-
-    if (engineSelect) {
-        engineSelect.addEventListener("change", function () {
-            var newEngine = engineSelect.value;
-            engineStatusEl.textContent = "switching...";
-            engineStatusEl.style.color = "#ffc107";
-            fetch("/api/engine/switch", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ engine: newEngine }),
-            }).then(function (r) {
-                return r.json().then(function (data) {
-                    if (r.ok) {
-                        engineStatusEl.textContent = "switched!";
-                        engineStatusEl.style.color = "#28a745";
-                        setTimeout(loadEngineStatus, 1000);
-                    } else {
-                        engineStatusEl.textContent = data.error || "switch failed";
-                        engineStatusEl.style.color = "#dc3545";
-                        loadEngineStatus();
-                    }
-                });
-            }).catch(function (e) {
-                engineStatusEl.textContent = "error: " + e.message;
-                engineStatusEl.style.color = "#dc3545";
-                loadEngineStatus();
-            });
         });
     }
 

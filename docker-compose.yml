@@ -13,7 +13,6 @@ services:
       - TZ=${TZ:-Asia/Tokyo}
       - HF_HOME=/models
       - CONFIG_DIR=/app/config
-      - ASR_ENGINE=${ASR_ENGINE:-faster-whisper}
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - COMPUTE_TYPE=${COMPUTE_TYPE:-int8_float16}
       - LANGUAGE=${LANGUAGE:-ja}
