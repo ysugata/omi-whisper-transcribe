@@ -98,8 +98,11 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
     page = max(1, page)
     per_page = max(1, min(100, per_page))
 
+    activity = request.query.get("activity", "").strip()
+    mood = request.query.get("mood", "").strip()
+
     try:
-        result = await indexer.get_sessions(page, per_page, query)
+        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood)
     except Exception as e:
         logger.exception("Failed to query sessions")
         return web.json_response({"error": str(e)}, status=500)
@@ -413,6 +416,22 @@ async def handle_speakers_delete_all(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Session Tagging プロキシ API (Bridge へ中継)
+# ============================================================
+
+async def handle_session_tag_start(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/session-tags/start")
+
+
+async def handle_session_tag_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/session-tags/status")
+
+
+async def handle_session_tag_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/session-tags/cancel")
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -485,6 +504,11 @@ def create_app() -> web.Application:
     app.router.add_delete("/api/speakers/{id}", handle_speakers_delete)
     app.router.add_post("/api/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
     app.router.add_delete("/api/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
+
+    # Session tagging プロキシ API
+    app.router.add_post("/api/session-tags/start", handle_session_tag_start)
+    app.router.add_get("/api/session-tags/status", handle_session_tag_status)
+    app.router.add_post("/api/session-tags/cancel", handle_session_tag_cancel)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

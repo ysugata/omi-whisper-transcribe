@@ -13,7 +13,30 @@
             <input type="text" id="search-input" placeholder="Search transcripts...">
             <button id="search-btn">Search</button>
         </div>
+        <select id="filter-activity" class="filter-select" title="Filter by activity">
+            <option value="">Activity</option>
+            <option value="casual_chat">Casual Chat</option>
+            <option value="meeting">Meeting</option>
+            <option value="brainstorming">Brainstorming</option>
+            <option value="planning">Planning</option>
+            <option value="debugging">Debugging</option>
+            <option value="learning">Learning</option>
+            <option value="storytelling">Storytelling</option>
+            <option value="phone_call">Phone Call</option>
+            <option value="dictation">Dictation</option>
+            <option value="other">Other</option>
+        </select>
+        <select id="filter-mood" class="filter-select" title="Filter by mood">
+            <option value="">Mood</option>
+            <option value="positive">Positive</option>
+            <option value="neutral">Neutral</option>
+            <option value="negative">Negative</option>
+            <option value="mixed">Mixed</option>
+            <option value="excited">Excited</option>
+            <option value="frustrated">Frustrated</option>
+        </select>
         <button id="diarize-btn" class="diarize-btn hidden" title="Batch Speaker Diarization">Diarize</button>
+        <button id="session-tag-btn" class="diarize-btn" title="Batch Session Tagging">Tag</button>
         <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
     </header>
 
@@ -36,6 +59,19 @@
 
         <div id="pagination" class="pagination"></div>
     </main>
+
+    <!-- Session tag progress panel -->
+    <div id="session-tag-panel" class="diarize-panel hidden">
+        <div class="diarize-header">
+            <span id="session-tag-status-text">Processing...</span>
+            <span id="session-tag-progress-text">0 / 0</span>
+            <button id="session-tag-cancel-btn" class="btn-sm btn-danger">Cancel</button>
+        </div>
+        <div class="progress-bar">
+            <div id="session-tag-progress-fill" class="progress-fill"></div>
+        </div>
+        <div id="session-tag-current" class="text-dim"></div>
+    </div>
 
     <!-- Speaker tag progress panel -->
     <div id="tag-panel" class="diarize-panel hidden">

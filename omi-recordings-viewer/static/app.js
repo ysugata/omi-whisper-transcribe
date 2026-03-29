@@ -59,9 +59,14 @@
 
     // --- API ---
 
+    var filterActivity = document.getElementById("filter-activity");
+    var filterMood = document.getElementById("filter-mood");
+
     function fetchSessions(page, query) {
         var url = "/api/sessions?page=" + page + "&per_page=20";
         if (query) url += "&q=" + encodeURIComponent(query);
+        if (filterActivity && filterActivity.value) url += "&activity=" + encodeURIComponent(filterActivity.value);
+        if (filterMood && filterMood.value) url += "&mood=" + encodeURIComponent(filterMood.value);
         return fetch(url).then(function (r) { return r.json(); });
     }
 
@@ -97,6 +102,26 @@
             html += '<div class="session-preview' + (isEmpty ? " empty" : "") + '">';
             html += isEmpty ? "(no transcript)" : escapeHtml(preview);
             html += "</div>";
+            // Tag badges
+            if (s.tags_activity || s.tags_mood || s.tags_topics) {
+                html += '<div class="session-tags">';
+                if (s.tags_activity) {
+                    html += '<span class="tag-badge activity">' + escapeHtml(s.tags_activity.replace(/_/g, " ")) + '</span>';
+                }
+                if (s.tags_mood) {
+                    html += '<span class="tag-badge mood-' + s.tags_mood + '">' + escapeHtml(s.tags_mood) + '</span>';
+                }
+                if (s.tags_topics) {
+                    var topics = s.tags_topics.split(",");
+                    for (var ti = 0; ti < topics.length && ti < 3; ti++) {
+                        html += '<span class="tag-badge topic">' + escapeHtml(topics[ti].trim()) + '</span>';
+                    }
+                }
+                html += '</div>';
+            }
+            if (s.tags_summary) {
+                html += '<div class="session-summary">' + escapeHtml(s.tags_summary) + '</div>';
+            }
             html += "</div>";
         });
 
@@ -165,6 +190,31 @@
             (s.model ? "<span>Model: " + escapeHtml(s.model) + "</span>" : "") +
             (s.audio_size_mb ? "<span>Size: " + s.audio_size_mb.toFixed(1) + " MB</span>" : "") +
             "</div>";
+
+        // Tag info in detail
+        var tags = (t && t.session && t.session.tags) ? t.session.tags : null;
+        if (tags) {
+            var tagsHtml = '<div class="detail-tags">';
+            if (tags.activity) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.activity.replace(/_/g, " ")) + '</span>';
+            if (tags.intent) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.intent.replace(/_/g, " ")) + '</span>';
+            if (tags.mood) tagsHtml += '<span class="tag-badge mood-' + tags.mood + '">' + escapeHtml(tags.mood) + '</span>';
+            if (tags.quality) tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.quality) + '</span>';
+            if (tags.topics) {
+                for (var tti = 0; tti < tags.topics.length; tti++) {
+                    tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.topics[tti]) + '</span>';
+                }
+            }
+            if (tags.entities) {
+                for (var tei = 0; tei < tags.entities.length; tei++) {
+                    tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.entities[tei]) + '</span>';
+                }
+            }
+            tagsHtml += '</div>';
+            detailHeader.innerHTML += tagsHtml;
+            if (tags.summary) {
+                detailHeader.innerHTML += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
+            }
+        }
 
         var audioFile = (t && t.session && t.session.audio_file) ? t.session.audio_file : "audio.ogg";
         audioContainer.innerHTML =
@@ -353,6 +403,8 @@
     searchInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") doSearch();
     });
+    if (filterActivity) filterActivity.addEventListener("change", function () { loadPage(1); });
+    if (filterMood) filterMood.addEventListener("change", function () { loadPage(1); });
     modalClose.addEventListener("click", closeModal);
     modal.addEventListener("click", function (e) {
         if (e.target === modal) closeModal();
@@ -1411,9 +1463,133 @@
         });
     }
 
+    // ============================================================
+    // Batch Session Tagging
+    // ============================================================
+
+    var sessionTagBtn = document.getElementById("session-tag-btn");
+    var sessionTagPanel = document.getElementById("session-tag-panel");
+    var sessionTagStatusText = document.getElementById("session-tag-status-text");
+    var sessionTagProgressText = document.getElementById("session-tag-progress-text");
+    var sessionTagCancelBtn = document.getElementById("session-tag-cancel-btn");
+    var sessionTagProgressFill = document.getElementById("session-tag-progress-fill");
+    var sessionTagCurrent = document.getElementById("session-tag-current");
+    var sessionTagTimer = null;
+    var sessionTagCancelTime = null;
+
+    function showSessionTagPanel(state) {
+        sessionTagPanel.classList.remove("hidden");
+        updateSessionTagUI(state);
+    }
+
+    function updateSessionTagUI(state) {
+        var done = (state.processed || 0) + (state.failed || 0);
+        var total = state.total || 0;
+        var pct = total > 0 ? Math.round(done / total * 100) : 0;
+
+        sessionTagProgressFill.style.width = pct + "%";
+        sessionTagProgressText.textContent = done + " / " + total;
+
+        if (state.running) {
+            if (state.cancel_requested) {
+                sessionTagStatusText.textContent = "Cancelling...";
+                sessionTagCancelBtn.style.display = "none";
+            } else {
+                sessionTagStatusText.textContent = "Tagging sessions...";
+                sessionTagCancelBtn.style.display = "";
+            }
+            sessionTagCurrent.textContent = state.current_session || "";
+        } else {
+            sessionTagCancelBtn.style.display = "none";
+            sessionTagCurrent.textContent = "";
+            sessionTagCancelTime = null;
+            if (state.finished_at) {
+                var msg = "Done: " + (state.processed || 0) + " tagged";
+                if (state.failed > 0) msg += ", " + state.failed + " failed";
+                if (state.cancel_requested) msg += " (cancelled)";
+                sessionTagStatusText.textContent = msg;
+            }
+        }
+    }
+
+    function startSessionTagPolling() {
+        if (sessionTagTimer) return;
+        sessionTagTimer = setInterval(function () {
+            fetch("/api/session-tags/status").then(function (r) { return r.json(); }).then(function (state) {
+                updateSessionTagUI(state);
+                if (!state.running) {
+                    clearInterval(sessionTagTimer);
+                    sessionTagTimer = null;
+                    loadPage(currentPage);
+                }
+            }).catch(function () {
+                clearInterval(sessionTagTimer);
+                sessionTagTimer = null;
+            });
+        }, 2000);
+    }
+
+    if (sessionTagBtn) {
+        sessionTagBtn.addEventListener("click", function () {
+            if (!confirm("Run LLM session tagging on recordings?")) return;
+            var opts = { method: "POST" };
+            fetch("/api/session-tags/start", opts).then(function (r) {
+                return r.json().then(function (data) {
+                    if (r.ok) {
+                        if (data.status === "no_sessions") {
+                            if (confirm("All sessions already tagged. Re-run on all sessions?")) {
+                                fetch("/api/session-tags/start", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ force: true }),
+                                }).then(function (r2) { return r2.json(); }).then(function (d2) {
+                                    showSessionTagPanel({ running: true, total: d2.total || 0, processed: 0, failed: 0 });
+                                    startSessionTagPolling();
+                                });
+                            }
+                            return;
+                        }
+                        showSessionTagPanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
+                        startSessionTagPolling();
+                    } else if (r.status === 409) {
+                        alert("Already running");
+                    } else if (r.status === 503) {
+                        alert("Session tagging unavailable (no GEMINI_API_KEY)");
+                    } else {
+                        alert("Error: " + (data.error || r.status));
+                    }
+                });
+            }).catch(function (e) {
+                alert("Failed to start: " + e.message);
+            });
+        });
+    }
+
+    if (sessionTagCancelBtn) {
+        sessionTagCancelBtn.addEventListener("click", function () {
+            sessionTagCancelTime = Date.now();
+            sessionTagCancelBtn.style.display = "none";
+            sessionTagStatusText.textContent = "Cancelling...";
+            fetch("/api/session-tags/cancel", { method: "POST" }).catch(function () {});
+        });
+    }
+
+    function checkSessionTagStatus() {
+        fetch("/api/session-tags/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (state) {
+            if (state && state.running) {
+                showSessionTagPanel(state);
+                startSessionTagPolling();
+            }
+        }).catch(function () {});
+    }
+
     // --- Init ---
     loadPage(1);
     checkDiarizeAvailability();
     loadHotwordsStatus();
     checkTagStatus();
+    checkSessionTagStatus();
 })();

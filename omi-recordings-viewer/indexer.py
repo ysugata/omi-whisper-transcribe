@@ -27,11 +27,31 @@ CREATE TABLE IF NOT EXISTS sessions (
     language TEXT,
     transcript_text TEXT,
     segment_count INTEGER,
+    tags_topics TEXT,
+    tags_activity TEXT,
+    tags_intent TEXT,
+    tags_mood TEXT,
+    tags_quality TEXT,
+    tags_entities TEXT,
+    tags_summary TEXT,
+    session_tagged INTEGER DEFAULT 0,
     UNIQUE(date, time)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at DESC);
 """
+
+# Migration: add tag columns to existing DBs
+MIGRATION_ADD_TAGS = [
+    "ALTER TABLE sessions ADD COLUMN tags_topics TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_activity TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_intent TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_mood TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_quality TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_entities TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_summary TEXT",
+    "ALTER TABLE sessions ADD COLUMN session_tagged INTEGER DEFAULT 0",
+]
 
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -71,7 +91,23 @@ class Indexer:
         await self._db.executescript(SCHEMA)
         await self._db.executescript(FTS_SCHEMA)
         await self._db.executescript(FTS_TRIGGERS)
+        # Migrate: add tag columns if missing
+        await self._migrate_tags()
         await self._db.commit()
+
+    async def _migrate_tags(self):
+        """Add tag columns to existing DB if they don't exist."""
+        cursor = await self._db.execute("PRAGMA table_info(sessions)")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for stmt in MIGRATION_ADD_TAGS:
+            # Extract column name from "ALTER TABLE sessions ADD COLUMN <name> ..."
+            col = stmt.split("ADD COLUMN")[1].strip().split()[0]
+            if col not in existing:
+                try:
+                    await self._db.execute(stmt)
+                    logger.info("Migration: added column %s", col)
+                except Exception:
+                    pass  # Column already exists
 
     async def close(self):
         if self._db:
@@ -132,6 +168,11 @@ class Indexer:
         segments = data.get("segments", [])
         transcript_text = " ".join(seg.get("text", "") for seg in segments).strip()
 
+        # Extract tags if present
+        tags = session.get("tags", {})
+        tags_topics = ",".join(tags.get("topics", [])) if tags.get("topics") else None
+        tags_entities = ",".join(tags.get("entities", [])) if tags.get("entities") else None
+
         return {
             "date": date,
             "time": time,
@@ -143,14 +184,39 @@ class Indexer:
             "language": session.get("language"),
             "transcript_text": transcript_text,
             "segment_count": len(segments),
+            "tags_topics": tags_topics,
+            "tags_activity": tags.get("activity"),
+            "tags_intent": tags.get("intent"),
+            "tags_mood": tags.get("mood"),
+            "tags_quality": tags.get("quality"),
+            "tags_entities": tags_entities,
+            "tags_summary": tags.get("summary"),
+            "session_tagged": 1 if session.get("session_tagged") else 0,
         }
 
+    async def _get_untagged(self, since_date: str | None = None) -> set[tuple[str, str]]:
+        """Get (date, time) pairs that are indexed but not yet tagged."""
+        if since_date:
+            cursor = await self._db.execute(
+                "SELECT date, time FROM sessions WHERE date >= ? AND session_tagged = 0",
+                (since_date,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT date, time FROM sessions WHERE session_tagged = 0"
+            )
+        rows = await cursor.fetchall()
+        return {(r["date"], r["time"]) for r in rows}
+
     async def sync(self) -> int:
-        """Sync DB with recordings dir. Returns number of new sessions added."""
+        """Sync DB with recordings dir. Returns number of new/updated sessions."""
         since_date = await self._get_latest_date()
         on_disk = self._scan_sessions(since_date)
         indexed = await self._get_indexed(since_date)
-        new = [(d, t) for d, t in on_disk if (d, t) not in indexed]
+        untagged = await self._get_untagged(since_date)
+
+        # New sessions + previously indexed but now tagged sessions (need re-index)
+        new = [(d, t) for d, t in on_disk if (d, t) not in indexed or (d, t) in untagged]
 
         if not new:
             return 0
@@ -164,11 +230,15 @@ class Indexer:
                 continue
 
             await self._db.execute(
-                """INSERT OR IGNORE INTO sessions
+                """INSERT OR REPLACE INTO sessions
                    (date, time, start_at, end_at, duration_seconds,
-                    audio_size_mb, model, language, transcript_text, segment_count)
+                    audio_size_mb, model, language, transcript_text, segment_count,
+                    tags_topics, tags_activity, tags_intent, tags_mood,
+                    tags_quality, tags_entities, tags_summary, session_tagged)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
-                           :audio_size_mb, :model, :language, :transcript_text, :segment_count)""",
+                           :audio_size_mb, :model, :language, :transcript_text, :segment_count,
+                           :tags_topics, :tags_activity, :tags_intent, :tags_mood,
+                           :tags_quality, :tags_entities, :tags_summary, :session_tagged)""",
                 info,
             )
             count += 1
@@ -177,37 +247,40 @@ class Indexer:
         logger.info("Indexed %d new sessions", count)
         return count
 
-    async def get_sessions(self, page: int = 1, per_page: int = 20, query: str = ""):
-        """Get paginated sessions, optionally filtered by FTS query."""
+    async def get_sessions(
+        self, page: int = 1, per_page: int = 20, query: str = "",
+        activity: str = "", mood: str = "",
+    ):
+        """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
 
+        where_clauses = []
+        params = []
+
         if query:
-            # Use LIKE for substring search (works with Japanese text)
-            like_param = "%" + query + "%"
-            count_row = await self._db.execute_fetchall(
-                """SELECT COUNT(*) as cnt FROM sessions
-                   WHERE transcript_text LIKE ?""",
-                (like_param,),
-            )
-            total = count_row[0]["cnt"]
+            where_clauses.append("transcript_text LIKE ?")
+            params.append("%" + query + "%")
 
-            cursor = await self._db.execute(
-                """SELECT * FROM sessions
-                   WHERE transcript_text LIKE ?
-                   ORDER BY start_at DESC
-                   LIMIT ? OFFSET ?""",
-                (like_param, per_page, offset),
-            )
-        else:
-            count_row = await self._db.execute_fetchall(
-                "SELECT COUNT(*) as cnt FROM sessions"
-            )
-            total = count_row[0]["cnt"]
+        if activity:
+            where_clauses.append("tags_activity = ?")
+            params.append(activity)
 
-            cursor = await self._db.execute(
-                "SELECT * FROM sessions ORDER BY start_at DESC LIMIT ? OFFSET ?",
-                (per_page, offset),
-            )
+        if mood:
+            where_clauses.append("tags_mood = ?")
+            params.append(mood)
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        count_row = await self._db.execute_fetchall(
+            f"SELECT COUNT(*) as cnt FROM sessions{where_sql}",
+            params,
+        )
+        total = count_row[0]["cnt"]
+
+        cursor = await self._db.execute(
+            f"SELECT * FROM sessions{where_sql} ORDER BY start_at DESC LIMIT ? OFFSET ?",
+            params + [per_page, offset],
+        )
 
         rows = await cursor.fetchall()
         return {

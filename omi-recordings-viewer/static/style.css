@@ -1031,6 +1031,80 @@ main {
     border-radius: 8px;
 }
 
+/* Filter select */
+.filter-select {
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.filter-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+/* Tag badges on session cards */
+.session-tags {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+
+.tag-badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 8px;
+    white-space: nowrap;
+}
+
+.tag-badge.activity { background: #2c3e50; color: #ecf0f1; }
+.tag-badge.mood-positive { background: #27ae60; color: #fff; }
+.tag-badge.mood-negative { background: #c0392b; color: #fff; }
+.tag-badge.mood-neutral { background: #555; color: #aaa; }
+.tag-badge.mood-mixed { background: #8e44ad; color: #fff; }
+.tag-badge.mood-excited { background: #e67e22; color: #fff; }
+.tag-badge.mood-frustrated { background: #e74c3c; color: #fff; }
+.tag-badge.topic { background: var(--accent-dim); color: #d0d8e8; }
+
+.session-summary {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-top: 2px;
+    font-style: italic;
+}
+
+/* Tag info in detail modal */
+.detail-tags {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.detail-tags .tag-badge {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+}
+
+.detail-summary {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-style: italic;
+    margin-bottom: 12px;
+    padding: 6px 10px;
+    background: var(--surface2);
+    border-radius: 6px;
+}
+
 /* Responsive */
 @media (max-width: 600px) {
     header {

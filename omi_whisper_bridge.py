@@ -65,6 +65,10 @@ LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_BATCH_INTERVAL = float(os.environ.get("LLM_BATCH_INTERVAL", "60"))   # Batch flush interval (seconds)
 LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "20"))             # Flush when this many segments accumulate
 
+# --- セッションタグ付け設定 ---
+TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
+TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
+
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
@@ -127,6 +131,7 @@ from diarizer import Diarizer
 from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
+from session_tagger import SessionTagger
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -170,6 +175,15 @@ if HF_AUTH_TOKEN:
     speaker_filter = SpeakerFilter(
         config_dir=CONFIG_DIR,
         hf_token=HF_AUTH_TOKEN,
+    )
+
+# セッションタグ付け (LLM API キーがあれば利用可能)
+session_tagger: SessionTagger | None = None
+if TAGGING_ENABLED and LLM_API_KEY:
+    session_tagger = SessionTagger(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=TAGGING_MODEL,
     )
 
 
@@ -298,6 +312,7 @@ class SessionRecorder:
         self.total_bytes = 0
         self._finalized = False
         self._audio_closed = False
+        self.session_tags: dict | None = None  # set by _tag_session() before finalize
 
         if not self.enabled:
             return
@@ -380,11 +395,12 @@ class SessionRecorder:
 
         duration_sec = self.total_bytes / (SAMPLE_RATE * 2)
 
-        # 空の録音 (音声なし) なら削除
-        if self.total_bytes == 0:
+        # 空の録音 (音声なし or セグメント0件) なら削除
+        if self.total_bytes == 0 or len(self.all_segments) == 0:
             import shutil
             shutil.rmtree(self.session_dir, ignore_errors=True)
-            log.info("Empty session removed.")
+            reason = "no audio" if self.total_bytes == 0 else "no segments (all filtered)"
+            log.info(f"Empty session removed: {reason}")
             return
 
         # WAV → OGG Opus 変換
@@ -401,17 +417,21 @@ class SessionRecorder:
         num_speakers = len(speakers)
 
         # メタデータ付きで JSON 保存
+        session_meta = {
+            "start": self.start_time.isoformat(),
+            "end": datetime.now().isoformat(),
+            "duration_seconds": round(duration_sec, 1),
+            "audio_file": audio_file,
+            "audio_size_mb": round(file_size_mb, 2),
+            "model": WHISPER_MODEL,
+            "language": LANGUAGE,
+            "num_speakers": num_speakers,
+        }
+        if self.session_tags:
+            session_meta["tags"] = self.session_tags
+            session_meta["session_tagged"] = True
         output = {
-            "session": {
-                "start": self.start_time.isoformat(),
-                "end": datetime.now().isoformat(),
-                "duration_seconds": round(duration_sec, 1),
-                "audio_file": audio_file,
-                "audio_size_mb": round(file_size_mb, 2),
-                "model": WHISPER_MODEL,
-                "language": LANGUAGE,
-                "num_speakers": num_speakers,
-            },
+            "session": session_meta,
             "segments": self.all_segments,
         }
 
@@ -867,6 +887,19 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
                 log.info("Post-session diarization succeeded")
             else:
                 log.warning("Post-session diarization failed, keeping original segments")
+
+        # Session tagging (after diarization, outside gpu_lock)
+        if (session_tagger and session_tagger.enabled
+                and len(recorder.all_segments) > 0):
+            try:
+                tags = await loop.run_in_executor(
+                    None,
+                    lambda: session_tagger.tag_session(recorder.all_segments),
+                )
+                if tags:
+                    recorder.session_tags = tags
+            except Exception as e:
+                log.warning(f"Session tagging failed (post-diarize): {e}")
     except Exception as e:
         log.error(f"Diarization error: {e}", exc_info=True)
     finally:
@@ -1209,6 +1242,140 @@ async def _batch_tag_task(force: bool = False):
 
 
 # ============================================================
+# バッチセッションタグ付け (LLM)
+# ============================================================
+
+_batch_session_tag_state = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "failed": 0,
+    "current_session": None,
+    "errors": [],
+    "cancel_requested": False,
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def _find_untagged_session_tag_sessions(force: bool = False) -> list[dict]:
+    """タグ付け対象のセッションを探す。"""
+    sessions = []
+    recordings = Path(RECORDINGS_DIR)
+    if not recordings.is_dir():
+        return sessions
+
+    for day_dir in sorted(recordings.iterdir()):
+        if not day_dir.is_dir():
+            continue
+        for time_dir in sorted(day_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+
+            try:
+                with open(transcript_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if not data.get("segments"):
+                continue
+
+            if not force and data.get("session", {}).get("session_tagged"):
+                continue
+
+            sessions.append({
+                "path": f"{day_dir.name}/{time_dir.name}",
+                "transcript_path": transcript_path,
+                "data": data,
+            })
+
+    return sessions
+
+
+async def _batch_session_tag_task(force: bool = False):
+    """バッチセッションタグ付けタスク。"""
+    import shutil
+
+    _batch_session_tag_state["running"] = True
+    _batch_session_tag_state["processed"] = 0
+    _batch_session_tag_state["failed"] = 0
+    _batch_session_tag_state["current_session"] = None
+    _batch_session_tag_state["errors"] = []
+    _batch_session_tag_state["cancel_requested"] = False
+    _batch_session_tag_state["started_at"] = datetime.now().isoformat()
+    _batch_session_tag_state["finished_at"] = None
+
+    try:
+        sessions = _find_untagged_session_tag_sessions(force=force)
+        _batch_session_tag_state["total"] = len(sessions)
+        log.info(f"Batch session tagging: {len(sessions)} session(s) to process (force={force})")
+
+        if not sessions:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        for sess in sessions:
+            if _batch_session_tag_state["cancel_requested"]:
+                log.info("Batch session tagging cancelled by user")
+                break
+
+            _batch_session_tag_state["current_session"] = sess["path"]
+            log.info(f"Batch session tag: {sess['path']}")
+
+            try:
+                segments = sess["data"].get("segments", [])
+                tags = await loop.run_in_executor(
+                    None,
+                    lambda segs=segments: session_tagger.tag_session(segs),
+                )
+
+                if tags:
+                    # Backup then update transcript.json
+                    bak_path = str(sess["transcript_path"]) + ".bak"
+                    shutil.copy2(sess["transcript_path"], bak_path)
+
+                    data = sess["data"]
+                    data["session"]["tags"] = tags
+                    data["session"]["session_tagged"] = True
+
+                    with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+
+                    _batch_session_tag_state["processed"] += 1
+                    log.info(f"Batch session tag done: {sess['path']} "
+                             f"({tags.get('activity', '?')}, {tags.get('mood', '?')})")
+                else:
+                    _batch_session_tag_state["failed"] += 1
+                    _batch_session_tag_state["errors"].append(f"{sess['path']}: tagger returned None")
+
+            except Exception as e:
+                _batch_session_tag_state["failed"] += 1
+                err_msg = f"{sess['path']}: {e}"
+                _batch_session_tag_state["errors"].append(err_msg)
+                log.error(f"Batch session tag error: {err_msg}", exc_info=True)
+
+            await asyncio.sleep(0)
+
+    except Exception as e:
+        log.error(f"Batch session tagging task error: {e}", exc_info=True)
+    finally:
+        _batch_session_tag_state["running"] = False
+        _batch_session_tag_state["current_session"] = None
+        _batch_session_tag_state["finished_at"] = datetime.now().isoformat()
+        log.info(
+            f"Batch session tagging finished: "
+            f"processed={_batch_session_tag_state['processed']}, "
+            f"failed={_batch_session_tag_state['failed']}, "
+            f"total={_batch_session_tag_state['total']}"
+        )
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -1372,6 +1539,22 @@ async def handle_connection(websocket):
                 time.time() - last_llm_flush >= LLM_BATCH_INTERVAL):
             await _flush_llm()
 
+    async def _tag_and_finalize(rec):
+        """Tag session then finalize recorder."""
+        if (session_tagger and session_tagger.enabled
+                and len(rec.all_segments) > 0):
+            try:
+                loop = asyncio.get_running_loop()
+                tags = await loop.run_in_executor(
+                    None,
+                    lambda: session_tagger.tag_session(rec.all_segments),
+                )
+                if tags:
+                    rec.session_tags = tags
+            except Exception as e:
+                log.warning(f"Session tagging failed (silence timeout): {e}")
+        rec.finalize()
+
     try:
         async for message in websocket:
             # Keep-alive ping (2バイト以下)
@@ -1413,7 +1596,7 @@ async def handle_connection(websocket):
                     elapsed_silence = time.time() - last_speech_time
                     if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
                         await _flush_llm()
-                        recorder.finalize()
+                        await _tag_and_finalize(recorder)
                         log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                         recorder = None
 
@@ -1470,7 +1653,7 @@ async def handle_connection(websocket):
                             elapsed_silence = time.time() - last_speech_time
                             if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
                                 await _flush_llm()
-                                recorder.finalize()
+                                await _tag_and_finalize(recorder)
                                 log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                                 recorder = None
                             total_audio_seconds += buffer_duration
@@ -1533,9 +1716,9 @@ async def handle_connection(websocket):
             recorder.close_audio()
             asyncio.create_task(_run_diarization_bg(recorder))
         else:
-            # diarization なし → 即 finalize
+            # diarization なし → タグ付け + finalize
             if recorder is not None:
-                recorder.finalize()
+                await _tag_and_finalize(recorder)
 
         duration = time.time() - session_start
         log.info(
@@ -1586,6 +1769,11 @@ async def main():
                  f"threshold={sf_status['threshold']})")
     else:
         log.info("Speaker filter: UNAVAILABLE (no HF_AUTH_TOKEN)")
+    if session_tagger and session_tagger.enabled:
+        log.info(f"Session tagger: ON (model={TAGGING_MODEL})")
+    else:
+        reason = "DISABLED" if not TAGGING_ENABLED else "no GEMINI_API_KEY"
+        log.info(f"Session tagger: {reason}")
     if VAD_SEG_ENABLED:
         log.info(f"VAD segmentation: ON (check={VAD_CHECK_INTERVAL}s, "
                  f"silence_trigger={VAD_SILENCE_TRIGGER}s, max_buffer={VAD_MAX_BUFFER}s)")
@@ -1882,6 +2070,43 @@ async def main():
         speaker_filter.delete_all()
         return web.json_response({"status": "ok"})
 
+    # --- Session Tagging バッチ API ---
+
+    async def handle_session_tag_start(request):
+        if session_tagger is None:
+            return web.json_response(
+                {"error": "GEMINI_API_KEY not configured or tagging disabled"}, status=503,
+            )
+        if _batch_session_tag_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409,
+            )
+
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+
+        sessions = _find_untagged_session_tag_sessions(force=force)
+        if not sessions and not force:
+            return web.json_response({
+                "status": "no_sessions",
+                "message": "All sessions already tagged",
+            })
+
+        asyncio.create_task(_batch_session_tag_task(force=force))
+        return web.json_response({"status": "started", "total": len(sessions)})
+
+    async def handle_session_tag_status(request):
+        return web.json_response(_batch_session_tag_state)
+
+    async def handle_session_tag_cancel(request):
+        if _batch_session_tag_state["running"]:
+            _batch_session_tag_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -1907,6 +2132,10 @@ async def main():
     mgmt_app.router.add_delete("/speakers/{id}", handle_speakers_delete)
     mgmt_app.router.add_post("/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
     mgmt_app.router.add_delete("/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
+    # Session tagging batch API
+    mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
+    mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)
+    mgmt_app.router.add_post("/session-tags/cancel", handle_session_tag_cancel)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()
