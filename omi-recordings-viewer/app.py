@@ -402,16 +402,19 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
     try:
         info = indexer._parse_transcript(date, time)
+        info["last_modified"] = transcript_path.stat().st_mtime
         await indexer._db.execute(
             """INSERT OR REPLACE INTO sessions
                (date, time, start_at, end_at, duration_seconds,
                 audio_size_mb, model, language, transcript_text, segment_count,
                 tags_topics, tags_activity, tags_intent, tags_mood,
-                tags_quality, tags_entities, tags_summary, session_tagged, tags_user)
+                tags_quality, tags_entities, tags_summary, session_tagged,
+                tags_user, last_modified)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                       :tags_quality, :tags_entities, :tags_summary, :session_tagged, :tags_user)""",
+                       :tags_quality, :tags_entities, :tags_summary, :session_tagged,
+                       :tags_user, :last_modified)""",
             info,
         )
         await indexer._db.commit()

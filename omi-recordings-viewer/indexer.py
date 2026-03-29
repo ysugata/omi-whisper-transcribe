@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_summary TEXT,
     session_tagged INTEGER DEFAULT 0,
     tags_user TEXT,
+    last_modified REAL DEFAULT 0,
     UNIQUE(date, time)
 );
 
@@ -53,6 +54,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_summary TEXT",
     "ALTER TABLE sessions ADD COLUMN session_tagged INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN tags_user TEXT",
+    "ALTER TABLE sessions ADD COLUMN last_modified REAL DEFAULT 0",
 ]
 
 FTS_SCHEMA = """
@@ -115,12 +117,12 @@ class Indexer:
         if self._db:
             await self._db.close()
 
-    def _scan_sessions(self, since_date: str | None = None) -> list[tuple[str, str]]:
-        """Scan recordings dir and return (date, time) pairs that have transcript.json.
+    def _scan_sessions_with_mtime(self) -> list[tuple[str, str, float]]:
+        """Scan recordings dir and return (date, time, mtime) tuples.
 
-        If since_date is given (e.g. "2026-03-25"), only date directories
-        >= that value are scanned.  On first run (DB empty) since_date is
-        None and a full scan is performed.
+        Always does a full scan.  The mtime is the modification time of
+        transcript.json, used to detect changes by batch operations
+        (diarize, tag, speaker tag) without re-reading unchanged files.
         """
         results = []
         if not self.recordings_dir.is_dir():
@@ -128,37 +130,25 @@ class Indexer:
         for date_dir in sorted(self.recordings_dir.iterdir()):
             if not date_dir.is_dir() or not DATE_RE.match(date_dir.name):
                 continue
-            if since_date and date_dir.name < since_date:
-                continue
             for time_dir in sorted(date_dir.iterdir()):
                 if not time_dir.is_dir() or not TIME_RE.match(time_dir.name):
                     continue
-                if (time_dir / "transcript.json").exists():
-                    results.append((date_dir.name, time_dir.name))
+                transcript = time_dir / "transcript.json"
+                if transcript.exists():
+                    try:
+                        mtime = transcript.stat().st_mtime
+                    except OSError:
+                        continue
+                    results.append((date_dir.name, time_dir.name, mtime))
         return results
 
-    async def _get_latest_date(self) -> str | None:
-        """Return the latest indexed date, or None if DB is empty."""
+    async def _get_indexed_mtimes(self) -> dict[tuple[str, str], float]:
+        """Get {(date, time): last_modified} for all indexed sessions."""
         cursor = await self._db.execute(
-            "SELECT MAX(date) as max_date FROM sessions"
+            "SELECT date, time, last_modified FROM sessions"
         )
-        row = await cursor.fetchone()
-        return row["max_date"] if row else None
-
-    async def _get_indexed(self, since_date: str | None = None) -> set[tuple[str, str]]:
-        """Get (date, time) pairs already in the DB.
-
-        If since_date is given, only returns pairs >= that date.
-        """
-        if since_date:
-            cursor = await self._db.execute(
-                "SELECT date, time FROM sessions WHERE date >= ?",
-                (since_date,),
-            )
-        else:
-            cursor = await self._db.execute("SELECT date, time FROM sessions")
         rows = await cursor.fetchall()
-        return {(r["date"], r["time"]) for r in rows}
+        return {(r["date"], r["time"]): r["last_modified"] or 0.0 for r in rows}
 
     def _parse_transcript(self, date: str, time: str) -> dict:
         """Parse a transcript.json file and return session data."""
@@ -198,57 +188,64 @@ class Indexer:
             "tags_user": tags_user,
         }
 
-    async def _get_untagged(self, since_date: str | None = None) -> set[tuple[str, str]]:
-        """Get (date, time) pairs that are indexed but not yet tagged."""
-        if since_date:
-            cursor = await self._db.execute(
-                "SELECT date, time FROM sessions WHERE date >= ? AND session_tagged = 0",
-                (since_date,),
-            )
-        else:
-            cursor = await self._db.execute(
-                "SELECT date, time FROM sessions WHERE session_tagged = 0"
-            )
-        rows = await cursor.fetchall()
-        return {(r["date"], r["time"]) for r in rows}
-
     async def sync(self) -> int:
-        """Sync DB with recordings dir. Returns number of new/updated sessions."""
-        since_date = await self._get_latest_date()
-        on_disk = self._scan_sessions(since_date)
-        indexed = await self._get_indexed(since_date)
+        """Sync DB with recordings dir. Returns number of new/updated sessions.
 
-        # New sessions from recent dates
-        new = [(d, t) for d, t in on_disk if (d, t) not in indexed]
+        Uses file modification time (mtime) to detect changes efficiently.
+        Only sessions with new or changed transcript.json are re-indexed,
+        avoiding the previous O(N) re-index of all untagged sessions.
+        """
+        loop = asyncio.get_event_loop()
 
-        # Also re-index ALL untagged sessions (batch tagging may update old dates)
-        all_untagged = await self._get_untagged()
-        new.extend((d, t) for d, t in all_untagged if (d, t) not in set(new))
+        # Scan disk for all sessions with mtimes (in executor to avoid blocking)
+        on_disk = await loop.run_in_executor(
+            None, self._scan_sessions_with_mtime
+        )
 
-        if not new:
+        # Get stored mtimes from DB
+        indexed_mtimes = await self._get_indexed_mtimes()
+
+        # Determine which sessions need (re-)indexing
+        to_index = []
+        for date, time, mtime in on_disk:
+            key = (date, time)
+            stored_mtime = indexed_mtimes.get(key)
+            if stored_mtime is None or abs(mtime - stored_mtime) > 0.01:
+                to_index.append((date, time, mtime))
+
+        if not to_index:
             return 0
 
         count = 0
-        for date, time in new:
+        for date, time, mtime in to_index:
             try:
-                info = self._parse_transcript(date, time)
+                info = await loop.run_in_executor(
+                    None, self._parse_transcript, date, time
+                )
             except Exception:
                 logger.exception("Failed to parse %s/%s", date, time)
                 continue
 
+            info["last_modified"] = mtime
             await self._db.execute(
                 """INSERT OR REPLACE INTO sessions
                    (date, time, start_at, end_at, duration_seconds,
                     audio_size_mb, model, language, transcript_text, segment_count,
                     tags_topics, tags_activity, tags_intent, tags_mood,
-                    tags_quality, tags_entities, tags_summary, session_tagged, tags_user)
+                    tags_quality, tags_entities, tags_summary, session_tagged,
+                    tags_user, last_modified)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                           :tags_quality, :tags_entities, :tags_summary, :session_tagged, :tags_user)""",
+                           :tags_quality, :tags_entities, :tags_summary, :session_tagged,
+                           :tags_user, :last_modified)""",
                 info,
             )
             count += 1
+
+            # Yield to event loop periodically to prevent blocking
+            if count % 10 == 0:
+                await asyncio.sleep(0)
 
         await self._db.commit()
         if count:
