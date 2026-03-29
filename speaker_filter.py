@@ -324,6 +324,114 @@ class SpeakerFilter:
         return avg, total_duration
 
     # ------------------------------------------------------------------
+    # Realtime voice filter
+    # ------------------------------------------------------------------
+
+    def get_user_speakers(self) -> list:
+        """Return speakers with is_user=True and a valid embedding."""
+        return [
+            s for s in self._data["speakers"]
+            if s.get("is_user") and s.get("embedding") is not None
+        ]
+
+    def filter_segments_realtime(
+        self,
+        inference,
+        audio_np: np.ndarray,
+        segments: list,
+        sample_rate: int = 16000,
+        threshold: float = 0,
+    ) -> list:
+        """Filter out non-user segments using pre-loaded embedding model.
+
+        Args:
+            inference: Pre-loaded pyannote Inference instance.
+            audio_np: float32 numpy array (mono, already at sample_rate).
+            segments: List of segment dicts (start, end, text, ...).
+            sample_rate: Sample rate of audio_np.
+            threshold: Cosine similarity threshold. 0 = use speakers.json value.
+
+        Returns:
+            Filtered list of segments (only user speech retained).
+        """
+        import torch
+
+        user_speakers = self.get_user_speakers()
+        if not user_speakers:
+            return segments
+
+        if threshold <= 0:
+            threshold = self._data.get("threshold", DEFAULT_THRESHOLD)
+
+        # Build user embedding matrix (normalized)
+        user_embs = []
+        for sp in user_speakers:
+            emb = np.array(sp["embedding"])
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                emb = emb / norm
+            user_embs.append(emb)
+        user_embs = np.array(user_embs)
+
+        # Ensure audio is 2D: (1, samples) for pyannote
+        if audio_np.ndim == 1:
+            waveform = torch.from_numpy(audio_np).unsqueeze(0).float()
+        else:
+            waveform = torch.from_numpy(audio_np).float()
+
+        kept = []
+        filtered_count = 0
+
+        for seg in segments:
+            start = float(seg.get("start", 0))
+            end = float(seg.get("end", 0))
+            duration = end - start
+
+            # Too short to judge reliably — keep
+            if duration < 0.5:
+                kept.append(seg)
+                continue
+
+            start_sample = int(start * sample_rate)
+            end_sample = int(end * sample_rate)
+            end_sample = min(end_sample, waveform.shape[1])
+            if start_sample >= end_sample:
+                kept.append(seg)
+                continue
+
+            try:
+                segment_audio = waveform[:, start_sample:end_sample]
+                emb = inference({"waveform": segment_audio, "sample_rate": sample_rate})
+                emb = np.array(emb)
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+
+                # Max cosine similarity against all user speakers
+                similarities = user_embs @ emb
+                best_sim = float(np.max(similarities))
+
+                if best_sim >= threshold:
+                    kept.append(seg)
+                else:
+                    text_preview = seg.get("text", "")[:40]
+                    log.info(
+                        f"Voice filter: removed segment [{start:.1f}-{end:.1f}s] "
+                        f"sim={best_sim:.3f} < {threshold:.2f} "
+                        f"text=\"{text_preview}\""
+                    )
+                    filtered_count += 1
+            except Exception as e:
+                log.warning(f"Voice filter error at {start:.1f}-{end:.1f}s: {e}")
+                kept.append(seg)  # On error, keep the segment
+
+        if filtered_count > 0:
+            log.info(f"Voice filter: kept {len(kept)}/{len(segments)} segments "
+                     f"(removed {filtered_count})")
+
+        return kept
+
+    # ------------------------------------------------------------------
     # Tagging
     # ------------------------------------------------------------------
 

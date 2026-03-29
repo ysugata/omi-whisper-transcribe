@@ -108,6 +108,10 @@ SILENCE_TIMEOUT = float(os.environ.get("SILENCE_TIMEOUT", "30.0"))       # 無�
 # --- Hotwords 設定 ---
 HOTWORDS_ENABLED = os.environ.get("HOTWORDS_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# --- リアルタイム声紋フィルタ設定 ---
+VOICE_FILTER_ENABLED = os.environ.get("VOICE_FILTER_ENABLED", "false").lower() in ("true", "1", "yes")
+VOICE_FILTER_THRESHOLD = float(os.environ.get("VOICE_FILTER_THRESHOLD", "0"))  # 0 = use speakers.json value
+
 # --- 認証設定 (Cloudflare Tunnel 経由で公開する場合) ---
 AUTH_TOKEN = os.environ.get("OMI_WHISPER_TOKEN", "")                     # 空文字 = 認証なし (LAN内専用)
 # トークン生成例: python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -1431,6 +1435,21 @@ async def handle_connection(websocket):
         if session_hotwords:
             log.info(f"Hotwords: {hotword_loader.get_count()} terms active")
 
+    # Realtime voice filter: load embedding model if enabled + user speakers exist
+    voice_filter_inference = None
+    if VOICE_FILTER_ENABLED and speaker_filter and speaker_filter.enabled:
+        user_speakers = speaker_filter.get_user_speakers()
+        if user_speakers:
+            try:
+                voice_filter_inference = speaker_filter._load_model()
+                log.info(f"Voice filter: ENABLED ({len(user_speakers)} user speaker(s), "
+                         f"threshold={VOICE_FILTER_THRESHOLD or speaker_filter.get_threshold()})")
+            except Exception as e:
+                log.warning(f"Voice filter: model load failed, continuing without filter: {e}")
+                voice_filter_inference = None
+        else:
+            log.warning("Voice filter: ENABLED but no user speakers with embeddings registered")
+
     # Layer 3: Deferred LLM batch correction
     llm_pending: list[dict] = []   # Segment dicts awaiting LLM correction (same refs as recorder.all_segments)
     last_llm_flush = time.time()
@@ -1474,6 +1493,14 @@ async def handle_connection(websocket):
         elapsed = time.time() - t0
         total_audio_seconds += chunk_duration
         recorder_audio_seconds += chunk_duration
+
+        # Realtime voice filter: remove non-user segments
+        if raw_segments and voice_filter_inference:
+            audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            raw_segments = speaker_filter.filter_segments_realtime(
+                voice_filter_inference, audio_np, raw_segments,
+                sample_rate=SAMPLE_RATE, threshold=VOICE_FILTER_THRESHOLD,
+            )
 
         if raw_segments:
             # 録音ログ: WAV ファイル内の位置に合わせたオフセット (先に保存)
@@ -1690,6 +1717,13 @@ async def handle_connection(websocket):
                 log.info("Processing remaining buffer...")
                 try:
                     raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords)
+                    # Realtime voice filter on remaining buffer
+                    if raw_segments and voice_filter_inference:
+                        audio_np = np.frombuffer(remaining, dtype=np.int16).astype(np.float32) / 32768.0
+                        raw_segments = speaker_filter.filter_segments_realtime(
+                            voice_filter_inference, audio_np, raw_segments,
+                            sample_rate=SAMPLE_RATE, threshold=VOICE_FILTER_THRESHOLD,
+                        )
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
@@ -1711,6 +1745,11 @@ async def handle_connection(websocket):
 
         # セッション終了: whisper モデルを解放
         model_manager.release()
+
+        # Voice filter embedding model unload
+        if voice_filter_inference is not None:
+            speaker_filter._unload_model(voice_filter_inference)
+            voice_filter_inference = None
 
         # 話者分離 (バックグラウンドで実行、新セッションをブロックしない)
         if (DIARIZATION_ENABLED and diarizer and diarizer.enabled
@@ -1768,6 +1807,18 @@ async def main():
             log.info("Hotwords: DISABLED (settings)")
     else:
         log.info("Hotwords: DISABLED (env)")
+    if VOICE_FILTER_ENABLED:
+        if speaker_filter and speaker_filter.enabled:
+            user_count = len(speaker_filter.get_user_speakers())
+            if user_count > 0:
+                log.info(f"Voice filter: ENABLED ({user_count} user speaker(s), "
+                         f"threshold={VOICE_FILTER_THRESHOLD or speaker_filter.get_threshold()})")
+            else:
+                log.info("Voice filter: ENABLED but no user speakers with embeddings")
+        else:
+            log.info("Voice filter: ENABLED but speaker filter unavailable")
+    else:
+        log.info("Voice filter: DISABLED")
     if speaker_filter and speaker_filter.enabled:
         sf_status = speaker_filter.get_status()
         log.info(f"Speaker filter: AVAILABLE ({sf_status['speaker_count']} speakers, "
