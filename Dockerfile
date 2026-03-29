@@ -32,6 +32,7 @@ COPY whisper_engine.py .
 COPY qwen_asr_engine.py .
 COPY engine_manager.py .
 COPY test_whisper.py .
+COPY tools/ tools/
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント
 ENV HF_HOME=/models
