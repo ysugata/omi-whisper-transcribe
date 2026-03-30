@@ -168,6 +168,34 @@ class SpeakerFilter:
             })
         return result
 
+    def list_speakers_detailed(self) -> list:
+        """list_speakers() と同じ構造 + 各サンプルのメタデータ (embedding 除外)。"""
+        result = []
+        for s in self._data["speakers"]:
+            samples_meta = []
+            for sample in s.get("samples", []):
+                samples_meta.append({
+                    "id": sample.get("id"),
+                    "added_at": sample.get("added_at"),
+                    "source_session": sample.get("source_session", ""),
+                    "segment_indices": sample.get("segment_indices", []),
+                    "duration": sample.get("duration", 0),
+                    "source": sample.get("source", "manual"),
+                })
+            result.append({
+                "id": s["id"],
+                "name": s["name"],
+                "is_user": s["is_user"],
+                "created_at": s["created_at"],
+                "sample_count": len(s.get("samples", [])),
+                "total_duration": sum(
+                    sample.get("duration", 0) for sample in s.get("samples", [])
+                ),
+                "has_embedding": s.get("embedding") is not None,
+                "samples": samples_meta,
+            })
+        return result
+
     def _find_speaker(self, speaker_id: str) -> Optional[dict]:
         for s in self._data["speakers"]:
             if s["id"] == speaker_id:

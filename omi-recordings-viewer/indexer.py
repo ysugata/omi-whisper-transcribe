@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(tags_activity);
+CREATE INDEX IF NOT EXISTS idx_sessions_mood ON sessions(tags_mood);
+CREATE INDEX IF NOT EXISTS idx_sessions_speakers ON sessions(speakers);
 """
 
 # Migration: add tag columns to existing DBs

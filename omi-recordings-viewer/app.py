@@ -530,6 +530,14 @@ async def handle_speakers_list(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "GET", "/speakers/list")
 
 
+async def handle_speakers_list_detailed(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/speakers/list-detailed")
+
+
+async def handle_speakers_tag_correction(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "PUT", "/speakers/tag-correction", timeout_sec=120)
+
+
 async def handle_speakers_add(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/speakers/add")
 
@@ -681,6 +689,8 @@ def create_app() -> web.Application:
     # Speaker プロキシ API (固定パスを {id} より先に登録)
     app.router.add_get("/api/speakers/status", handle_speakers_status)
     app.router.add_get("/api/speakers/list", handle_speakers_list)
+    app.router.add_get("/api/speakers/list-detailed", handle_speakers_list_detailed)
+    app.router.add_put("/api/speakers/tag-correction", handle_speakers_tag_correction)
     app.router.add_post("/api/speakers/add", handle_speakers_add)
     app.router.add_put("/api/speakers/threshold", handle_speakers_threshold)
     app.router.add_post("/api/speakers/tag/start", handle_speakers_tag_start)

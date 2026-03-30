@@ -183,6 +183,26 @@
                     <button id="voice-add-btn" class="btn-primary">Add Speaker</button>
                 </div>
                 <div id="voice-speakers-list" class="voice-speakers-list"></div>
+                <details class="enrollment-guide">
+                    <summary>Enrollment Guide</summary>
+                    <p>Omi デバイスを装着した状態で以下の文章を読み上げ、声紋を登録してください:</p>
+                    <ol>
+                        <li>
+                            <strong>日常会話パターン</strong>
+                            <span class="enrollment-text">今日はいい天気ですね。最近どうしていますか。週末は映画を見に行きました。とても面白かったですよ。明日は早起きしなくちゃいけないので、今日は早めに寝ようと思います。</span>
+                        </li>
+                        <li>
+                            <strong>技術用語パターン</strong>
+                            <span class="enrollment-text">Kubernetesクラスターの設定を確認して、デプロイメントのレプリカ数を調整しましょう。GitHubのプルリクエストをレビューして、CI/CDパイプラインが正常に動作しているかチェックしてください。</span>
+                        </li>
+                        <li>
+                            <strong>固有名詞パターン</strong>
+                            <span class="enrollment-text">東京から大阪まで新幹線のぞみで二時間半くらいです。渋谷のスクランブル交差点を通って、代々木公園まで散歩しました。帰りに表参道でコーヒーを飲みました。</span>
+                        </li>
+                    </ol>
+                    <p><strong>手順:</strong> 1. 上の文章を読み上げる → 2. セッション一覧で録音を見つける → 3. セグメントをチェック → 4. Speaker を選んで「Add to voiceprint」</p>
+                    <p><strong>Tip:</strong> 合計30秒以上、複数サンプルで精度が向上します。</p>
+                </details>
                 <div class="voice-threshold-row">
                     <label>Similarity Threshold</label>
                     <input type="range" id="voice-threshold" min="0.3" max="0.9" step="0.05" value="0.55">

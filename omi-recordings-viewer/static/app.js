@@ -334,13 +334,13 @@
             html += '<input type="checkbox" class="segment-checkbox" data-idx="' + idx + '">';
             html += '<span class="segment-time" data-seek="' + seg.start + '">' + formatTimestamp(seg.start) + "</span>";
 
-            // Speaker badge
+            // Speaker badge (clickable for correction)
             if (seg.person_id && seg.person_id !== "unknown") {
-                var badgeCls = seg.is_user ? "speaker-badge user-speaker" : "speaker-badge known-speaker";
-                html += '<span class="' + badgeCls + '">' + escapeHtml(seg.person_name || seg.person_id) + "</span>";
+                var badgeCls = seg.is_user ? "speaker-badge user-speaker clickable" : "speaker-badge known-speaker clickable";
+                html += '<span class="' + badgeCls + '" data-seg-idx="' + idx + '">' + escapeHtml(seg.person_name || seg.person_id) + "</span>";
             } else if (seg.person_id === "unknown") {
                 var unknownLabel = seg.speaker ? ("? " + seg.speaker) : "?";
-                html += '<span class="speaker-badge unknown-speaker">' + escapeHtml(unknownLabel) + '</span>';
+                html += '<span class="speaker-badge unknown-speaker clickable" data-seg-idx="' + idx + '">' + escapeHtml(unknownLabel) + '</span>';
             } else {
                 html += '<span class="segment-speaker">' + (seg.speaker || "") + "</span>";
             }
@@ -367,6 +367,16 @@
         for (var j = 0; j < checkboxes.length; j++) {
             checkboxes[j].addEventListener("change", updateVoiceprintSelection);
         }
+
+        // Speaker badge click → correction dropdown
+        var badges = segmentsContainer.querySelectorAll(".speaker-badge.clickable");
+        for (var bi = 0; bi < badges.length; bi++) {
+            badges[bi].addEventListener("click", function (e) {
+                e.stopPropagation();
+                var segIdx = parseInt(this.getAttribute("data-seg-idx"), 10);
+                showCorrectionDropdown(this, segIdx);
+            });
+        }
     }
 
     function updateVoiceprintSelection() {
@@ -375,6 +385,120 @@
         var addBtn = document.getElementById("voiceprint-add-btn");
         countEl.textContent = checked.length + " selected";
         addBtn.disabled = checked.length === 0;
+    }
+
+    // ============================================================
+    // Speaker tag correction
+    // ============================================================
+
+    function showCorrectionDropdown(badgeEl, segIdx) {
+        // Close any existing dropdown
+        closeCorrectionDropdown();
+
+        var dropdown = document.createElement("div");
+        dropdown.className = "correction-dropdown";
+        dropdown.id = "correction-dropdown";
+
+        // "unknown" option
+        var unknownOpt = document.createElement("div");
+        unknownOpt.className = "correction-option";
+        unknownOpt.textContent = "unknown (clear)";
+        unknownOpt.addEventListener("click", function () {
+            closeCorrectionDropdown();
+            applySpeakerCorrection(segIdx, "unknown");
+        });
+        dropdown.appendChild(unknownOpt);
+
+        // All registered speakers
+        speakersCache.forEach(function (sp) {
+            var opt = document.createElement("div");
+            opt.className = "correction-option";
+            opt.textContent = sp.name + (sp.is_user ? " (me)" : "");
+            opt.addEventListener("click", function () {
+                closeCorrectionDropdown();
+                applySpeakerCorrection(segIdx, sp.id);
+            });
+            dropdown.appendChild(opt);
+        });
+
+        // Position relative to badge
+        var rect = badgeEl.getBoundingClientRect();
+        dropdown.style.top = (rect.bottom + window.scrollY + 2) + "px";
+        dropdown.style.left = (rect.left + window.scrollX) + "px";
+        document.body.appendChild(dropdown);
+
+        // Close on outside click (delayed to avoid immediate close)
+        setTimeout(function () {
+            document.addEventListener("click", closeCorrectionDropdownOnClick);
+        }, 0);
+    }
+
+    function closeCorrectionDropdown() {
+        var existing = document.getElementById("correction-dropdown");
+        if (existing) existing.remove();
+        document.removeEventListener("click", closeCorrectionDropdownOnClick);
+    }
+
+    function closeCorrectionDropdownOnClick(e) {
+        var dd = document.getElementById("correction-dropdown");
+        if (dd && !dd.contains(e.target)) {
+            closeCorrectionDropdown();
+        }
+    }
+
+    function applySpeakerCorrection(segIdx, speakerId) {
+        var session = currentDetailDate + "/" + currentDetailTime;
+
+        // Visual feedback: dim the segment
+        var segEl = segmentsContainer.querySelector('.segment[data-idx="' + segIdx + '"]');
+        if (segEl) segEl.style.opacity = "0.5";
+
+        fetch("/api/speakers/tag-correction", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                session: session,
+                segment_index: segIdx,
+                speaker_id: speakerId,
+            }),
+        }).then(function (r) {
+            return r.json().then(function (data) {
+                if (r.ok) {
+                    // Update in-memory segment
+                    var seg = currentDetailSegments[segIdx];
+                    seg.person_id = data.person_id;
+                    seg.person_name = data.person_name;
+                    seg.is_user = data.is_user;
+                    seg.manually_tagged = true;
+                    seg.speaker_similarity = 1.0;
+                    renderSegments();
+
+                    if (data.auto_added_sample) {
+                        showNotification("Speaker corrected. Voiceprint sample auto-added (" +
+                            (data.auto_added_sample.duration || 0).toFixed(1) + "s)");
+                    } else {
+                        showNotification("Speaker corrected.");
+                    }
+                } else {
+                    alert("Error: " + (data.error || "unknown"));
+                    if (segEl) segEl.style.opacity = "";
+                }
+            });
+        }).catch(function (e) {
+            alert("Failed: " + e.message);
+            if (segEl) segEl.style.opacity = "";
+        });
+    }
+
+    function showNotification(msg) {
+        var el = document.createElement("div");
+        el.className = "notification show";
+        el.textContent = msg;
+        document.body.appendChild(el);
+        setTimeout(function () {
+            el.classList.remove("show");
+            setTimeout(function () { el.remove(); }, 400);
+        }, 3000);
     }
 
     function updateVoiceprintSpeakerSelect() {
@@ -1317,14 +1441,71 @@
     }
 
     function loadSpeakerSamples(speakerId) {
-        // We need full speaker data — for now re-fetch from the status
-        // The samples are stored in config/speakers.json, accessible via speakers/list
-        // But list only returns summary. We need to read the samples from the file.
-        // Actually, let's fetch the speakers.json config directly through a custom endpoint
-        // or just show what we know from the summary.
         var el = document.getElementById("samples-" + speakerId);
         if (!el) return;
-        el.innerHTML = '<div class="text-dim">Sample details in config/speakers.json</div>';
+
+        // Toggle: if already loaded, hide
+        if (el.getAttribute("data-loaded") === "1") {
+            el.innerHTML = '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(speakerId) + '">Show samples</a>';
+            el.removeAttribute("data-loaded");
+            bindShowSamplesLink(el);
+            return;
+        }
+
+        el.innerHTML = '<div class="text-dim">Loading...</div>';
+        fetch("/api/speakers/list-detailed").then(function (r) {
+            if (!r.ok) throw new Error("Failed");
+            return r.json();
+        }).then(function (speakers) {
+            var sp = speakers.find(function (s) { return s.id === speakerId; });
+            if (!sp || !sp.samples || sp.samples.length === 0) {
+                el.innerHTML = '<div class="text-dim">No samples</div>';
+                return;
+            }
+            var html = '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(speakerId) + '">Hide samples</a>';
+            sp.samples.forEach(function (sample) {
+                var addedDate = sample.added_at ? sample.added_at.split("T")[0] : "?";
+                var src = sample.source_session || "-";
+                var srcLabel = sample.source === "correction" ? "correction" : src;
+                html += '<div class="voice-sample-row">';
+                html += '<span>' + escapeHtml(srcLabel) + '</span>';
+                html += '<span>' + (sample.duration || 0).toFixed(1) + 's</span>';
+                html += '<span>' + escapeHtml(addedDate) + '</span>';
+                html += '<button class="btn-danger voice-sample-del" data-speaker="' + escapeHtml(speakerId) +
+                         '" data-sample="' + escapeHtml(sample.id) + '">Del</button>';
+                html += '</div>';
+            });
+            el.innerHTML = html;
+            el.setAttribute("data-loaded", "1");
+
+            // Bind delete buttons
+            var delBtns = el.querySelectorAll(".voice-sample-del");
+            for (var i = 0; i < delBtns.length; i++) {
+                delBtns[i].addEventListener("click", function () {
+                    var sid = this.getAttribute("data-speaker");
+                    var sampleId = this.getAttribute("data-sample");
+                    if (!confirm("Delete this voiceprint sample?")) return;
+                    fetch("/api/speakers/" + sid + "/voiceprint/" + sampleId, { method: "DELETE" })
+                        .then(function (r) { return r.json(); })
+                        .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
+                });
+            }
+
+            // Bind toggle link
+            bindShowSamplesLink(el);
+        }).catch(function () {
+            el.innerHTML = '<div class="text-dim">Failed to load samples</div>';
+        });
+    }
+
+    function bindShowSamplesLink(container) {
+        var link = container.querySelector(".voice-show-samples");
+        if (link) {
+            link.addEventListener("click", function (e) {
+                e.preventDefault();
+                loadSpeakerSamples(this.getAttribute("data-id"));
+            });
+        }
     }
 
     voiceAddBtn.addEventListener("click", function () {
@@ -1711,10 +1892,9 @@
     }
 
     // --- Init ---
-    loadUserTagsCache().then(function () {
+    Promise.all([loadUserTagsCache(), loadSpeakerNames()]).then(function () {
         loadPage(1);
     });
-    loadSpeakerNames();
     checkBatchStatus("diarize");
     checkBatchStatus("tags");
     loadHotwordsStatus();

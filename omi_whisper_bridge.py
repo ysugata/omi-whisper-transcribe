@@ -1210,6 +1210,7 @@ async def _batch_tag_task(force: bool = False):
                         None, speaker_filter._load_model
                     )
                     try:
+                        original_segments = s["data"]["segments"]
                         updated = await loop.run_in_executor(
                             None,
                             lambda s=sess: speaker_filter.tag_segments_with_model(
@@ -1220,6 +1221,11 @@ async def _batch_tag_task(force: bool = False):
                         await loop.run_in_executor(
                             None, lambda: speaker_filter._unload_model(inference)
                         )
+
+                # Preserve manually_tagged segments
+                for i, orig in enumerate(original_segments):
+                    if orig.get("manually_tagged") and i < len(updated):
+                        updated[i] = orig
 
                 # バックアップを作成してから transcript.json を更新
                 bak_path = str(sess["transcript_path"]) + ".bak"
@@ -1515,6 +1521,7 @@ async def _batch_combined_tag_task(force: bool = False):
 
                     st["current_session"] = sess["path"]
                     try:
+                        original_segments = sess["data"]["segments"]
                         async with model_manager.gpu_lock:
                             if model_manager.loaded:
                                 await model_manager.force_unload()
@@ -1532,6 +1539,11 @@ async def _batch_combined_tag_task(force: bool = False):
                                 await loop.run_in_executor(
                                     None, lambda: speaker_filter._unload_model(inference)
                                 )
+
+                        # Preserve manually_tagged segments
+                        for i, orig in enumerate(original_segments):
+                            if orig.get("manually_tagged") and i < len(updated):
+                                updated[i] = orig
 
                         bak_path = str(sess["transcript_path"]) + ".bak"
                         shutil.copy2(sess["transcript_path"], bak_path)
@@ -2147,6 +2159,115 @@ async def main():
             )
         return web.json_response(speaker_filter.list_speakers())
 
+    async def handle_speakers_list_detailed(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        return web.json_response(speaker_filter.list_speakers_detailed())
+
+    async def handle_speakers_tag_correction(request):
+        if speaker_filter is None:
+            return web.json_response(
+                {"error": "HF_AUTH_TOKEN not configured"}, status=503,
+            )
+        body = await request.json()
+        session_path = str(body.get("session", "")).strip()
+        segment_index = body.get("segment_index")
+        new_speaker_id = str(body.get("speaker_id", "")).strip()
+
+        if not session_path or segment_index is None or not new_speaker_id:
+            return web.json_response(
+                {"error": "session, segment_index, and speaker_id are required"}, status=400,
+            )
+
+        parts = session_path.split("/")
+        if len(parts) != 2:
+            return web.json_response({"error": "invalid session path"}, status=400)
+
+        session_dir = Path(RECORDINGS_DIR) / parts[0] / parts[1]
+        transcript_path = session_dir / "transcript.json"
+        if not transcript_path.exists():
+            return web.json_response({"error": "session not found"}, status=404)
+
+        try:
+            with open(transcript_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return web.json_response({"error": "transcript read error"}, status=500)
+
+        segments = data.get("segments", [])
+        if segment_index < 0 or segment_index >= len(segments):
+            return web.json_response({"error": "segment_index out of range"}, status=400)
+
+        seg = segments[segment_index]
+
+        if new_speaker_id == "unknown":
+            seg["person_id"] = "unknown"
+            seg["person_name"] = "unknown"
+            seg["is_user"] = False
+            seg["speaker_similarity"] = 0
+            seg["manually_tagged"] = True
+        else:
+            sp = speaker_filter._find_speaker(new_speaker_id)
+            if sp is None:
+                return web.json_response({"error": "speaker not found"}, status=404)
+            seg["person_id"] = sp["id"]
+            seg["person_name"] = sp["name"]
+            seg["is_user"] = sp.get("is_user", False)
+            seg["speaker_similarity"] = 1.0
+            seg["manually_tagged"] = True
+
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        result = {
+            "status": "ok",
+            "segment_index": segment_index,
+            "person_id": seg["person_id"],
+            "person_name": seg["person_name"],
+            "is_user": seg["is_user"],
+            "manually_tagged": True,
+        }
+
+        # Auto-learn: add voiceprint from correction (best-effort)
+        if new_speaker_id != "unknown":
+            seg_duration = float(seg.get("end", 0)) - float(seg.get("start", 0))
+            if seg_duration >= 0.5:
+                try:
+                    audio_file = data.get("session", {}).get("audio_file", "audio.ogg")
+                    audio_path = session_dir / audio_file
+                    if not audio_path.exists():
+                        for ext in ("audio.ogg", "audio.wav"):
+                            alt = session_dir / ext
+                            if alt.exists():
+                                audio_path = alt
+                                break
+
+                    if audio_path.exists():
+                        loop = asyncio.get_running_loop()
+                        async with model_manager.gpu_lock:
+                            await model_manager.unload_model()
+                            sample = await loop.run_in_executor(
+                                None,
+                                lambda: speaker_filter.add_voiceprint(
+                                    new_speaker_id, str(audio_path),
+                                    [{"start": seg["start"], "end": seg["end"]}],
+                                    session_path + " (correction)",
+                                ),
+                            )
+                        if sample:
+                            result["auto_added_sample"] = {
+                                "id": sample["id"],
+                                "duration": sample.get("duration", 0),
+                            }
+                            log.info(f"Auto-added voiceprint from correction: {new_speaker_id}")
+                except Exception as e:
+                    log.warning(f"Auto-add voiceprint from correction failed (non-fatal): {e}")
+
+        log.info(f"Tag correction: {session_path}[{segment_index}] → {seg['person_name']}")
+        return web.json_response(result)
+
     async def handle_speakers_add(request):
         if speaker_filter is None:
             return web.json_response(
@@ -2422,7 +2543,9 @@ async def main():
     # Speaker 管理 API (固定パスを {id} より先に登録)
     mgmt_app.router.add_get("/speakers/status", handle_speakers_status)
     mgmt_app.router.add_get("/speakers/list", handle_speakers_list)
+    mgmt_app.router.add_get("/speakers/list-detailed", handle_speakers_list_detailed)
     mgmt_app.router.add_post("/speakers/add", handle_speakers_add)
+    mgmt_app.router.add_put("/speakers/tag-correction", handle_speakers_tag_correction)
     mgmt_app.router.add_put("/speakers/threshold", handle_speakers_threshold)
     mgmt_app.router.add_post("/speakers/tag/start", handle_speakers_tag_start)
     mgmt_app.router.add_get("/speakers/tag/status", handle_speakers_tag_status)
