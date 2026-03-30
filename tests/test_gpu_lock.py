@@ -81,8 +81,8 @@ class TestDiarizerFreeVram:
             "synchronize() must be called before empty_cache()"
 
     def test_run_pipeline_cleans_up_before_return(self):
-        """_run_pipeline() should call _free_vram() after speaker assignment
-        to release intermediate VRAM before returning."""
+        """_run_pipeline() should call _free_vram() after diarization model release
+        and after speaker assignment to release intermediate VRAM."""
         from diarizer import Diarizer
 
         d = Diarizer(hf_token="dummy", device="cpu")
@@ -95,31 +95,40 @@ class TestDiarizerFreeVram:
 
         segments = [{"text": "hello", "start": 0.0, "end": 1.0}]
 
-        mock_whisperx = MagicMock()
-        mock_whisperx.load_audio.return_value = MagicMock(__len__=lambda self: 32000)  # 2s
-        mock_whisperx.load_align_model.return_value = (MagicMock(), MagicMock())
-        mock_whisperx.align.return_value = {"segments": [{"text": "hello", "start": 0.0, "end": 1.0}]}
-        mock_whisperx.assign_word_speakers.return_value = {
-            "segments": [{"text": "hello", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
-        }
+        # Mock torchaudio.load → return 2s waveform
+        mock_torchaudio = MagicMock()
+        mock_waveform = MagicMock()
+        mock_waveform.shape = [1, 32000]  # 2s at 16kHz
+        mock_torchaudio.load.return_value = (mock_waveform, 16000)
 
-        mock_diarize_pipeline = MagicMock()
-        mock_diarize_pipeline_instance = MagicMock()
-        mock_diarize_pipeline.return_value = mock_diarize_pipeline_instance
+        # Mock pyannote Pipeline
+        mock_annotation = MagicMock()
+        mock_annotation.itertracks.return_value = [
+            (MagicMock(start=0.0, end=1.0), None, "SPEAKER_00"),
+        ]
+
+        mock_pipeline_cls = MagicMock()
+        mock_pipeline_instance = MagicMock()
+        mock_pipeline_instance.return_value = mock_annotation
+        mock_pipeline_cls.from_pretrained.return_value = mock_pipeline_instance
+
+        mock_pyannote_audio = MagicMock(Pipeline=mock_pipeline_cls)
+
+        mock_torch = MagicMock()
 
         with patch.dict("sys.modules", {
-            "torch": MagicMock(),
-            "whisperx": mock_whisperx,
-            "whisperx.diarize": MagicMock(DiarizationPipeline=mock_diarize_pipeline),
+            "torch": mock_torch,
+            "torchaudio": mock_torchaudio,
+            "pyannote": MagicMock(),
+            "pyannote.audio": mock_pyannote_audio,
         }):
             result = d._run_pipeline("dummy.wav", segments, None, None)
 
-        # Should have 3 _free_vram calls:
-        # 1. After alignment model release
-        # 2. After diarization model release
-        # 3. After speaker assignment (new: cleanup before return)
-        assert len(free_vram_calls) >= 3, \
-            f"Expected at least 3 _free_vram() calls, got {len(free_vram_calls)}"
+        # Should have 2 _free_vram calls:
+        # 1. After diarization model release
+        # 2. After speaker assignment (cleanup before return)
+        assert len(free_vram_calls) >= 2, \
+            f"Expected at least 2 _free_vram() calls, got {len(free_vram_calls)}"
 
 
 # =====================================================================
@@ -203,6 +212,8 @@ class TestBatchDiarizeLock:
         mock_mm = MagicMock()
         mock_mm.gpu_lock = TrackingLock()
         mock_mm.force_unload = AsyncMock(return_value=True)
+        # Prevent per-session force_unload inside loop (loaded is False after initial unload)
+        mock_mm.loaded = False
 
         mock_diarizer = MagicMock()
         mock_diarizer.diarize.return_value = (
@@ -374,6 +385,8 @@ class TestBatchTagLock:
         mock_mm = MagicMock()
         mock_mm.gpu_lock = tracking_lock
         mock_mm.force_unload = AsyncMock(return_value=True)
+        # Prevent per-session force_unload inside loop (loaded is False after initial unload)
+        mock_mm.loaded = False
 
         mock_inference = MagicMock()
 
