@@ -53,6 +53,8 @@ class TestListSpeakersDetailed:
                             "duration": 2.0,
                             "embedding": [0.2] * 256,
                             "source": "correction",
+                            "audio_start": 10.5,
+                            "audio_end": 12.5,
                         },
                     ],
                 }
@@ -79,10 +81,13 @@ class TestListSpeakersDetailed:
             assert s1["id"] == "s_001"
             assert s1["duration"] == 5.5
             assert s1["source"] == "manual"  # default
+            assert "audio_start" not in s1  # legacy sample
 
             s2 = sp["samples"][1]
             assert s2["id"] == "s_002"
             assert s2["source"] == "correction"
+            assert s2["audio_start"] == 10.5
+            assert s2["audio_end"] == 12.5
 
     def test_no_embedding_speaker(self):
         with tempfile.TemporaryDirectory() as tmp:

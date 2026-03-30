@@ -2164,7 +2164,50 @@ async def main():
             return web.json_response(
                 {"error": "HF_AUTH_TOKEN not configured"}, status=503,
             )
-        return web.json_response(speaker_filter.list_speakers_detailed())
+        speakers = speaker_filter.list_speakers_detailed()
+
+        # Enrich legacy samples that lack audio_start/audio_end
+        for sp in speakers:
+            for sample in sp.get("samples", []):
+                if "audio_start" in sample:
+                    continue
+                source = sample.get("source_session", "")
+                # Strip " (correction)" suffix
+                source = source.replace(" (correction)", "").strip()
+                if not source or "/" not in source:
+                    continue
+                parts = source.split("/")
+                if len(parts) != 2:
+                    continue
+                transcript_path = Path(RECORDINGS_DIR) / parts[0] / parts[1] / "transcript.json"
+                try:
+                    with open(transcript_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    segments = data.get("segments", [])
+                    if not segments:
+                        continue
+                    # Try to find segment(s) matching the sample duration
+                    target_dur = sample.get("duration", 0)
+                    if target_dur > 0:
+                        # Single-segment: find best match by duration
+                        best, best_diff = None, float("inf")
+                        for seg in segments:
+                            seg_dur = seg.get("end", 0) - seg.get("start", 0)
+                            diff = abs(seg_dur - target_dur)
+                            if diff < best_diff:
+                                best_diff = diff
+                                best = seg
+                        if best and best_diff < 1.0:
+                            sample["audio_start"] = best["start"]
+                            sample["audio_end"] = best["end"]
+                            continue
+                    # Fallback: entire session
+                    sample["audio_start"] = segments[0].get("start", 0)
+                    sample["audio_end"] = segments[-1].get("end", 0)
+                except Exception:
+                    pass
+
+        return web.json_response(speakers)
 
     async def handle_speakers_tag_correction(request):
         if speaker_filter is None:

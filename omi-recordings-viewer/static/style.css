@@ -1005,6 +1005,24 @@ main {
     padding: 2px 6px;
 }
 
+.voice-sample-play {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    font-size: 0.7rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 0;
+}
+.voice-sample-play:hover { filter: brightness(1.2); }
+.voice-sample-play.playing { background: var(--danger); }
+
 .voice-threshold-row {
     display: flex;
     align-items: center;

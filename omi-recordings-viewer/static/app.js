@@ -1467,7 +1467,22 @@
                 var addedDate = sample.added_at ? sample.added_at.split("T")[0] : "?";
                 var src = sample.source_session || "-";
                 var srcLabel = sample.source === "correction" ? "correction" : src;
+                // Build audio URL from source_session
+                var sessionKey = (sample.source_session || "").replace(" (correction)", "").trim();
+                var hasAudio = sessionKey && sessionKey.indexOf("/") !== -1;
                 html += '<div class="voice-sample-row">';
+                if (hasAudio) {
+                    var parts = sessionKey.split("/");
+                    var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/audio.ogg";
+                    var timeHash = "";
+                    if (sample.audio_start != null && sample.audio_end != null) {
+                        timeHash = "#t=" + sample.audio_start.toFixed(1) + "," + sample.audio_end.toFixed(1);
+                    }
+                    html += '<button class="btn-sm voice-sample-play" data-url="' + escapeHtml(audioUrl) +
+                             '" data-start="' + (sample.audio_start != null ? sample.audio_start : "") +
+                             '" data-end="' + (sample.audio_end != null ? sample.audio_end : "") +
+                             '" title="Play sample">&#9654;</button>';
+                }
                 html += '<span>' + escapeHtml(srcLabel) + '</span>';
                 html += '<span>' + (sample.duration || 0).toFixed(1) + 's</span>';
                 html += '<span>' + escapeHtml(addedDate) + '</span>';
@@ -1477,6 +1492,14 @@
             });
             el.innerHTML = html;
             el.setAttribute("data-loaded", "1");
+
+            // Bind play buttons
+            var playBtns = el.querySelectorAll(".voice-sample-play");
+            for (var p = 0; p < playBtns.length; p++) {
+                playBtns[p].addEventListener("click", function () {
+                    playSampleAudio(this);
+                });
+            }
 
             // Bind delete buttons
             var delBtns = el.querySelectorAll(".voice-sample-del");
@@ -1495,6 +1518,70 @@
             bindShowSamplesLink(el);
         }).catch(function () {
             el.innerHTML = '<div class="text-dim">Failed to load samples</div>';
+        });
+    }
+
+    // Shared audio element for sample playback
+    var sampleAudio = null;
+    var activeSampleBtn = null;
+
+    function playSampleAudio(btn) {
+        var url = btn.getAttribute("data-url");
+        var startStr = btn.getAttribute("data-start");
+        var endStr = btn.getAttribute("data-end");
+
+        // If same button clicked while playing, stop
+        if (activeSampleBtn === btn && sampleAudio && !sampleAudio.paused) {
+            sampleAudio.pause();
+            sampleAudio = null;
+            btn.textContent = "\u25B6";
+            btn.classList.remove("playing");
+            activeSampleBtn = null;
+            return;
+        }
+
+        // Stop previous playback
+        if (sampleAudio) {
+            sampleAudio.pause();
+            if (activeSampleBtn) {
+                activeSampleBtn.textContent = "\u25B6";
+                activeSampleBtn.classList.remove("playing");
+            }
+        }
+
+        sampleAudio = new Audio(url);
+        activeSampleBtn = btn;
+        btn.textContent = "\u25A0";
+        btn.classList.add("playing");
+
+        var hasRange = startStr !== "" && endStr !== "";
+        if (hasRange) {
+            sampleAudio.currentTime = parseFloat(startStr);
+        }
+
+        sampleAudio.play().catch(function () {
+            btn.textContent = "\u25B6";
+            btn.classList.remove("playing");
+            activeSampleBtn = null;
+        });
+
+        if (hasRange) {
+            var endTime = parseFloat(endStr);
+            sampleAudio.addEventListener("timeupdate", function onTimeUpdate() {
+                if (sampleAudio.currentTime >= endTime) {
+                    sampleAudio.pause();
+                    sampleAudio.removeEventListener("timeupdate", onTimeUpdate);
+                    btn.textContent = "\u25B6";
+                    btn.classList.remove("playing");
+                    activeSampleBtn = null;
+                }
+            });
+        }
+
+        sampleAudio.addEventListener("ended", function () {
+            btn.textContent = "\u25B6";
+            btn.classList.remove("playing");
+            activeSampleBtn = null;
         });
     }
 

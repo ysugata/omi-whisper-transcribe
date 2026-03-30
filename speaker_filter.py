@@ -174,14 +174,18 @@ class SpeakerFilter:
         for s in self._data["speakers"]:
             samples_meta = []
             for sample in s.get("samples", []):
-                samples_meta.append({
+                meta = {
                     "id": sample.get("id"),
                     "added_at": sample.get("added_at"),
                     "source_session": sample.get("source_session", ""),
                     "segment_indices": sample.get("segment_indices", []),
                     "duration": sample.get("duration", 0),
                     "source": sample.get("source", "manual"),
-                })
+                }
+                if "audio_start" in sample:
+                    meta["audio_start"] = sample["audio_start"]
+                    meta["audio_end"] = sample["audio_end"]
+                samples_meta.append(meta)
             result.append({
                 "id": s["id"],
                 "name": s["name"],
@@ -241,12 +245,18 @@ class SpeakerFilter:
         if embedding is None:
             return None
 
+        # Compute audio time range from segments
+        audio_start = min(s.get("start", 0) for s in segments)
+        audio_end = max(s.get("end", 0) for s in segments)
+
         sample = {
             "id": "s_" + uuid.uuid4().hex[:6],
             "added_at": datetime.now().isoformat(),
             "source_session": session_name,
             "segment_indices": list(range(len(segments))),
             "duration": round(duration, 1),
+            "audio_start": round(audio_start, 2),
+            "audio_end": round(audio_end, 2),
             "embedding": embedding.tolist(),
         }
 
