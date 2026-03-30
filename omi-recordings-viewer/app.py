@@ -102,14 +102,25 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
     activity = request.query.get("activity", "").strip()
     mood = request.query.get("mood", "").strip()
     user_tag = request.query.get("user_tag", "").strip()
+    speaker = request.query.get("speaker", "").strip()
 
     try:
-        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood, user_tag=user_tag)
+        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood, user_tag=user_tag, speaker=speaker)
     except Exception as e:
         logger.exception("Failed to query sessions")
         return web.json_response({"error": str(e)}, status=500)
 
     return web.json_response(result)
+
+
+async def handle_api_speaker_names(request: web.Request) -> web.Response:
+    indexer: Indexer = request.app["indexer"]
+    try:
+        names = await indexer.get_speaker_names()
+    except Exception as e:
+        logger.exception("Failed to get speaker names")
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response(names)
 
 
 async def handle_api_session_detail(request: web.Request) -> web.Response:
@@ -409,12 +420,12 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                 audio_size_mb, model, language, transcript_text, segment_count,
                 tags_topics, tags_activity, tags_intent, tags_mood,
                 tags_quality, tags_entities, tags_summary, session_tagged,
-                tags_user, last_modified)
+                tags_user, speakers, last_modified)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
                        :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                       :tags_user, :last_modified)""",
+                       :tags_user, :speakers, :last_modified)""",
             info,
         )
         await indexer._db.commit()
@@ -626,6 +637,7 @@ def create_app() -> web.Application:
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/sessions", handle_api_sessions)
+    app.router.add_get("/api/speaker-names", handle_api_speaker_names)
     app.router.add_get("/api/sessions/{date}/{time}", handle_api_session_detail)
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)
 

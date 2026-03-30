@@ -896,6 +896,23 @@ main {
 .seg-filter-btn:hover { color: var(--text); border-color: var(--accent); }
 .seg-filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
+.seg-speaker-select {
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    cursor: pointer;
+    margin-left: auto;
+}
+
+.seg-speaker-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    color: var(--text);
+}
+
 /* Segment checkbox */
 .segment-checkbox {
     width: 16px;

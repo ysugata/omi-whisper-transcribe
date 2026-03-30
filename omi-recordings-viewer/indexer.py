@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_summary TEXT,
     session_tagged INTEGER DEFAULT 0,
     tags_user TEXT,
+    speakers TEXT,
     last_modified REAL DEFAULT 0,
     UNIQUE(date, time)
 );
@@ -54,6 +55,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_summary TEXT",
     "ALTER TABLE sessions ADD COLUMN session_tagged INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN tags_user TEXT",
+    "ALTER TABLE sessions ADD COLUMN speakers TEXT",
     "ALTER TABLE sessions ADD COLUMN last_modified REAL DEFAULT 0",
 ]
 
@@ -166,6 +168,14 @@ class Indexer:
         tags_entities = ",".join(tags.get("entities", [])) if tags.get("entities") else None
         tags_user = ",".join(tags.get("user_tags", [])) if tags.get("user_tags") else None
 
+        # Extract unique speaker names from segments
+        speaker_names = set()
+        for seg in segments:
+            pn = seg.get("person_name")
+            if pn and pn != "unknown":
+                speaker_names.add(pn)
+        speakers_csv = ",".join(sorted(speaker_names)) if speaker_names else None
+
         return {
             "date": date,
             "time": time,
@@ -186,6 +196,7 @@ class Indexer:
             "tags_summary": tags.get("summary"),
             "session_tagged": 1 if session.get("session_tagged") else 0,
             "tags_user": tags_user,
+            "speakers": speakers_csv,
         }
 
     async def sync(self) -> int:
@@ -233,12 +244,12 @@ class Indexer:
                     audio_size_mb, model, language, transcript_text, segment_count,
                     tags_topics, tags_activity, tags_intent, tags_mood,
                     tags_quality, tags_entities, tags_summary, session_tagged,
-                    tags_user, last_modified)
+                    tags_user, speakers, last_modified)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
                            :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                           :tags_user, :last_modified)""",
+                           :tags_user, :speakers, :last_modified)""",
                 info,
             )
             count += 1
@@ -255,6 +266,7 @@ class Indexer:
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
         activity: str = "", mood: str = "", user_tag: str = "",
+        speaker: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -279,6 +291,11 @@ class Indexer:
             params.append("%" + user_tag + "%")
             params.append(user_tag)
 
+        if speaker:
+            where_clauses.append("(speakers LIKE ? OR speakers = ?)")
+            params.append("%" + speaker + "%")
+            params.append(speaker)
+
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
         count_row = await self._db.execute_fetchall(
@@ -300,6 +317,20 @@ class Indexer:
             "per_page": per_page,
             "pages": (total + per_page - 1) // per_page if per_page else 0,
         }
+
+    async def get_speaker_names(self) -> list[str]:
+        """Return all unique speaker names from the speakers column."""
+        cursor = await self._db.execute(
+            "SELECT DISTINCT speakers FROM sessions WHERE speakers IS NOT NULL AND speakers != ''"
+        )
+        rows = await cursor.fetchall()
+        names = set()
+        for row in rows:
+            for name in row["speakers"].split(","):
+                name = name.strip()
+                if name:
+                    names.add(name)
+        return sorted(names)
 
     async def get_session(self, date: str, time: str):
         """Get a single session by date/time."""

@@ -30,6 +30,7 @@
     var currentDetailSegments = [];
     var speakersCache = [];
     var segmentFilter = "all";
+    var segmentSpeakerFilter = "";
 
     // User tags
     var userTagsCache = [];
@@ -67,6 +68,7 @@
     var filterActivity = document.getElementById("filter-activity");
     var filterMood = document.getElementById("filter-mood");
     var filterUserTag = document.getElementById("filter-user-tag");
+    var filterSpeaker = document.getElementById("filter-speaker");
 
     function fetchSessions(page, query) {
         var url = "/api/sessions?page=" + page + "&per_page=20";
@@ -74,6 +76,7 @@
         if (filterActivity && filterActivity.value) url += "&activity=" + encodeURIComponent(filterActivity.value);
         if (filterMood && filterMood.value) url += "&mood=" + encodeURIComponent(filterMood.value);
         if (filterUserTag && filterUserTag.value) url += "&user_tag=" + encodeURIComponent(filterUserTag.value);
+        if (filterSpeaker && filterSpeaker.value) url += "&speaker=" + encodeURIComponent(filterSpeaker.value);
         return fetch(url).then(function (r) { return r.json(); });
     }
 
@@ -255,10 +258,38 @@
 
         audioEl.addEventListener("timeupdate", onTimeUpdate);
 
+        // Reset segment speaker filter
+        segmentSpeakerFilter = "";
+
         // Always show voiceprint bar (users can create new speakers inline)
         var vpBar = document.getElementById("voiceprint-bar");
         var filterBar = document.getElementById("segment-filter-bar");
         var hasTagged = currentDetailSegments.some(function (seg) { return seg.person_id; });
+
+        // Populate segment speaker filter dropdown
+        var segSpkSelect = document.getElementById("segment-speaker-filter");
+        if (segSpkSelect) {
+            segSpkSelect.innerHTML = '<option value="">-- Speaker --</option>';
+            var spkNames = {};
+            currentDetailSegments.forEach(function (seg) {
+                if (seg.person_name && seg.person_name !== "unknown") {
+                    spkNames[seg.person_name] = true;
+                }
+            });
+            Object.keys(spkNames).sort().forEach(function (name) {
+                var opt = document.createElement("option");
+                opt.value = name;
+                opt.textContent = name;
+                segSpkSelect.appendChild(opt);
+            });
+            // Also add "unknown" option if any unknown segments exist
+            if (currentDetailSegments.some(function (seg) { return seg.person_id === "unknown"; })) {
+                var uOpt = document.createElement("option");
+                uOpt.value = "__unknown__";
+                uOpt.textContent = "unknown";
+                segSpkSelect.appendChild(uOpt);
+            }
+        }
         updateVoiceprintSpeakerSelect();
         // Reset new speaker form
         var newSp = document.getElementById("voiceprint-new-speaker");
@@ -285,6 +316,15 @@
             var isHidden = false;
             if (segmentFilter === "unknown-only" && !isUnknown && seg.person_id) isHidden = true;
             if (segmentFilter === "hide-unknown" && isUnknown) isHidden = true;
+
+            // Speaker name filter
+            if (segmentSpeakerFilter) {
+                if (segmentSpeakerFilter === "__unknown__") {
+                    if (seg.person_id !== "unknown") isHidden = true;
+                } else {
+                    if (seg.person_name !== segmentSpeakerFilter) isHidden = true;
+                }
+            }
 
             var cls = "segment";
             if (isUnknown) cls += " unknown-segment";
@@ -403,6 +443,7 @@
         segmentsContainer.innerHTML = "";
         document.getElementById("detail-user-tags").innerHTML = "";
         segmentFilter = "all";
+        segmentSpeakerFilter = "";
         modal.classList.remove("hidden");
 
         // Load speakers list, user tags, and session detail in parallel
@@ -440,6 +481,7 @@
     if (filterActivity) filterActivity.addEventListener("change", function () { loadPage(1); });
     if (filterMood) filterMood.addEventListener("change", function () { loadPage(1); });
     if (filterUserTag) filterUserTag.addEventListener("change", function () { loadPage(1); });
+    if (filterSpeaker) filterSpeaker.addEventListener("change", function () { loadPage(1); });
     modalClose.addEventListener("click", closeModal);
     modal.addEventListener("click", function (e) {
         if (e.target === modal) closeModal();
@@ -1446,6 +1488,30 @@
             for (var fj = 0; fj < filterBtns.length; fj++) filterBtns[fj].classList.remove("active");
             this.classList.add("active");
             segmentFilter = this.getAttribute("data-filter");
+            // Reset speaker filter when using button filter
+            segmentSpeakerFilter = "";
+            var segSpkSel = document.getElementById("segment-speaker-filter");
+            if (segSpkSel) segSpkSel.value = "";
+            renderSegments();
+        });
+    }
+
+    // Segment speaker filter
+    var segSpeakerFilter = document.getElementById("segment-speaker-filter");
+    if (segSpeakerFilter) {
+        segSpeakerFilter.addEventListener("change", function () {
+            segmentSpeakerFilter = this.value;
+            // Reset button filter to "all" when using speaker filter
+            if (segmentSpeakerFilter) {
+                segmentFilter = "all";
+                filterBtns = document.querySelectorAll(".seg-filter-btn");
+                for (var fk = 0; fk < filterBtns.length; fk++) {
+                    filterBtns[fk].classList.remove("active");
+                    if (filterBtns[fk].getAttribute("data-filter") === "all") {
+                        filterBtns[fk].classList.add("active");
+                    }
+                }
+            }
             renderSegments();
         });
     }
@@ -1627,10 +1693,28 @@
         });
     }
 
+    // --- Speaker names for session filter ---
+
+    function loadSpeakerNames() {
+        fetch("/api/speaker-names").then(function (r) { return r.json(); }).then(function (names) {
+            if (!filterSpeaker || !Array.isArray(names)) return;
+            var currentVal = filterSpeaker.value;
+            filterSpeaker.innerHTML = '<option value="">Speaker</option>';
+            names.forEach(function (name) {
+                var opt = document.createElement("option");
+                opt.value = name;
+                opt.textContent = name;
+                filterSpeaker.appendChild(opt);
+            });
+            filterSpeaker.value = currentVal;
+        }).catch(function () {});
+    }
+
     // --- Init ---
     loadUserTagsCache().then(function () {
         loadPage(1);
     });
+    loadSpeakerNames();
     checkBatchStatus("diarize");
     checkBatchStatus("tags");
     loadHotwordsStatus();
