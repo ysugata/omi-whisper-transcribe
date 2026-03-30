@@ -310,6 +310,33 @@ class SpeakerFilter:
             avg = avg / norm
         speaker["embedding"] = avg.tolist()
 
+    @staticmethod
+    def _vad_filter_audio(waveform_1d_np: np.ndarray, sr: int = 16000):
+        """Apply Silero VAD to extract speech-only regions from audio.
+
+        Args:
+            waveform_1d_np: 1-D float32 numpy array (mono).
+            sr: Sample rate.
+
+        Returns:
+            Filtered 1-D numpy array with only speech regions, or None if no speech found.
+        """
+        from faster_whisper.vad import get_speech_timestamps, VadOptions
+
+        vad_opts = VadOptions(
+            threshold=0.35,
+            min_speech_duration_ms=250,
+            speech_pad_ms=100,
+        )
+        timestamps = get_speech_timestamps(waveform_1d_np, vad_opts)
+        if not timestamps:
+            return None
+
+        chunks = []
+        for ts in timestamps:
+            chunks.append(waveform_1d_np[ts["start"]:ts["end"]])
+        return np.concatenate(chunks)
+
     def _extract_embedding(self, inference, audio_path: str, segments: list):
         """セグメントリストから embedding を抽出する。
 
@@ -343,11 +370,22 @@ class SpeakerFilter:
                 continue
 
             segment_audio = waveform[:, start_sample:end_sample]
+
+            # VAD filter: extract speech-only regions
+            segment_np = segment_audio.squeeze(0).numpy()
+            filtered = self._vad_filter_audio(segment_np, sr)
+            if filtered is None:
+                log.warning(
+                    f"VAD: no speech in segment [{start:.1f}-{end:.1f}s], skipping"
+                )
+                continue
+
+            filtered_waveform = torch.from_numpy(filtered).unsqueeze(0).float()
             total_duration += duration
 
             # pyannote Inference expects dict-like or file
             # We pass a dict with waveform and sample_rate
-            emb = inference({"waveform": segment_audio, "sample_rate": sr})
+            emb = inference({"waveform": filtered_waveform, "sample_rate": sr})
             embeddings.append(emb)
 
         if not embeddings:

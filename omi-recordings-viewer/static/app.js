@@ -1394,13 +1394,16 @@
             html += '</div>';
             html += '<div class="voice-samples-list" id="samples-' + escapeHtml(sp.id) + '">';
             if (sp.samples && sp.samples.length > 0) {
-                sp.samples.forEach(function (sample) {
+                var maxVisible = 3;
+                var hiddenCount = sp.samples.length > maxVisible ? sp.samples.length - maxVisible : 0;
+                sp.samples.forEach(function (sample, idx) {
                     var addedDate = sample.added_at ? sample.added_at.split("T")[0] : "?";
                     var src = sample.source_session || "-";
                     var srcLabel = sample.source === "correction" ? "correction" : src;
                     var sessionKey = (sample.source_session || "").replace(" (correction)", "").trim();
                     var hasAudio = sessionKey && sessionKey.indexOf("/") !== -1;
-                    html += '<div class="voice-sample-row">';
+                    var hidden = idx >= maxVisible;
+                    html += '<div class="voice-sample-row"' + (hidden ? ' style="display:none" data-hidden="1"' : '') + '>';
                     if (hasAudio) {
                         var parts = sessionKey.split("/");
                         var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/";
@@ -1416,6 +1419,9 @@
                              '" data-sample="' + escapeHtml(sample.id) + '">Del</button>';
                     html += '</div>';
                 });
+                if (hiddenCount > 0) {
+                    html += '<a href="#" class="voice-show-all" data-speaker="' + escapeHtml(sp.id) + '">+' + hiddenCount + ' more...</a>';
+                }
             } else {
                 html += '<div class="text-dim">No samples</div>';
             }
@@ -1461,6 +1467,23 @@
                 fetch("/api/speakers/" + sid + "/voiceprint/" + sampleId, { method: "DELETE" })
                     .then(function (r) { return r.json(); })
                     .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
+            });
+        }
+
+        // Bind "show all" links
+        var showAllLinks = voiceSpeakersListEl.querySelectorAll(".voice-show-all");
+        for (var sa = 0; sa < showAllLinks.length; sa++) {
+            showAllLinks[sa].addEventListener("click", function (e) {
+                e.preventDefault();
+                var spId = this.getAttribute("data-speaker");
+                var container = document.getElementById("samples-" + spId);
+                if (!container) return;
+                var hidden = container.querySelectorAll('[data-hidden="1"]');
+                for (var h = 0; h < hidden.length; h++) {
+                    hidden[h].style.display = "";
+                    hidden[h].removeAttribute("data-hidden");
+                }
+                this.remove();
             });
         }
     }

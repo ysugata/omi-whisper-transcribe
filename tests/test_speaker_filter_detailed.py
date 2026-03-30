@@ -1,7 +1,13 @@
-"""Tests for speaker_filter list_speakers_detailed()."""
+"""Tests for speaker_filter list_speakers_detailed() and VAD filtering."""
 import json
 import os
+import sys
 import tempfile
+import types
+from unittest import mock
+
+import numpy as np
+import pytest
 
 from speaker_filter import SpeakerFilter
 
@@ -107,3 +113,47 @@ class TestListSpeakersDetailed:
             assert len(result) == 1
             assert result[0]["has_embedding"] is False
             assert result[0]["samples"] == []
+
+
+class TestVadFilterAudio:
+    @pytest.fixture(autouse=True)
+    def _stub_faster_whisper(self):
+        """Ensure faster_whisper.vad stub exists in sys.modules."""
+        fw = sys.modules.get("faster_whisper")
+        fw_vad = sys.modules.get("faster_whisper.vad")
+        if fw is None:
+            fw = types.ModuleType("faster_whisper")
+            sys.modules["faster_whisper"] = fw
+        if fw_vad is None:
+            fw_vad = types.ModuleType("faster_whisper.vad")
+            sys.modules["faster_whisper.vad"] = fw_vad
+            fw.vad = fw_vad
+        self._mock_get_ts = mock.MagicMock()
+        self._mock_vad_opts = mock.MagicMock()
+        fw_vad.get_speech_timestamps = self._mock_get_ts
+        fw_vad.VadOptions = self._mock_vad_opts
+
+    def test_speech_regions_concatenated(self):
+        """VAD returns speech timestamps → only those regions are kept."""
+        audio = np.zeros(16000 * 3, dtype=np.float32)  # 3 seconds
+        timestamps = [
+            {"start": 0, "end": 8000},
+            {"start": 12000, "end": 16000},
+        ]
+        self._mock_get_ts.return_value = timestamps
+
+        result = SpeakerFilter._vad_filter_audio(audio, sr=16000)
+
+        self._mock_get_ts.assert_called_once()
+        assert result is not None
+        # 8000 + 4000 = 12000 samples
+        assert len(result) == 12000
+
+    def test_no_speech_returns_none(self):
+        """VAD finds no speech → returns None."""
+        audio = np.zeros(16000, dtype=np.float32)
+        self._mock_get_ts.return_value = []
+
+        result = SpeakerFilter._vad_filter_audio(audio, sr=16000)
+
+        assert result is None
