@@ -1403,7 +1403,7 @@
                     html += '<div class="voice-sample-row">';
                     if (hasAudio) {
                         var parts = sessionKey.split("/");
-                        var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/audio.ogg";
+                        var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/";
                         html += '<button class="btn-sm voice-sample-play" data-url="' + escapeHtml(audioUrl) +
                                  '" data-start="' + (sample.audio_start != null ? sample.audio_start : "") +
                                  '" data-end="' + (sample.audio_end != null ? sample.audio_end : "") +

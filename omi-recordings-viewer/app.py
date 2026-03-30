@@ -153,6 +153,21 @@ async def handle_audio(request: web.Request) -> web.FileResponse:
     return web.FileResponse(audio_path, headers={"Content-Type": mime})
 
 
+async def handle_audio_auto(request: web.Request) -> web.FileResponse:
+    """Auto-detect audio file (ogg preferred, wav fallback)."""
+    date = request.match_info["date"]
+    time = request.match_info["time"]
+
+    session_dir = Path(RECORDINGS_DIR) / date / time
+    for name in ("audio.ogg", "audio.wav"):
+        audio_path = session_dir / name
+        if audio_path.exists():
+            mime = _AUDIO_MIME.get(audio_path.suffix, "application/octet-stream")
+            return web.FileResponse(audio_path, headers={"Content-Type": mime})
+
+    raise web.HTTPNotFound(text="audio not found")
+
+
 # ============================================================
 # 設定 API: 用語補正辞書
 # ============================================================
@@ -647,6 +662,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/sessions", handle_api_sessions)
     app.router.add_get("/api/speaker-names", handle_api_speaker_names)
     app.router.add_get("/api/sessions/{date}/{time}", handle_api_session_detail)
+    app.router.add_get("/audio/{date}/{time}/", handle_audio_auto)
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)
 
     # 設定 API
