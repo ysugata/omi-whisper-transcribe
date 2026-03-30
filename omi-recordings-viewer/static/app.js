@@ -1358,7 +1358,7 @@
     }
 
     function loadVoiceSpeakers() {
-        fetch("/api/speakers/list").then(function (r) {
+        fetch("/api/speakers/list-detailed").then(function (r) {
             if (!r.ok) return [];
             return r.json();
         }).then(function (data) {
@@ -1393,7 +1393,32 @@
             html += '<button class="btn-danger voice-speaker-del" data-id="' + escapeHtml(sp.id) + '">Del</button>';
             html += '</div>';
             html += '<div class="voice-samples-list" id="samples-' + escapeHtml(sp.id) + '">';
-            html += '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(sp.id) + '">Show samples</a>';
+            if (sp.samples && sp.samples.length > 0) {
+                sp.samples.forEach(function (sample) {
+                    var addedDate = sample.added_at ? sample.added_at.split("T")[0] : "?";
+                    var src = sample.source_session || "-";
+                    var srcLabel = sample.source === "correction" ? "correction" : src;
+                    var sessionKey = (sample.source_session || "").replace(" (correction)", "").trim();
+                    var hasAudio = sessionKey && sessionKey.indexOf("/") !== -1;
+                    html += '<div class="voice-sample-row">';
+                    if (hasAudio) {
+                        var parts = sessionKey.split("/");
+                        var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/audio.ogg";
+                        html += '<button class="btn-sm voice-sample-play" data-url="' + escapeHtml(audioUrl) +
+                                 '" data-start="' + (sample.audio_start != null ? sample.audio_start : "") +
+                                 '" data-end="' + (sample.audio_end != null ? sample.audio_end : "") +
+                                 '" title="Play sample">&#9654;</button>';
+                    }
+                    html += '<span>' + escapeHtml(srcLabel) + '</span>';
+                    html += '<span>' + (sample.duration || 0).toFixed(1) + 's</span>';
+                    html += '<span>' + escapeHtml(addedDate) + '</span>';
+                    html += '<button class="btn-danger voice-sample-del" data-speaker="' + escapeHtml(sp.id) +
+                             '" data-sample="' + escapeHtml(sample.id) + '">Del</button>';
+                    html += '</div>';
+                });
+            } else {
+                html += '<div class="text-dim">No samples</div>';
+            }
             html += '</div>';
             html += '</div>';
         });
@@ -1418,11 +1443,24 @@
             });
         }
 
-        var showLinks = voiceSpeakersListEl.querySelectorAll(".voice-show-samples");
-        for (var k = 0; k < showLinks.length; k++) {
-            showLinks[k].addEventListener("click", function (e) {
-                e.preventDefault();
-                loadSpeakerSamples(this.getAttribute("data-id"));
+        // Bind sample play buttons
+        var playBtns = voiceSpeakersListEl.querySelectorAll(".voice-sample-play");
+        for (var p = 0; p < playBtns.length; p++) {
+            playBtns[p].addEventListener("click", function () {
+                playSampleInline(this);
+            });
+        }
+
+        // Bind sample delete buttons
+        var sampleDelBtns = voiceSpeakersListEl.querySelectorAll(".voice-sample-del");
+        for (var sd = 0; sd < sampleDelBtns.length; sd++) {
+            sampleDelBtns[sd].addEventListener("click", function () {
+                var sid = this.getAttribute("data-speaker");
+                var sampleId = this.getAttribute("data-sample");
+                if (!confirm("Delete this voiceprint sample?")) return;
+                fetch("/api/speakers/" + sid + "/voiceprint/" + sampleId, { method: "DELETE" })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
             });
         }
     }
@@ -1440,159 +1478,83 @@
           .then(function () { loadVoiceSpeakers(); });
     }
 
-    function loadSpeakerSamples(speakerId) {
-        var el = document.getElementById("samples-" + speakerId);
-        if (!el) return;
-
-        // Toggle: if already loaded, hide
-        if (el.getAttribute("data-loaded") === "1") {
-            el.innerHTML = '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(speakerId) + '">Show samples</a>';
-            el.removeAttribute("data-loaded");
-            bindShowSamplesLink(el);
-            return;
-        }
-
-        el.innerHTML = '<div class="text-dim">Loading...</div>';
-        fetch("/api/speakers/list-detailed").then(function (r) {
-            if (!r.ok) throw new Error("Failed");
-            return r.json();
-        }).then(function (speakers) {
-            var sp = speakers.find(function (s) { return s.id === speakerId; });
-            if (!sp || !sp.samples || sp.samples.length === 0) {
-                el.innerHTML = '<div class="text-dim">No samples</div>';
-                return;
-            }
-            var html = '<a href="#" class="text-dim voice-show-samples" data-id="' + escapeHtml(speakerId) + '">Hide samples</a>';
-            sp.samples.forEach(function (sample) {
-                var addedDate = sample.added_at ? sample.added_at.split("T")[0] : "?";
-                var src = sample.source_session || "-";
-                var srcLabel = sample.source === "correction" ? "correction" : src;
-                // Build audio URL from source_session
-                var sessionKey = (sample.source_session || "").replace(" (correction)", "").trim();
-                var hasAudio = sessionKey && sessionKey.indexOf("/") !== -1;
-                html += '<div class="voice-sample-row">';
-                if (hasAudio) {
-                    var parts = sessionKey.split("/");
-                    var audioUrl = "/audio/" + encodeURIComponent(parts[0]) + "/" + encodeURIComponent(parts[1]) + "/audio.ogg";
-                    var timeHash = "";
-                    if (sample.audio_start != null && sample.audio_end != null) {
-                        timeHash = "#t=" + sample.audio_start.toFixed(1) + "," + sample.audio_end.toFixed(1);
-                    }
-                    html += '<button class="btn-sm voice-sample-play" data-url="' + escapeHtml(audioUrl) +
-                             '" data-start="' + (sample.audio_start != null ? sample.audio_start : "") +
-                             '" data-end="' + (sample.audio_end != null ? sample.audio_end : "") +
-                             '" title="Play sample">&#9654;</button>';
-                }
-                html += '<span>' + escapeHtml(srcLabel) + '</span>';
-                html += '<span>' + (sample.duration || 0).toFixed(1) + 's</span>';
-                html += '<span>' + escapeHtml(addedDate) + '</span>';
-                html += '<button class="btn-danger voice-sample-del" data-speaker="' + escapeHtml(speakerId) +
-                         '" data-sample="' + escapeHtml(sample.id) + '">Del</button>';
-                html += '</div>';
-            });
-            el.innerHTML = html;
-            el.setAttribute("data-loaded", "1");
-
-            // Bind play buttons
-            var playBtns = el.querySelectorAll(".voice-sample-play");
-            for (var p = 0; p < playBtns.length; p++) {
-                playBtns[p].addEventListener("click", function () {
-                    playSampleAudio(this);
-                });
-            }
-
-            // Bind delete buttons
-            var delBtns = el.querySelectorAll(".voice-sample-del");
-            for (var i = 0; i < delBtns.length; i++) {
-                delBtns[i].addEventListener("click", function () {
-                    var sid = this.getAttribute("data-speaker");
-                    var sampleId = this.getAttribute("data-sample");
-                    if (!confirm("Delete this voiceprint sample?")) return;
-                    fetch("/api/speakers/" + sid + "/voiceprint/" + sampleId, { method: "DELETE" })
-                        .then(function (r) { return r.json(); })
-                        .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
-                });
-            }
-
-            // Bind toggle link
-            bindShowSamplesLink(el);
-        }).catch(function () {
-            el.innerHTML = '<div class="text-dim">Failed to load samples</div>';
-        });
-    }
-
-    // Shared audio element for sample playback
-    var sampleAudio = null;
-    var activeSampleBtn = null;
-
-    function playSampleAudio(btn) {
+    function playSampleInline(btn) {
         var url = btn.getAttribute("data-url");
         var startStr = btn.getAttribute("data-start");
         var endStr = btn.getAttribute("data-end");
+        var row = btn.closest(".voice-sample-row");
+        if (!row) return;
 
-        // If same button clicked while playing, stop
-        if (activeSampleBtn === btn && sampleAudio && !sampleAudio.paused) {
-            sampleAudio.pause();
-            sampleAudio = null;
+        // Check if this row already has a player (toggle off)
+        var existingPlayer = row.nextElementSibling;
+        if (existingPlayer && existingPlayer.classList.contains("sample-player")) {
+            var audio = existingPlayer.querySelector("audio");
+            if (audio) audio.pause();
+            existingPlayer.remove();
             btn.textContent = "\u25B6";
             btn.classList.remove("playing");
-            activeSampleBtn = null;
             return;
         }
 
-        // Stop previous playback
-        if (sampleAudio) {
-            sampleAudio.pause();
-            if (activeSampleBtn) {
-                activeSampleBtn.textContent = "\u25B6";
-                activeSampleBtn.classList.remove("playing");
-            }
+        // Remove any existing player elsewhere
+        var oldPlayers = voiceSpeakersListEl.querySelectorAll(".sample-player");
+        for (var i = 0; i < oldPlayers.length; i++) {
+            var oldAudio = oldPlayers[i].querySelector("audio");
+            if (oldAudio) oldAudio.pause();
+            oldPlayers[i].remove();
+        }
+        var oldBtns = voiceSpeakersListEl.querySelectorAll(".voice-sample-play.playing");
+        for (var j = 0; j < oldBtns.length; j++) {
+            oldBtns[j].textContent = "\u25B6";
+            oldBtns[j].classList.remove("playing");
         }
 
-        sampleAudio = new Audio(url);
-        activeSampleBtn = btn;
+        // Create player div
+        var playerDiv = document.createElement("div");
+        playerDiv.className = "sample-player";
+        var audioEl2 = document.createElement("audio");
+        audioEl2.controls = true;
+        audioEl2.preload = "metadata";
+        audioEl2.src = url;
+        playerDiv.appendChild(audioEl2);
+
+        // Insert after the row
+        row.parentNode.insertBefore(playerDiv, row.nextSibling);
         btn.textContent = "\u25A0";
         btn.classList.add("playing");
 
         var hasRange = startStr !== "" && endStr !== "";
-        if (hasRange) {
-            sampleAudio.currentTime = parseFloat(startStr);
-        }
 
-        sampleAudio.play().catch(function () {
-            btn.textContent = "\u25B6";
-            btn.classList.remove("playing");
-            activeSampleBtn = null;
+        audioEl2.addEventListener("loadedmetadata", function () {
+            if (hasRange) {
+                audioEl2.currentTime = parseFloat(startStr);
+            }
+            audioEl2.play().catch(function () {});
         });
 
         if (hasRange) {
             var endTime = parseFloat(endStr);
-            sampleAudio.addEventListener("timeupdate", function onTimeUpdate() {
-                if (sampleAudio.currentTime >= endTime) {
-                    sampleAudio.pause();
-                    sampleAudio.removeEventListener("timeupdate", onTimeUpdate);
-                    btn.textContent = "\u25B6";
-                    btn.classList.remove("playing");
-                    activeSampleBtn = null;
+            audioEl2.addEventListener("timeupdate", function () {
+                if (audioEl2.currentTime >= endTime) {
+                    audioEl2.pause();
                 }
             });
         }
 
-        sampleAudio.addEventListener("ended", function () {
+        audioEl2.addEventListener("ended", function () {
             btn.textContent = "\u25B6";
             btn.classList.remove("playing");
-            activeSampleBtn = null;
         });
-    }
 
-    function bindShowSamplesLink(container) {
-        var link = container.querySelector(".voice-show-samples");
-        if (link) {
-            link.addEventListener("click", function (e) {
-                e.preventDefault();
-                loadSpeakerSamples(this.getAttribute("data-id"));
-            });
-        }
+        audioEl2.addEventListener("pause", function () {
+            btn.textContent = "\u25B6";
+            btn.classList.remove("playing");
+        });
+
+        audioEl2.addEventListener("play", function () {
+            btn.textContent = "\u25A0";
+            btn.classList.add("playing");
+        });
     }
 
     voiceAddBtn.addEventListener("click", function () {

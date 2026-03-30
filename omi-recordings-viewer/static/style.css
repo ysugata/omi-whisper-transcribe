@@ -1021,7 +1021,15 @@ main {
     padding: 0;
 }
 .voice-sample-play:hover { filter: brightness(1.2); }
-.voice-sample-play.playing { background: var(--danger); }
+.voice-sample-play.playing { background: #c0392b; }
+
+.sample-player {
+    padding: 4px 0 4px 32px;
+}
+.sample-player audio {
+    width: 100%;
+    height: 32px;
+}
 
 .voice-threshold-row {
     display: flex;
