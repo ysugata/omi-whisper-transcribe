@@ -783,137 +783,201 @@
     // Batch Diarization
     // ============================================================
 
+    // ============================================================
+    // Unified Batch Progress Panel
+    // ============================================================
+
     var diarizeBtn = document.getElementById("diarize-btn");
-    var diarizePanel = document.getElementById("diarize-panel");
-    var diarizeStatusText = document.getElementById("diarize-status-text");
-    var diarizeProgressText = document.getElementById("diarize-progress-text");
-    var diarizeCancelBtn = document.getElementById("diarize-cancel-btn");
-    var diarizeProgressFill = document.getElementById("diarize-progress-fill");
-    var diarizeCurrent = document.getElementById("diarize-current");
-    var diarizeTimer = null;
+    var tagBtn = document.getElementById("tag-btn");
+    var batchPanel = document.getElementById("batch-panel");
+    var batchStatusText = document.getElementById("batch-status-text");
+    var batchProgressText = document.getElementById("batch-progress-text");
+    var batchCancelBtn = document.getElementById("batch-cancel-btn");
+    var batchProgressFill = document.getElementById("batch-progress-fill");
+    var batchCurrent = document.getElementById("batch-current");
+    var batchTimer = null;
+    var batchCancelTime = null;
+    var batchFadeTimer = null;
+    var activeBatchType = null; // "diarize" | "tags"
 
-    function checkDiarizeAvailability() {
-        fetch("/api/diarize/status").then(function (r) {
-            if (r.ok) {
-                diarizeBtn.classList.remove("hidden");
-                return r.json();
-            }
-            // 502/503 = bridge not available
-            diarizeBtn.classList.add("hidden");
-            return null;
-        }).then(function (state) {
-            if (state && state.running) {
-                showDiarizePanel(state);
-                startDiarizePolling();
-            }
-        }).catch(function () {
-            diarizeBtn.classList.add("hidden");
-        });
+    var batchApiMap = {
+        diarize: { start: "/api/diarize/start", status: "/api/diarize/status", cancel: "/api/diarize/cancel" },
+        tags:    { start: "/api/tags/start",    status: "/api/tags/status",    cancel: "/api/tags/cancel"    },
+    };
+
+    var batchLabels = {
+        diarize: { running: "話者分離中...", cancelling: "キャンセル中...", done: "話者分離完了" },
+        tags:    {
+            session_tag: "LLM タグ付け中...",
+            voice_tag: "声紋タグ付け中...",
+            cancelling: "キャンセル中...",
+            done: "タグ付け完了",
+        },
+    };
+
+    function showBatchPanel(type, state) {
+        activeBatchType = type;
+        batchPanel.classList.remove("hidden", "fade-out");
+        if (batchFadeTimer) { clearTimeout(batchFadeTimer); batchFadeTimer = null; }
+        updateBatchUI(type, state);
     }
 
-    function showDiarizePanel(state) {
-        diarizePanel.classList.remove("hidden");
-        updateDiarizeUI(state);
+    function hideBatchPanel() {
+        if (batchFadeTimer) return; // already scheduled
+        batchFadeTimer = setTimeout(function () {
+            batchPanel.classList.add("fade-out");
+            setTimeout(function () {
+                batchPanel.classList.add("hidden");
+                batchPanel.classList.remove("fade-out");
+                batchFadeTimer = null;
+                activeBatchType = null;
+            }, 500);
+        }, 5000);
     }
 
-    var diarizeCancelTime = null;
-
-    function updateDiarizeUI(state) {
+    function updateBatchUI(type, state) {
         var done = (state.processed || 0) + (state.failed || 0);
         var total = state.total || 0;
         var pct = total > 0 ? Math.round(done / total * 100) : 0;
 
-        diarizeProgressFill.style.width = pct + "%";
-        diarizeProgressText.textContent = done + " / " + total;
+        batchProgressFill.style.width = pct + "%";
+        batchProgressText.textContent = done + " / " + total;
 
         if (state.running) {
             if (state.cancel_requested) {
-                diarizeStatusText.textContent = "Cancelling...";
-                diarizeCancelBtn.style.display = "none";
-                // Auto-hide panel after 30s if cancel is stuck
-                if (diarizeCancelTime && Date.now() - diarizeCancelTime > 30000) {
-                    diarizeStatusText.textContent = "Cancelled (waiting for current session to finish)";
+                batchStatusText.textContent = (batchLabels[type] || {}).cancelling || "キャンセル中...";
+                batchCancelBtn.style.display = "none";
+                if (batchCancelTime && Date.now() - batchCancelTime > 30000) {
+                    batchStatusText.textContent = "キャンセル待ち (現在のセッション完了待ち)";
                 }
             } else {
-                diarizeStatusText.textContent = "Processing...";
-                diarizeCancelBtn.style.display = "";
+                // Phase-aware label for tags
+                if (type === "tags" && state.phase) {
+                    var phaseLabel = batchLabels.tags[state.phase] || "処理中...";
+                    // Show phase-specific progress
+                    if (state.phase === "session_tag") {
+                        var stDone = (state.session_tag_processed || 0) + (state.session_tag_failed || 0);
+                        batchStatusText.textContent = phaseLabel;
+                        batchProgressText.textContent = stDone + " / " + (state.session_tag_total || 0);
+                        pct = state.session_tag_total > 0 ? Math.round(stDone / state.session_tag_total * 100) : 0;
+                        batchProgressFill.style.width = pct + "%";
+                    } else if (state.phase === "voice_tag") {
+                        var vtDone = (state.voice_tag_processed || 0) + (state.voice_tag_failed || 0);
+                        batchStatusText.textContent = phaseLabel;
+                        batchProgressText.textContent = vtDone + " / " + (state.voice_tag_total || 0);
+                        pct = state.voice_tag_total > 0 ? Math.round(vtDone / state.voice_tag_total * 100) : 0;
+                        batchProgressFill.style.width = pct + "%";
+                    }
+                } else {
+                    batchStatusText.textContent = (batchLabels[type] || {}).running || "処理中...";
+                }
+                batchCancelBtn.style.display = "";
             }
-            if (state.current_session) {
-                diarizeCurrent.textContent = state.current_session;
-            } else {
-                diarizeCurrent.textContent = "";
-            }
+            batchCurrent.textContent = state.current_session || "";
         } else {
-            diarizeCancelBtn.style.display = "none";
-            diarizeCurrent.textContent = "";
-            diarizeCancelTime = null;
+            batchCancelBtn.style.display = "none";
+            batchCurrent.textContent = "";
+            batchCancelTime = null;
             if (state.finished_at) {
-                var msg = "Done: " + (state.processed || 0) + " processed";
-                if (state.failed > 0) msg += ", " + state.failed + " failed";
-                if (state.cancel_requested) msg += " (cancelled)";
-                diarizeStatusText.textContent = msg;
+                var label = (batchLabels[type] || {}).done || "完了";
+                var msg = label + ": " + (state.processed || 0) + " 件処理";
+                if (state.failed > 0) msg += ", " + state.failed + " 件失敗";
+                if (state.cancel_requested) msg += " (キャンセル)";
+                batchStatusText.textContent = msg;
             }
         }
     }
 
-    function startDiarizePolling() {
-        if (diarizeTimer) return;
-        diarizeTimer = setInterval(function () {
-            fetch("/api/diarize/status").then(function (r) { return r.json(); }).then(function (state) {
-                updateDiarizeUI(state);
+    function startBatchPolling(type) {
+        if (batchTimer) return;
+        var api = batchApiMap[type];
+        if (!api) return;
+        batchTimer = setInterval(function () {
+            fetch(api.status).then(function (r) { return r.json(); }).then(function (state) {
+                updateBatchUI(type, state);
                 if (!state.running) {
-                    clearInterval(diarizeTimer);
-                    diarizeTimer = null;
-                    // reload session list to reflect new diarization data
+                    clearInterval(batchTimer);
+                    batchTimer = null;
                     loadPage(currentPage);
+                    hideBatchPanel();
                 }
             }).catch(function () {
-                clearInterval(diarizeTimer);
-                diarizeTimer = null;
+                clearInterval(batchTimer);
+                batchTimer = null;
             });
         }, 2000);
     }
 
-    function startDiarizeRequest(force) {
+    function startBatch(type, force) {
+        var api = batchApiMap[type];
+        if (!api) return;
         var opts = { method: "POST" };
         if (force) {
             opts.headers = { "Content-Type": "application/json" };
             opts.body = JSON.stringify({ force: true });
         }
-        fetch("/api/diarize/start", opts).then(function (r) {
+        fetch(api.start, opts).then(function (r) {
             return r.json().then(function (data) {
                 if (r.ok) {
                     if (data.status === "no_sessions") {
-                        if (confirm("All sessions already diarized. Re-run on all sessions?")) {
-                            startDiarizeRequest(true);
+                        if (confirm("すべてのセッションは処理済みです。再実行しますか？")) {
+                            startBatch(type, true);
                         }
                         return;
                     }
-                    showDiarizePanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
-                    startDiarizePolling();
+                    showBatchPanel(type, { running: true, total: data.total || 0, processed: 0, failed: 0 });
+                    startBatchPolling(type);
                 } else if (r.status === 409) {
-                    alert("Already running");
+                    alert("既に実行中です");
                 } else if (r.status === 503) {
-                    alert("HF_AUTH_TOKEN is not configured");
+                    alert("必要な設定がありません: " + (data.error || ""));
                 } else {
-                    alert("Error: " + (data.error || r.status));
+                    alert("エラー: " + (data.error || r.status));
                 }
             });
         }).catch(function (e) {
-            alert("Failed to start: " + e.message);
+            alert("開始に失敗しました: " + e.message);
+        });
+    }
+
+    function checkBatchStatus(type) {
+        var api = batchApiMap[type];
+        if (!api) return;
+        fetch(api.status).then(function (r) {
+            if (r.ok) {
+                if (type === "diarize") diarizeBtn.classList.remove("hidden");
+                return r.json();
+            }
+            if (type === "diarize") diarizeBtn.classList.add("hidden");
+            return null;
+        }).then(function (state) {
+            if (state && state.running) {
+                showBatchPanel(type, state);
+                startBatchPolling(type);
+            }
+        }).catch(function () {
+            if (type === "diarize") diarizeBtn.classList.add("hidden");
         });
     }
 
     diarizeBtn.addEventListener("click", function () {
-        if (!confirm("Run speaker diarization on recordings?")) return;
-        startDiarizeRequest(false);
+        if (!confirm("話者分離を実行しますか？")) return;
+        startBatch("diarize", false);
     });
 
-    diarizeCancelBtn.addEventListener("click", function () {
-        diarizeCancelTime = Date.now();
-        diarizeCancelBtn.style.display = "none";
-        diarizeStatusText.textContent = "Cancelling...";
-        fetch("/api/diarize/cancel", { method: "POST" }).catch(function () {});
+    tagBtn.addEventListener("click", function () {
+        if (!confirm("タグ付け (LLM + 声紋) を実行しますか？")) return;
+        startBatch("tags", false);
+    });
+
+    batchCancelBtn.addEventListener("click", function () {
+        if (!activeBatchType) return;
+        var api = batchApiMap[activeBatchType];
+        if (!api) return;
+        batchCancelTime = Date.now();
+        batchCancelBtn.style.display = "none";
+        batchStatusText.textContent = "キャンセル中...";
+        fetch(api.cancel, { method: "POST" }).catch(function () {});
     });
 
     // ============================================================
@@ -1099,7 +1163,6 @@
     var voiceThresholdSlider = document.getElementById("voice-threshold");
     var voiceThresholdValue = document.getElementById("voice-threshold-value");
     var voiceThresholdSaveBtn = document.getElementById("voice-threshold-save");
-    var voiceTagBtn = document.getElementById("voice-tag-btn");
     var voiceDeleteAllBtn = document.getElementById("voice-delete-all-btn");
     var voiceStatus = document.getElementById("voice-status");
 
@@ -1259,125 +1322,7 @@
             .then(function () { loadVoiceSpeakers(); loadVoiceSettings(); });
     });
 
-    // ============================================================
-    // Batch Speaker Tagging
-    // ============================================================
-
-    var tagPanel = document.getElementById("tag-panel");
-    var tagStatusText = document.getElementById("tag-status-text");
-    var tagProgressText = document.getElementById("tag-progress-text");
-    var tagCancelBtn = document.getElementById("tag-cancel-btn");
-    var tagProgressFill = document.getElementById("tag-progress-fill");
-    var tagCurrent = document.getElementById("tag-current");
-    var tagTimer = null;
-    var tagCancelTime = null;
-
-    function showTagPanel(state) {
-        tagPanel.classList.remove("hidden");
-        updateTagUI(state);
-    }
-
-    function updateTagUI(state) {
-        var done = (state.processed || 0) + (state.failed || 0);
-        var total = state.total || 0;
-        var pct = total > 0 ? Math.round(done / total * 100) : 0;
-
-        tagProgressFill.style.width = pct + "%";
-        tagProgressText.textContent = done + " / " + total;
-
-        if (state.running) {
-            if (state.cancel_requested) {
-                tagStatusText.textContent = "Cancelling...";
-                tagCancelBtn.style.display = "none";
-                if (tagCancelTime && Date.now() - tagCancelTime > 30000) {
-                    tagStatusText.textContent = "Cancelled (waiting for current session to finish)";
-                }
-            } else {
-                tagStatusText.textContent = "Tagging...";
-                tagCancelBtn.style.display = "";
-            }
-            tagCurrent.textContent = state.current_session || "";
-        } else {
-            tagCancelBtn.style.display = "none";
-            tagCurrent.textContent = "";
-            tagCancelTime = null;
-            if (state.finished_at) {
-                var msg = "Done: " + (state.processed || 0) + " tagged";
-                if (state.failed > 0) msg += ", " + state.failed + " failed";
-                if (state.cancel_requested) msg += " (cancelled)";
-                tagStatusText.textContent = msg;
-            }
-        }
-    }
-
-    function startTagPolling() {
-        if (tagTimer) return;
-        tagTimer = setInterval(function () {
-            fetch("/api/speakers/tag/status").then(function (r) { return r.json(); }).then(function (state) {
-                updateTagUI(state);
-                if (!state.running) {
-                    clearInterval(tagTimer);
-                    tagTimer = null;
-                    loadPage(currentPage);
-                }
-            }).catch(function () {
-                clearInterval(tagTimer);
-                tagTimer = null;
-            });
-        }, 2000);
-    }
-
-    voiceTagBtn.addEventListener("click", function () {
-        if (!confirm("Run speaker tagging on all recordings?")) return;
-        var opts = { method: "POST" };
-        fetch("/api/speakers/tag/start", opts).then(function (r) {
-            return r.json().then(function (data) {
-                if (r.ok) {
-                    if (data.status === "no_sessions") {
-                        if (confirm("All sessions already tagged. Re-run on all?")) {
-                            fetch("/api/speakers/tag/start", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ force: true }),
-                            }).then(function (r2) { return r2.json(); }).then(function (d2) {
-                                showTagPanel({ running: true, total: d2.total || 0, processed: 0, failed: 0 });
-                                startTagPolling();
-                            });
-                        }
-                        return;
-                    }
-                    showTagPanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
-                    startTagPolling();
-                } else if (r.status === 409) {
-                    alert("Already running");
-                } else {
-                    alert("Error: " + (data.error || r.status));
-                }
-            });
-        }).catch(function (e) {
-            alert("Failed: " + e.message);
-        });
-    });
-
-    tagCancelBtn.addEventListener("click", function () {
-        tagCancelTime = Date.now();
-        tagCancelBtn.style.display = "none";
-        tagStatusText.textContent = "Cancelling...";
-        fetch("/api/speakers/tag/cancel", { method: "POST" }).catch(function () {});
-    });
-
-    // Check if tag batch is already running on load
-    function checkTagStatus() {
-        fetch("/api/speakers/tag/status").then(function (r) {
-            if (!r.ok) return null;
-            return r.json();
-        }).then(function (state) {
-            if (state && state.running) {
-                showTagPanel(state);
-                startTagPolling();
-            }
-        }).catch(function () {});
-    }
+    // (Batch Speaker Tagging - removed, integrated into unified batch panel)
 
     // ============================================================
     // Voiceprint add from session detail
@@ -1499,128 +1444,7 @@
         });
     }
 
-    // ============================================================
-    // Batch Session Tagging
-    // ============================================================
-
-    var sessionTagBtn = document.getElementById("session-tag-btn");
-    var sessionTagPanel = document.getElementById("session-tag-panel");
-    var sessionTagStatusText = document.getElementById("session-tag-status-text");
-    var sessionTagProgressText = document.getElementById("session-tag-progress-text");
-    var sessionTagCancelBtn = document.getElementById("session-tag-cancel-btn");
-    var sessionTagProgressFill = document.getElementById("session-tag-progress-fill");
-    var sessionTagCurrent = document.getElementById("session-tag-current");
-    var sessionTagTimer = null;
-    var sessionTagCancelTime = null;
-
-    function showSessionTagPanel(state) {
-        sessionTagPanel.classList.remove("hidden");
-        updateSessionTagUI(state);
-    }
-
-    function updateSessionTagUI(state) {
-        var done = (state.processed || 0) + (state.failed || 0);
-        var total = state.total || 0;
-        var pct = total > 0 ? Math.round(done / total * 100) : 0;
-
-        sessionTagProgressFill.style.width = pct + "%";
-        sessionTagProgressText.textContent = done + " / " + total;
-
-        if (state.running) {
-            if (state.cancel_requested) {
-                sessionTagStatusText.textContent = "Cancelling...";
-                sessionTagCancelBtn.style.display = "none";
-            } else {
-                sessionTagStatusText.textContent = "Tagging sessions...";
-                sessionTagCancelBtn.style.display = "";
-            }
-            sessionTagCurrent.textContent = state.current_session || "";
-        } else {
-            sessionTagCancelBtn.style.display = "none";
-            sessionTagCurrent.textContent = "";
-            sessionTagCancelTime = null;
-            if (state.finished_at) {
-                var msg = "Done: " + (state.processed || 0) + " tagged";
-                if (state.failed > 0) msg += ", " + state.failed + " failed";
-                if (state.cancel_requested) msg += " (cancelled)";
-                sessionTagStatusText.textContent = msg;
-            }
-        }
-    }
-
-    function startSessionTagPolling() {
-        if (sessionTagTimer) return;
-        sessionTagTimer = setInterval(function () {
-            fetch("/api/session-tags/status").then(function (r) { return r.json(); }).then(function (state) {
-                updateSessionTagUI(state);
-                if (!state.running) {
-                    clearInterval(sessionTagTimer);
-                    sessionTagTimer = null;
-                    loadPage(currentPage);
-                }
-            }).catch(function () {
-                clearInterval(sessionTagTimer);
-                sessionTagTimer = null;
-            });
-        }, 2000);
-    }
-
-    if (sessionTagBtn) {
-        sessionTagBtn.addEventListener("click", function () {
-            if (!confirm("Run LLM session tagging on recordings?")) return;
-            var opts = { method: "POST" };
-            fetch("/api/session-tags/start", opts).then(function (r) {
-                return r.json().then(function (data) {
-                    if (r.ok) {
-                        if (data.status === "no_sessions") {
-                            if (confirm("All sessions already tagged. Re-run on all sessions?")) {
-                                fetch("/api/session-tags/start", {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ force: true }),
-                                }).then(function (r2) { return r2.json(); }).then(function (d2) {
-                                    showSessionTagPanel({ running: true, total: d2.total || 0, processed: 0, failed: 0 });
-                                    startSessionTagPolling();
-                                });
-                            }
-                            return;
-                        }
-                        showSessionTagPanel({ running: true, total: data.total || 0, processed: 0, failed: 0 });
-                        startSessionTagPolling();
-                    } else if (r.status === 409) {
-                        alert("Already running");
-                    } else if (r.status === 503) {
-                        alert("Session tagging unavailable (no GEMINI_API_KEY)");
-                    } else {
-                        alert("Error: " + (data.error || r.status));
-                    }
-                });
-            }).catch(function (e) {
-                alert("Failed to start: " + e.message);
-            });
-        });
-    }
-
-    if (sessionTagCancelBtn) {
-        sessionTagCancelBtn.addEventListener("click", function () {
-            sessionTagCancelTime = Date.now();
-            sessionTagCancelBtn.style.display = "none";
-            sessionTagStatusText.textContent = "Cancelling...";
-            fetch("/api/session-tags/cancel", { method: "POST" }).catch(function () {});
-        });
-    }
-
-    function checkSessionTagStatus() {
-        fetch("/api/session-tags/status").then(function (r) {
-            if (!r.ok) return null;
-            return r.json();
-        }).then(function (state) {
-            if (state && state.running) {
-                showSessionTagPanel(state);
-                startSessionTagPolling();
-            }
-        }).catch(function () {});
-    }
+    // (Batch Session Tagging - removed, integrated into unified batch panel)
 
     // ============================================================
     // User Tags Management
@@ -1801,8 +1625,7 @@
     loadUserTagsCache().then(function () {
         loadPage(1);
     });
-    checkDiarizeAvailability();
+    checkBatchStatus("diarize");
+    checkBatchStatus("tags");
     loadHotwordsStatus();
-    checkTagStatus();
-    checkSessionTagStatus();
 })();

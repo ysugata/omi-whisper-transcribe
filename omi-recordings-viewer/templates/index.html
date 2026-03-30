@@ -38,22 +38,22 @@
         <select id="filter-user-tag" class="filter-select" title="Filter by user tag">
             <option value="">User Tag</option>
         </select>
-        <button id="diarize-btn" class="diarize-btn hidden" title="Batch Speaker Diarization">Diarize</button>
-        <button id="session-tag-btn" class="diarize-btn" title="Batch Session Tagging">Tag</button>
+        <button id="diarize-btn" class="diarize-btn hidden" title="Batch Speaker Diarization">話者分離</button>
+        <button id="tag-btn" class="diarize-btn" title="Batch Tagging (LLM + Voice)">タグ付け</button>
         <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
     </header>
 
     <main>
-        <div id="diarize-panel" class="diarize-panel hidden">
-            <div class="diarize-header">
-                <span id="diarize-status-text">Processing...</span>
-                <span id="diarize-progress-text">0 / 0</span>
-                <button id="diarize-cancel-btn" class="btn-sm btn-danger">Cancel</button>
+        <div id="batch-panel" class="batch-panel hidden">
+            <div class="batch-header">
+                <span id="batch-status-text">Processing...</span>
+                <span id="batch-progress-text">0 / 0</span>
+                <button id="batch-cancel-btn" class="btn-sm btn-danger">Cancel</button>
             </div>
             <div class="progress-bar">
-                <div id="diarize-progress-fill" class="progress-fill"></div>
+                <div id="batch-progress-fill" class="progress-fill"></div>
             </div>
-            <div id="diarize-current" class="text-dim"></div>
+            <div id="batch-current" class="text-dim"></div>
         </div>
 
         <div id="session-list" class="session-list">
@@ -63,31 +63,6 @@
         <div id="pagination" class="pagination"></div>
     </main>
 
-    <!-- Session tag progress panel -->
-    <div id="session-tag-panel" class="diarize-panel hidden">
-        <div class="diarize-header">
-            <span id="session-tag-status-text">Processing...</span>
-            <span id="session-tag-progress-text">0 / 0</span>
-            <button id="session-tag-cancel-btn" class="btn-sm btn-danger">Cancel</button>
-        </div>
-        <div class="progress-bar">
-            <div id="session-tag-progress-fill" class="progress-fill"></div>
-        </div>
-        <div id="session-tag-current" class="text-dim"></div>
-    </div>
-
-    <!-- Speaker tag progress panel -->
-    <div id="tag-panel" class="diarize-panel hidden">
-        <div class="diarize-header">
-            <span id="tag-status-text">Processing...</span>
-            <span id="tag-progress-text">0 / 0</span>
-            <button id="tag-cancel-btn" class="btn-sm btn-danger">Cancel</button>
-        </div>
-        <div class="progress-bar">
-            <div id="tag-progress-fill" class="progress-fill"></div>
-        </div>
-        <div id="tag-current" class="text-dim"></div>
-    </div>
 
     <!-- Session detail modal -->
     <div id="detail-modal" class="modal hidden">
@@ -209,7 +184,6 @@
                     <button id="voice-threshold-save" class="btn-sm">Save</button>
                 </div>
                 <div class="voice-actions">
-                    <button id="voice-tag-btn" class="btn-primary">Tag All Recordings</button>
                     <button id="voice-delete-all-btn" class="btn-danger">Delete All Speakers</button>
                 </div>
                 <span id="voice-status" class="save-status"></span>

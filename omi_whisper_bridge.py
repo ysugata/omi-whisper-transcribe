@@ -1393,6 +1393,185 @@ async def _batch_session_tag_task(force: bool = False):
 
 
 # ============================================================
+# 統合タグ付けバッチ (Session Tag → Voice Tag)
+# ============================================================
+
+_batch_combined_tag_state = {
+    "running": False,
+    "phase": None,            # "session_tag" | "voice_tag"
+    "total": 0,
+    "processed": 0,
+    "failed": 0,
+    "current_session": None,
+    "errors": [],
+    "cancel_requested": False,
+    "started_at": None,
+    "finished_at": None,
+    # Phase details
+    "session_tag_total": 0,
+    "session_tag_processed": 0,
+    "session_tag_failed": 0,
+    "voice_tag_total": 0,
+    "voice_tag_processed": 0,
+    "voice_tag_failed": 0,
+}
+
+
+async def _batch_combined_tag_task(force: bool = False):
+    """統合タグ付けバッチ: Session Tag → Voice Tag を順番に実行する。"""
+    import shutil
+
+    st = _batch_combined_tag_state
+    st["running"] = True
+    st["phase"] = None
+    st["processed"] = 0
+    st["failed"] = 0
+    st["current_session"] = None
+    st["errors"] = []
+    st["cancel_requested"] = False
+    st["started_at"] = datetime.now().isoformat()
+    st["finished_at"] = None
+    st["session_tag_total"] = 0
+    st["session_tag_processed"] = 0
+    st["session_tag_failed"] = 0
+    st["voice_tag_total"] = 0
+    st["voice_tag_processed"] = 0
+    st["voice_tag_failed"] = 0
+
+    try:
+        # --- Phase 1: Session Tag (LLM) ---
+        st["phase"] = "session_tag"
+        session_tag_sessions = _find_untagged_session_tag_sessions(force=force)
+        st["session_tag_total"] = len(session_tag_sessions)
+        st["total"] = len(session_tag_sessions)
+        log.info(f"Combined tag Phase 1 (session tag): {len(session_tag_sessions)} session(s) (force={force})")
+
+        if session_tag_sessions and session_tagger is not None:
+            loop = asyncio.get_running_loop()
+            for sess in session_tag_sessions:
+                if st["cancel_requested"]:
+                    log.info("Combined tag cancelled by user (session tag phase)")
+                    break
+
+                st["current_session"] = sess["path"]
+                try:
+                    segments = sess["data"].get("segments", [])
+                    tags = await loop.run_in_executor(
+                        None,
+                        lambda segs=segments: session_tagger.tag_session(segs),
+                    )
+
+                    if tags:
+                        bak_path = str(sess["transcript_path"]) + ".bak"
+                        shutil.copy2(sess["transcript_path"], bak_path)
+
+                        data = sess["data"]
+                        data["session"]["tags"] = tags
+                        data["session"]["session_tagged"] = True
+
+                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+
+                        st["session_tag_processed"] += 1
+                        st["processed"] += 1
+                    else:
+                        st["session_tag_failed"] += 1
+                        st["failed"] += 1
+                        st["errors"].append(f"{sess['path']}: tagger returned None")
+
+                except Exception as e:
+                    st["session_tag_failed"] += 1
+                    st["failed"] += 1
+                    err_msg = f"{sess['path']}: {e}"
+                    st["errors"].append(err_msg)
+                    log.error(f"Combined tag session-tag error: {err_msg}", exc_info=True)
+
+                await asyncio.sleep(0)
+
+        # --- Phase 2: Voice Tag (Speaker) ---
+        if st["cancel_requested"]:
+            return
+
+        st["phase"] = "voice_tag"
+        if speaker_filter is not None:
+            voice_sessions = _find_untagged_sessions(force=force)
+            st["voice_tag_total"] = len(voice_sessions)
+            st["total"] = st["session_tag_total"] + len(voice_sessions)
+            st["processed"] = st["session_tag_processed"] + st["session_tag_failed"]
+            st["failed"] = 0  # Reset failed count for combined progress
+            log.info(f"Combined tag Phase 2 (voice tag): {len(voice_sessions)} session(s) (force={force})")
+
+            if voice_sessions:
+                loop = asyncio.get_running_loop()
+
+                # Force-unload Whisper once before the batch
+                async with model_manager.gpu_lock:
+                    await model_manager.force_unload()
+
+                for sess in voice_sessions:
+                    if st["cancel_requested"]:
+                        log.info("Combined tag cancelled by user (voice tag phase)")
+                        break
+
+                    st["current_session"] = sess["path"]
+                    try:
+                        async with model_manager.gpu_lock:
+                            if model_manager.loaded:
+                                await model_manager.force_unload()
+                            inference = await loop.run_in_executor(
+                                None, speaker_filter._load_model
+                            )
+                            try:
+                                updated = await loop.run_in_executor(
+                                    None,
+                                    lambda s=sess: speaker_filter.tag_segments_with_model(
+                                        inference, str(s["audio"]), s["data"]["segments"]
+                                    ),
+                                )
+                            finally:
+                                await loop.run_in_executor(
+                                    None, lambda: speaker_filter._unload_model(inference)
+                                )
+
+                        bak_path = str(sess["transcript_path"]) + ".bak"
+                        shutil.copy2(sess["transcript_path"], bak_path)
+
+                        data = sess["data"]
+                        data["segments"] = updated
+                        data["session"]["speaker_tagged"] = True
+
+                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+
+                        st["voice_tag_processed"] += 1
+                        st["processed"] += 1
+
+                    except Exception as e:
+                        st["voice_tag_failed"] += 1
+                        st["failed"] += 1
+                        err_msg = f"{sess['path']}: {e}"
+                        st["errors"].append(err_msg)
+                        log.error(f"Combined tag voice-tag error: {err_msg}", exc_info=True)
+
+                    await asyncio.sleep(0)
+        else:
+            log.info("Combined tag Phase 2 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
+
+    except Exception as e:
+        log.error(f"Combined tag task error: {e}", exc_info=True)
+    finally:
+        st["running"] = False
+        st["current_session"] = None
+        st["finished_at"] = datetime.now().isoformat()
+        log.info(
+            f"Combined tag finished: "
+            f"session_tag={st['session_tag_processed']}/{st['session_tag_total']}, "
+            f"voice_tag={st['voice_tag_processed']}/{st['voice_tag_total']}, "
+            f"failed={st['session_tag_failed'] + st['voice_tag_failed']}"
+        )
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -2184,6 +2363,50 @@ async def main():
             _batch_session_tag_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
+    # --- Combined Tag バッチ API (Session Tag → Voice Tag) ---
+
+    async def handle_combined_tag_start(request):
+        if _batch_combined_tag_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409,
+            )
+        # At least one tagger must be available
+        if session_tagger is None and speaker_filter is None:
+            return web.json_response(
+                {"error": "No tagger available (need GEMINI_API_KEY or HF_AUTH_TOKEN)"}, status=503,
+            )
+
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+
+        # Check if there's anything to do
+        st_sessions = _find_untagged_session_tag_sessions(force=force) if session_tagger else []
+        vt_sessions = _find_untagged_sessions(force=force) if speaker_filter else []
+
+        if not st_sessions and not vt_sessions and not force:
+            return web.json_response({
+                "status": "no_sessions",
+                "message": "All sessions already tagged",
+            })
+
+        asyncio.create_task(_batch_combined_tag_task(force=force))
+        return web.json_response({
+            "status": "started",
+            "total": len(st_sessions) + len(vt_sessions),
+        })
+
+    async def handle_combined_tag_status(request):
+        return web.json_response(_batch_combined_tag_state)
+
+    async def handle_combined_tag_cancel(request):
+        if _batch_combined_tag_state["running"]:
+            _batch_combined_tag_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -2215,6 +2438,10 @@ async def main():
     mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
     mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)
     mgmt_app.router.add_post("/session-tags/cancel", handle_session_tag_cancel)
+    # Combined tag batch API (Session Tag → Voice Tag)
+    mgmt_app.router.add_post("/tags/start", handle_combined_tag_start)
+    mgmt_app.router.add_get("/tags/status", handle_combined_tag_status)
+    mgmt_app.router.add_post("/tags/cancel", handle_combined_tag_cancel)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()

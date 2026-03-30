@@ -582,6 +582,22 @@ async def handle_session_tag_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Combined Tag プロキシ API (Session Tag → Voice Tag)
+# ============================================================
+
+async def handle_combined_tag_start(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/tags/start")
+
+
+async def handle_combined_tag_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/tags/status")
+
+
+async def handle_combined_tag_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/tags/cancel")
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -668,6 +684,11 @@ def create_app() -> web.Application:
     app.router.add_post("/api/session-tags/start", handle_session_tag_start)
     app.router.add_get("/api/session-tags/status", handle_session_tag_status)
     app.router.add_post("/api/session-tags/cancel", handle_session_tag_cancel)
+
+    # Combined tag プロキシ API (Session Tag → Voice Tag)
+    app.router.add_post("/api/tags/start", handle_combined_tag_start)
+    app.router.add_get("/api/tags/status", handle_combined_tag_status)
+    app.router.add_post("/api/tags/cancel", handle_combined_tag_cancel)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

@@ -320,30 +320,35 @@ main {
     border-color: var(--accent);
 }
 
-/* Diarize progress panel */
-.diarize-panel {
+/* Batch progress panel */
+.batch-panel {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
     margin-bottom: 12px;
+    transition: opacity 0.5s ease;
 }
 
-.diarize-panel.hidden { display: none; }
+.batch-panel.hidden { display: none; }
 
-.diarize-header {
+.batch-panel.fade-out {
+    opacity: 0;
+}
+
+.batch-header {
     display: flex;
     align-items: center;
     gap: 12px;
     margin-bottom: 8px;
 }
 
-.diarize-header #diarize-status-text {
+.batch-header #batch-status-text {
     font-weight: 500;
     font-size: 0.9rem;
 }
 
-.diarize-header #diarize-progress-text {
+.batch-header #batch-progress-text {
     font-size: 0.85rem;
     color: var(--text-dim);
     margin-left: auto;
