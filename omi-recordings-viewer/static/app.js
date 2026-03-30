@@ -892,8 +892,10 @@
         if (batchTimer) return;
         var api = batchApiMap[type];
         if (!api) return;
+        var errorCount = 0;
         batchTimer = setInterval(function () {
             fetch(api.status).then(function (r) { return r.json(); }).then(function (state) {
+                errorCount = 0;
                 updateBatchUI(type, state);
                 if (!state.running) {
                     clearInterval(batchTimer);
@@ -902,8 +904,12 @@
                     hideBatchPanel();
                 }
             }).catch(function () {
-                clearInterval(batchTimer);
-                batchTimer = null;
+                errorCount++;
+                // Only stop polling after 15 consecutive failures (30s)
+                if (errorCount >= 15) {
+                    clearInterval(batchTimer);
+                    batchTimer = null;
+                }
             });
         }, 2000);
     }
