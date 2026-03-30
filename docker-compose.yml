@@ -72,7 +72,7 @@ services:
     volumes:
       - ./recordings:/app/recordings
       - ./config:/app/config
-      - viewer-data:/app/data
+      - ./data:/app/data
     environment:
       - RECORDINGS_DIR=/app/recordings
       - CONFIG_DIR=/app/config
@@ -82,4 +82,3 @@ services:
 
 volumes:
   whisper-models:
-  viewer-data:
