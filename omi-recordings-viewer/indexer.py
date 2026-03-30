@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at DESC);
+"""
+
+# Indexes on columns that may be added by migration — must run AFTER migration
+POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(tags_activity);
 CREATE INDEX IF NOT EXISTS idx_sessions_mood ON sessions(tags_mood);
 CREATE INDEX IF NOT EXISTS idx_sessions_speakers ON sessions(speakers);
@@ -102,6 +106,8 @@ class Indexer:
         await self._db.executescript(FTS_TRIGGERS)
         # Migrate: add tag columns if missing
         await self._migrate_tags()
+        # Create indexes on migrated columns (must be after migration)
+        await self._db.executescript(POST_MIGRATION_INDEXES)
         await self._db.commit()
 
     async def _migrate_tags(self):
