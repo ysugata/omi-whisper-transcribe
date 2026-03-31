@@ -33,6 +33,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
+| トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
 ## 必要環境
@@ -338,6 +339,8 @@ Gemini API を使い、文字起こし結果の用語修正と新規用語の提
 
 Gemini API でセッション終了時に自動でメタデータタグを付与:
 
+#### 基本フィールド
+
 | フィールド | 型 | 内容 |
 |-----------|-----|------|
 | `topics` | リスト | 会話の主要トピック |
@@ -347,6 +350,21 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 | `quality` | enum | 文字起こし品質 (clear, noisy, mixed) |
 | `entities` | リスト | 言及された固有名詞 |
 | `summary` | テキスト | 日本語の要約 (1〜2文) |
+
+#### 事業継承 AI 用フィールド
+
+| フィールド | 型 | 内容 |
+|-----------|-----|------|
+| `source_type` | enum | 会話形式 (meeting, monologue, discussion, phone_call, negotiation 等) |
+| `business_domain` | enum | 事業領域 (sales, technology, finance, management, product_planning 等) |
+| `importance` | enum | 重要度 (high, medium, low) |
+| `confidentiality` | enum | 機密レベル (public, internal, confidential) |
+| `decision_required` | bool | 意思決定が行われたか |
+| `decision_summary` | テキスト | 何が決まったか (50 文字以内) |
+| `reasoning_summary` | テキスト | なぜそう決めたか (50 文字以内) |
+| `action_items` | リスト | 次のステップ (最大 5 件) |
+| `outcome` | enum/null | 結果 (pending, completed, cancelled, deferred) |
+| `next_action` | テキスト | 次にやること (50 文字以内) |
 
 - `TAGGING_ENABLED=true` でリアルタイム自動タグ付け
 - Viewer の「Tag」ボタンからバッチ実行も可能
@@ -376,8 +394,59 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 - 話者バッジ表示 (緑=自分、青=登録話者、グレー=unknown)
 - セグメント選択による声紋登録 (新規話者のインライン作成対応)
 - バッチ処理パネル (話者分離・話者タグ付け・セッションタグ付け)
+- トレーニングデータエクスポート (6 フォーマット、フィルタ、ストリーミングダウンロード)
 - 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット、Hotwords、Voice、Tags)
 - 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
+
+## トレーニングデータエクスポート
+
+Viewer の **Export** タブまたは API からセッションデータを JSONL 形式でエクスポートできます。事業継承 AI のファインチューニングデータ生成を想定しています。
+
+### フォーマット
+
+| フォーマット | 用途 | 出力内容 |
+|---|---|---|
+| **OpenAI Fine-tuning** | GPT ファインチューニング | `messages` 形式 (system/user/assistant) |
+| **ShareGPT / LLaMA-Factory** | オープンモデルのファインチューニング | `conversations` 形式 (human/gpt) |
+| **Comprehensive** | 全メタデータ付き生データ | session + tags + turns |
+| **Knowledge Base** | ナレッジ蓄積 | title, body, category, importance |
+| **Decision Log** | 意思決定記録 | decision, reason, action_items, outcome |
+| **SOP** | 手順書 / TODO 抽出 | steps, context, domain |
+
+- OpenAI / ShareGPT 形式では**独白セッションをデフォルトで除外** (Include Monologue チェックで変更可)
+- Knowledge は `summary` のあるセッションのみ出力
+- Decision Log は `decision_required=true` のセッションのみ出力
+- SOP は `action_items` があり `casual_chat` でないセッションのみ出力
+
+### フィルタ
+
+| パラメータ | 説明 | デフォルト |
+|---|---|---|
+| `date_from` / `date_to` | 日付範囲 | 全期間 |
+| `quality` | 文字起こし品質 (カンマ区切り) | 全て |
+| `business_domain` | 事業領域で絞り込み | 全て |
+| `speaker_mode` | `conversation` (全員) / `user_only` (自分のみ) | conversation |
+| `min_segments` | 最小セグメント数 | 3 |
+| `include_monologue` | 独白セッションを含めるか | フォーマットによる |
+
+### API
+
+```bash
+# プレビュー (件数・サイズ推定)
+curl "http://localhost:8092/api/export/stats?format=knowledge&business_domain=technology"
+
+# ダウンロード
+curl -o knowledge.jsonl \
+  "http://localhost:8092/api/export/training?format=knowledge&min_segments=1"
+
+# 意思決定ログのみ
+curl -o decisions.jsonl \
+  "http://localhost:8092/api/export/training?format=decision_log&min_segments=1"
+
+# SOP (手順書)
+curl -o sop.jsonl \
+  "http://localhost:8092/api/export/training?format=sop&min_segments=1"
+```
 
 ## 録音データ
 
@@ -433,6 +502,7 @@ omi_whisper_transcribe/
 ├── omi-recordings-viewer/    # Viewer Web アプリ
 │   ├── app.py                # aiohttp サーバー + API
 │   ├── indexer.py            # SQLite インデックス管理
+│   ├── exporter.py           # トレーニングデータエクスポート (6 フォーマット)
 │   ├── templates/            # Jinja2 テンプレート
 │   └── static/               # JS + CSS
 ├── Dockerfile                # Bridge コンテナ
