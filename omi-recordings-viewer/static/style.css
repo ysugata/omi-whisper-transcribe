@@ -1374,3 +1374,93 @@ main {
     margin-top: 4px;
     line-height: 1.5;
 }
+
+/* Export tab */
+.export-form {
+    margin-bottom: 16px;
+}
+
+.export-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.export-row > label {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    min-width: 100px;
+    flex-shrink: 0;
+}
+
+.export-row select,
+.export-row input[type="number"] {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+.export-row select:focus,
+.export-row input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.export-date-range {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.export-date-range input[type="date"] {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.85rem;
+}
+
+.export-date-range input[type="date"]:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.export-date-range span {
+    color: var(--text-dim);
+}
+
+.export-checkboxes {
+    display: flex;
+    gap: 16px;
+}
+
+.export-preview {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 0.85rem;
+    line-height: 1.6;
+}
+
+.export-preview.hidden { display: none; }
+
+.export-preview-line {
+    color: var(--text-dim);
+}
+
+.export-preview-line strong {
+    color: var(--text);
+}
+
+.export-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}

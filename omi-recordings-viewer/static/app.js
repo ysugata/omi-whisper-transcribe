@@ -1963,6 +1963,81 @@
         }).catch(function () {});
     }
 
+    // ============================================================
+    // Export tab
+    // ============================================================
+
+    var exportFormatEl = document.getElementById("export-format");
+    var exportDateFrom = document.getElementById("export-date-from");
+    var exportDateTo = document.getElementById("export-date-to");
+    var exportSpeakerMode = document.getElementById("export-speaker-mode");
+    var exportMinSegments = document.getElementById("export-min-segments");
+    var exportStatsBtn = document.getElementById("export-stats-btn");
+    var exportDownloadBtn = document.getElementById("export-download-btn");
+    var exportPreview = document.getElementById("export-preview");
+    var exportPreviewContent = document.getElementById("export-preview-content");
+    var exportStatusEl = document.getElementById("export-status");
+
+    function getExportQueryString() {
+        var params = "format=" + encodeURIComponent(exportFormatEl.value);
+        if (exportDateFrom.value) params += "&date_from=" + encodeURIComponent(exportDateFrom.value);
+        if (exportDateTo.value) params += "&date_to=" + encodeURIComponent(exportDateTo.value);
+
+        var qualities = [];
+        document.querySelectorAll(".export-quality:checked").forEach(function (cb) {
+            qualities.push(cb.value);
+        });
+        if (qualities.length > 0) params += "&quality=" + encodeURIComponent(qualities.join(","));
+
+        params += "&speaker_mode=" + encodeURIComponent(exportSpeakerMode.value);
+        params += "&min_segments=" + encodeURIComponent(exportMinSegments.value || "3");
+        return params;
+    }
+
+    function formatBytes(bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+        return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    if (exportStatsBtn) {
+        exportStatsBtn.addEventListener("click", function () {
+            exportStatsBtn.disabled = true;
+            exportStatsBtn.textContent = "Loading...";
+            fetch("/api/export/stats?" + getExportQueryString())
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.error) {
+                        exportStatusEl.textContent = "Error: " + data.error;
+                        exportStatusEl.style.color = "#e74c3c";
+                        return;
+                    }
+                    exportPreview.classList.remove("hidden");
+                    exportPreviewContent.innerHTML =
+                        '<div class="export-preview-line"><strong>' + data.sessions + '</strong> sessions / <strong>' + data.segments + '</strong> segments</div>' +
+                        '<div class="export-preview-line">Date: ' + escapeHtml(data.date_from || "N/A") + ' ~ ' + escapeHtml(data.date_to || "N/A") + '</div>' +
+                        '<div class="export-preview-line">Est. size: <strong>' + formatBytes(data.est_size_bytes) + '</strong></div>';
+                    exportDownloadBtn.disabled = data.sessions === 0;
+                    exportStatusEl.textContent = "";
+                })
+                .catch(function (err) {
+                    exportStatusEl.textContent = "Error: " + err.message;
+                    exportStatusEl.style.color = "#e74c3c";
+                })
+                .finally(function () {
+                    exportStatsBtn.disabled = false;
+                    exportStatsBtn.textContent = "Preview Stats";
+                });
+        });
+    }
+
+    if (exportDownloadBtn) {
+        exportDownloadBtn.addEventListener("click", function () {
+            var qs = getExportQueryString();
+            window.location.href = "/api/export/training?" + qs;
+        });
+    }
+
     // --- Init ---
     Promise.all([loadUserTagsCache(), loadSpeakerNames()]).then(function () {
         loadPage(1);

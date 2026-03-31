@@ -111,6 +111,7 @@
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
                 <button class="tab" data-tab="voice-tab">Voice</button>
                 <button class="tab" data-tab="user-tags-tab">Tags</button>
+                <button class="tab" data-tab="export-tab">Export</button>
             </div>
 
             <!-- Term corrections tab -->
@@ -213,6 +214,55 @@
                     <button id="voice-delete-all-btn" class="btn-danger">Delete All Speakers</button>
                 </div>
                 <span id="voice-status" class="save-status"></span>
+            </div>
+
+            <!-- Export tab -->
+            <div id="export-tab" class="tab-content">
+                <div class="export-form">
+                    <div class="export-row">
+                        <label>Format</label>
+                        <select id="export-format">
+                            <option value="openai">OpenAI Fine-tuning JSONL</option>
+                            <option value="conversation">ShareGPT / LLaMA-Factory JSONL</option>
+                            <option value="comprehensive">Comprehensive (Full metadata) JSONL</option>
+                        </select>
+                    </div>
+                    <div class="export-row">
+                        <label>Date Range</label>
+                        <div class="export-date-range">
+                            <input type="date" id="export-date-from" placeholder="From">
+                            <span>~</span>
+                            <input type="date" id="export-date-to" placeholder="To">
+                        </div>
+                    </div>
+                    <div class="export-row">
+                        <label>Quality</label>
+                        <div class="export-checkboxes">
+                            <label class="toggle-label"><input type="checkbox" class="export-quality" value="clean" checked><span>Clean</span></label>
+                            <label class="toggle-label"><input type="checkbox" class="export-quality" value="partial" checked><span>Partial</span></label>
+                            <label class="toggle-label"><input type="checkbox" class="export-quality" value="noisy"><span>Noisy</span></label>
+                        </div>
+                    </div>
+                    <div class="export-row">
+                        <label>Speaker</label>
+                        <select id="export-speaker-mode">
+                            <option value="conversation">Full Conversation</option>
+                            <option value="user_only">User Only</option>
+                        </select>
+                    </div>
+                    <div class="export-row">
+                        <label>Min Segments</label>
+                        <input type="number" id="export-min-segments" value="3" min="1" max="100" style="width:80px">
+                    </div>
+                </div>
+                <div id="export-preview" class="export-preview hidden">
+                    <div id="export-preview-content"></div>
+                </div>
+                <div class="export-actions">
+                    <button id="export-stats-btn" class="btn-primary">Preview Stats</button>
+                    <button id="export-download-btn" class="btn-primary" disabled>Download JSONL</button>
+                    <span id="export-status" class="save-status"></span>
+                </div>
             </div>
         </div>
     </div>

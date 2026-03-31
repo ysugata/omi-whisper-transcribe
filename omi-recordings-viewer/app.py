@@ -13,6 +13,7 @@ import aiohttp_jinja2
 import jinja2
 from aiohttp import web
 
+from exporter import export_session
 from indexer import Indexer
 
 logging.basicConfig(
@@ -632,6 +633,106 @@ async def handle_combined_tag_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Export API
+# ============================================================
+
+def _parse_export_params(request: web.Request) -> dict:
+    """Parse common export query parameters."""
+    fmt = request.query.get("format", "comprehensive")
+    if fmt not in ("comprehensive", "openai", "conversation"):
+        raise web.HTTPBadRequest(text="format must be comprehensive, openai, or conversation")
+
+    quality_raw = request.query.get("quality", "").strip()
+    quality = [q.strip() for q in quality_raw.split(",") if q.strip()] or None
+
+    activity_raw = request.query.get("activity", "").strip()
+    activity = [a.strip() for a in activity_raw.split(",") if a.strip()] or None
+
+    return {
+        "format": fmt,
+        "date_from": request.query.get("date_from", "").strip(),
+        "date_to": request.query.get("date_to", "").strip(),
+        "quality": quality,
+        "activity": activity,
+        "speaker_mode": request.query.get("speaker_mode", "conversation"),
+        "min_segments": int(request.query.get("min_segments", "3")),
+    }
+
+
+async def handle_export_stats(request: web.Request) -> web.Response:
+    """GET /api/export/stats — preview statistics for export."""
+    try:
+        params = _parse_export_params(request)
+    except web.HTTPBadRequest as e:
+        return web.json_response({"error": e.text}, status=400)
+
+    indexer: Indexer = request.app["indexer"]
+    try:
+        stats = await indexer.get_export_stats(
+            date_from=params["date_from"],
+            date_to=params["date_to"],
+            quality=params["quality"],
+            activity=params["activity"],
+            min_segments=params["min_segments"],
+        )
+    except Exception as e:
+        logger.exception("Export stats failed")
+        return web.json_response({"error": str(e)}, status=500)
+
+    return web.json_response(stats)
+
+
+async def handle_export_training(request: web.Request) -> web.Response:
+    """GET /api/export/training — stream JSONL download."""
+    try:
+        params = _parse_export_params(request)
+    except web.HTTPBadRequest as e:
+        return web.json_response({"error": e.text}, status=400)
+
+    indexer: Indexer = request.app["indexer"]
+    try:
+        session_pairs = await indexer.get_export_sessions(
+            date_from=params["date_from"],
+            date_to=params["date_to"],
+            quality=params["quality"],
+            activity=params["activity"],
+            min_segments=params["min_segments"],
+        )
+    except Exception as e:
+        logger.exception("Export query failed")
+        return web.json_response({"error": str(e)}, status=500)
+
+    fmt = params["format"]
+    speaker_mode = params["speaker_mode"]
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "application/x-ndjson",
+            "Content-Disposition": f'attachment; filename="training_{fmt}.jsonl"',
+        },
+    )
+    await response.prepare(request)
+
+    for date, time in session_pairs:
+        try:
+            transcript = await indexer.get_transcript(date, time)
+            if not transcript:
+                continue
+            session_id = f"{date}/{time}"
+            line = export_session(fmt, session_id, transcript, speaker_mode)
+            if line:
+                await response.write((line + "\n").encode("utf-8"))
+        except Exception:
+            logger.exception("Export error for %s/%s", date, time)
+            continue
+
+    await response.write_eof()
+    return response
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -727,6 +828,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/tags/start", handle_combined_tag_start)
     app.router.add_get("/api/tags/status", handle_combined_tag_status)
     app.router.add_post("/api/tags/cancel", handle_combined_tag_cancel)
+
+    # Export API
+    app.router.add_get("/api/export/stats", handle_export_stats)
+    app.router.add_get("/api/export/training", handle_export_training)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

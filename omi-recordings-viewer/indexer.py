@@ -361,6 +361,83 @@ class Indexer:
         data = await loop.run_in_executor(None, path.read_text, "utf-8")
         return json.loads(data)
 
+    async def get_export_stats(
+        self, date_from: str = "", date_to: str = "",
+        quality: list[str] | None = None, activity: list[str] | None = None,
+        min_segments: int = 3,
+    ) -> dict:
+        """Get stats for export preview (session count, segment count, date range, est size)."""
+        where, params = self._build_export_where(
+            date_from, date_to, quality, activity, min_segments,
+        )
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        rows = await self._db.execute_fetchall(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(segment_count), 0) as segs,"
+            f" MIN(date) as min_date, MAX(date) as max_date,"
+            f" COALESCE(SUM(LENGTH(transcript_text)), 0) as text_bytes"
+            f" FROM sessions{where_sql}",
+            params,
+        )
+        r = rows[0]
+        return {
+            "sessions": r["cnt"],
+            "segments": r["segs"],
+            "date_from": r["min_date"] or "",
+            "date_to": r["max_date"] or "",
+            "est_size_bytes": int(r["text_bytes"] * 1.5),  # rough estimate with JSON overhead
+        }
+
+    async def get_export_sessions(
+        self, date_from: str = "", date_to: str = "",
+        quality: list[str] | None = None, activity: list[str] | None = None,
+        min_segments: int = 3,
+    ) -> list[tuple[str, str]]:
+        """Get (date, time) pairs matching export filters."""
+        where, params = self._build_export_where(
+            date_from, date_to, quality, activity, min_segments,
+        )
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        cursor = await self._db.execute(
+            f"SELECT date, time FROM sessions{where_sql} ORDER BY date, time",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [(r["date"], r["time"]) for r in rows]
+
+    def _build_export_where(
+        self, date_from: str, date_to: str,
+        quality: list[str] | None, activity: list[str] | None,
+        min_segments: int,
+    ) -> tuple[list[str], list]:
+        """Build WHERE clauses and params for export queries."""
+        where: list[str] = []
+        params: list = []
+
+        if min_segments > 0:
+            where.append("segment_count >= ?")
+            params.append(min_segments)
+
+        if date_from:
+            where.append("date >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("date <= ?")
+            params.append(date_to)
+
+        if quality:
+            placeholders = ",".join("?" for _ in quality)
+            where.append(f"tags_quality IN ({placeholders})")
+            params.extend(quality)
+
+        if activity:
+            placeholders = ",".join("?" for _ in activity)
+            where.append(f"tags_activity IN ({placeholders})")
+            params.extend(activity)
+
+        return where, params
+
     async def periodic_sync(self, interval: int = 30):
         """Background task: sync every `interval` seconds."""
         while True:
