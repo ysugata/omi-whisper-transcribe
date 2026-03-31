@@ -137,6 +137,7 @@ from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
 from session_tagger import SessionTagger
+from training_sanitizer import TrainingSanitizer
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -192,6 +193,16 @@ if TAGGING_ENABLED and LLM_API_KEY:
         base_url=LLM_BASE_URL,
         model=TAGGING_MODEL,
         user_tags_path=_USER_TAGS_PATH,
+    )
+
+# Training data sanitizer (LLM API キーがあれば利用可能)
+SANITIZE_MODEL = os.environ.get("SANITIZE_MODEL", "gemini-2.5-flash")
+training_sanitizer: TrainingSanitizer | None = None
+if LLM_API_KEY:
+    training_sanitizer = TrainingSanitizer(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=SANITIZE_MODEL,
     )
 
 
@@ -2571,6 +2582,188 @@ async def main():
             _batch_combined_tag_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
+    # ============================================================
+    # Batch sanitize (training data anonymization)
+    # ============================================================
+
+    _batch_sanitize_state = {
+        "running": False,
+        "total": 0,
+        "processed": 0,
+        "failed": 0,
+        "dropped": 0,
+        "records_generated": 0,
+        "current_session": None,
+        "errors": [],
+        "cancel_requested": False,
+        "started_at": None,
+        "finished_at": None,
+        "output_file": None,
+    }
+
+    async def _batch_sanitize_task(session_paths: list):
+        """Batch sanitize sessions for safe training data export."""
+        _batch_sanitize_state["running"] = True
+        _batch_sanitize_state["total"] = len(session_paths)
+        _batch_sanitize_state["processed"] = 0
+        _batch_sanitize_state["failed"] = 0
+        _batch_sanitize_state["dropped"] = 0
+        _batch_sanitize_state["records_generated"] = 0
+        _batch_sanitize_state["current_session"] = None
+        _batch_sanitize_state["errors"] = []
+        _batch_sanitize_state["cancel_requested"] = False
+        _batch_sanitize_state["started_at"] = datetime.now().isoformat()
+        _batch_sanitize_state["finished_at"] = None
+        _batch_sanitize_state["output_file"] = None
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"safe_training_{ts}.jsonl"
+        output_path = Path(CONFIG_DIR) / output_filename
+        _batch_sanitize_state["output_file"] = output_filename
+
+        loop = asyncio.get_running_loop()
+        try:
+            with open(output_path, "w", encoding="utf-8") as out_f:
+                for sess_path in session_paths:
+                    if _batch_sanitize_state["cancel_requested"]:
+                        log.info("Batch sanitize cancelled by user")
+                        break
+
+                    _batch_sanitize_state["current_session"] = sess_path
+                    parts = sess_path.split("/")
+                    if len(parts) != 2:
+                        _batch_sanitize_state["failed"] += 1
+                        _batch_sanitize_state["errors"].append(
+                            f"Invalid session path: {sess_path}"
+                        )
+                        continue
+
+                    transcript_path = (
+                        Path(RECORDINGS_DIR) / parts[0] / parts[1] / "transcript.json"
+                    )
+                    if not transcript_path.exists():
+                        _batch_sanitize_state["failed"] += 1
+                        _batch_sanitize_state["errors"].append(
+                            f"transcript.json not found: {sess_path}"
+                        )
+                        continue
+
+                    try:
+                        with open(transcript_path, encoding="utf-8") as f:
+                            transcript = json.load(f)
+                    except (json.JSONDecodeError, OSError) as e:
+                        _batch_sanitize_state["failed"] += 1
+                        _batch_sanitize_state["errors"].append(
+                            f"{sess_path}: {e}"
+                        )
+                        continue
+
+                    try:
+                        result = await loop.run_in_executor(
+                            None, training_sanitizer.sanitize_session, transcript
+                        )
+                    except Exception as e:
+                        _batch_sanitize_state["failed"] += 1
+                        _batch_sanitize_state["errors"].append(
+                            f"{sess_path}: {e}"
+                        )
+                        log.error(f"Sanitize error for {sess_path}: {e}")
+                        continue
+
+                    if result is None:
+                        _batch_sanitize_state["failed"] += 1
+                        continue
+
+                    if result["risk_level"] == "high":
+                        _batch_sanitize_state["dropped"] += 1
+                        _batch_sanitize_state["processed"] += 1
+                        log.info(f"Sanitize: {sess_path} → high risk, dropped")
+                        continue
+
+                    for rec in result["records"]:
+                        rec["session_id"] = sess_path
+                        rec["risk_level"] = result["risk_level"]
+                        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        _batch_sanitize_state["records_generated"] += 1
+
+                    _batch_sanitize_state["processed"] += 1
+                    log.info(
+                        f"Sanitize: {sess_path} → {result['risk_level']}, "
+                        f"{len(result['records'])} records"
+                    )
+                    await asyncio.sleep(0)
+
+        except Exception as e:
+            log.error(f"Batch sanitize error: {e}", exc_info=True)
+            _batch_sanitize_state["errors"].append(str(e))
+        finally:
+            _batch_sanitize_state["running"] = False
+            _batch_sanitize_state["current_session"] = None
+            _batch_sanitize_state["finished_at"] = datetime.now().isoformat()
+            log.info(
+                f"Batch sanitize finished: "
+                f"{_batch_sanitize_state['processed']} processed, "
+                f"{_batch_sanitize_state['failed']} failed, "
+                f"{_batch_sanitize_state['dropped']} dropped, "
+                f"{_batch_sanitize_state['records_generated']} records"
+            )
+
+    async def handle_sanitize_start(request):
+        if training_sanitizer is None:
+            return web.json_response(
+                {"error": "GEMINI_API_KEY not configured"}, status=503
+            )
+        if _batch_sanitize_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409
+            )
+
+        try:
+            body = await request.json()
+            sessions = body.get("sessions", [])
+        except Exception:
+            return web.json_response(
+                {"error": "invalid request body"}, status=400
+            )
+
+        if not sessions or not isinstance(sessions, list):
+            return web.json_response(
+                {"error": "sessions list required"}, status=400
+            )
+
+        asyncio.create_task(_batch_sanitize_task(sessions))
+        return web.json_response({
+            "status": "started",
+            "total": len(sessions),
+        })
+
+    async def handle_sanitize_status(request):
+        return web.json_response(_batch_sanitize_state)
+
+    async def handle_sanitize_cancel(request):
+        if _batch_sanitize_state["running"]:
+            _batch_sanitize_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
+    async def handle_sanitize_download(request):
+        filename = request.query.get("file", "")
+        # Security: only allow safe_training_*.jsonl pattern
+        if not re.match(r'^safe_training_\d{8}_\d{6}\.jsonl$', filename):
+            return web.json_response(
+                {"error": "invalid filename"}, status=400
+            )
+        filepath = Path(CONFIG_DIR) / filename
+        if not filepath.exists():
+            return web.json_response(
+                {"error": "file not found"}, status=404
+            )
+        return web.FileResponse(
+            filepath,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -2608,6 +2801,11 @@ async def main():
     mgmt_app.router.add_post("/tags/start", handle_combined_tag_start)
     mgmt_app.router.add_get("/tags/status", handle_combined_tag_status)
     mgmt_app.router.add_post("/tags/cancel", handle_combined_tag_cancel)
+    # Sanitize batch API (training data anonymization)
+    mgmt_app.router.add_post("/sanitize/start", handle_sanitize_start)
+    mgmt_app.router.add_get("/sanitize/status", handle_sanitize_status)
+    mgmt_app.router.add_post("/sanitize/cancel", handle_sanitize_cancel)
+    mgmt_app.router.add_get("/sanitize/download", handle_sanitize_download)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()

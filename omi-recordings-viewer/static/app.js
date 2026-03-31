@@ -1016,8 +1016,9 @@
     var activeBatchType = null; // "diarize" | "tags"
 
     var batchApiMap = {
-        diarize: { start: "/api/diarize/start", status: "/api/diarize/status", cancel: "/api/diarize/cancel" },
-        tags:    { start: "/api/tags/start",    status: "/api/tags/status",    cancel: "/api/tags/cancel"    },
+        diarize:  { start: "/api/diarize/start",  status: "/api/diarize/status",  cancel: "/api/diarize/cancel"  },
+        tags:     { start: "/api/tags/start",      status: "/api/tags/status",      cancel: "/api/tags/cancel"    },
+        sanitize: { start: "/api/sanitize/start",  status: "/api/sanitize/status",  cancel: "/api/sanitize/cancel" },
     };
 
     var batchLabels = {
@@ -1028,6 +1029,7 @@
             cancelling: "キャンセル中...",
             done: "タグ付け完了",
         },
+        sanitize: { running: "LLM 匿名化処理中...", cancelling: "キャンセル中...", done: "匿名化完了" },
     };
 
     function showBatchPanel(type, state) {
@@ -1097,8 +1099,16 @@
                 var label = (batchLabels[type] || {}).done || "完了";
                 var msg = label + ": " + (state.processed || 0) + " 件処理";
                 if (state.failed > 0) msg += ", " + state.failed + " 件失敗";
+                if (type === "sanitize") {
+                    if (state.dropped > 0) msg += ", " + state.dropped + " 件除外(高リスク)";
+                    msg += ", " + (state.records_generated || 0) + " レコード生成";
+                }
                 if (state.cancel_requested) msg += " (キャンセル)";
                 batchStatusText.textContent = msg;
+                // Auto-download sanitize output
+                if (type === "sanitize" && state.output_file && state.records_generated > 0) {
+                    window.location.href = "/api/sanitize/download?file=" + encodeURIComponent(state.output_file);
+                }
             }
         }
     }
@@ -2038,6 +2048,10 @@
             } else {
                 exportIncludeMonologue.checked = true;
             }
+            // Update button label for safe_training
+            if (exportDownloadBtn) {
+                exportDownloadBtn.textContent = fmt === "safe_training" ? "Generate & Download" : "Download JSONL";
+            }
         });
     }
 
@@ -2099,8 +2113,34 @@
 
     if (exportDownloadBtn) {
         exportDownloadBtn.addEventListener("click", function () {
+            var fmt = exportFormatEl.value;
             var qs = getExportQueryString();
-            window.location.href = "/api/export/training?" + qs;
+            if (fmt === "safe_training") {
+                // Use batch sanitize flow via Bridge LLM
+                exportDownloadBtn.disabled = true;
+                fetch("/api/sanitize/start?" + qs, { method: "POST" })
+                    .then(function (r) { return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; }); })
+                    .then(function (res) {
+                        if (res.ok) {
+                            if (res.data.status === "no_sessions") {
+                                alert("フィルタ条件に一致するセッションがありません");
+                                return;
+                            }
+                            showBatchPanel("sanitize", { running: true, total: res.data.total || 0, processed: 0, failed: 0 });
+                            startBatchPolling("sanitize");
+                        } else if (res.status === 409) {
+                            alert("既に実行中です");
+                        } else if (res.status === 503) {
+                            alert("GEMINI_API_KEY が設定されていません");
+                        } else {
+                            alert("エラー: " + (res.data.error || res.status));
+                        }
+                    })
+                    .catch(function (e) { alert("開始に失敗しました: " + e.message); })
+                    .finally(function () { exportDownloadBtn.disabled = false; });
+            } else {
+                window.location.href = "/api/export/training?" + qs;
+            }
         });
     }
 

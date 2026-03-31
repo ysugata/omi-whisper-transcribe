@@ -653,6 +653,7 @@ async def handle_combined_tag_cancel(request: web.Request) -> web.Response:
 _VALID_EXPORT_FORMATS = {
     "comprehensive", "openai", "conversation",
     "knowledge", "decision_log", "sop",
+    "safe_training",
 }
 
 
@@ -772,6 +773,114 @@ async def handle_export_training(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Sanitize API (safe training data generation via Bridge LLM)
+# ============================================================
+
+def _parse_sanitize_params(request: web.Request) -> dict:
+    """Parse query parameters for sanitize (reuses export filter params)."""
+    quality_raw = request.query.get("quality", "").strip()
+    quality = [q.strip() for q in quality_raw.split(",") if q.strip()] or None
+
+    activity_raw = request.query.get("activity", "").strip()
+    activity = [a.strip() for a in activity_raw.split(",") if a.strip()] or None
+
+    business_domain = request.query.get("business_domain", "").strip()
+
+    return {
+        "date_from": request.query.get("date_from", "").strip(),
+        "date_to": request.query.get("date_to", "").strip(),
+        "quality": quality,
+        "activity": activity,
+        "business_domain": business_domain,
+        "min_segments": int(request.query.get("min_segments", "3")),
+    }
+
+
+async def handle_sanitize_start(request: web.Request) -> web.Response:
+    """POST /api/sanitize/start — query DB for sessions, send list to Bridge."""
+    if not BRIDGE_MGMT_URL:
+        return web.json_response({"error": "bridge not configured"}, status=503)
+
+    params = _parse_sanitize_params(request)
+
+    indexer: Indexer = request.app["indexer"]
+    try:
+        session_pairs = await indexer.get_export_sessions(
+            date_from=params["date_from"],
+            date_to=params["date_to"],
+            quality=params["quality"],
+            activity=params["activity"],
+            min_segments=params["min_segments"],
+            business_domain=params["business_domain"],
+        )
+    except Exception as e:
+        logger.exception("Sanitize session query failed")
+        return web.json_response({"error": str(e)}, status=500)
+
+    if not session_pairs:
+        return web.json_response({
+            "status": "no_sessions",
+            "message": "No sessions match the filters",
+        })
+
+    sessions = [f"{date}/{time}" for date, time in session_pairs]
+
+    # Forward to Bridge
+    session: aiohttp.ClientSession = request.app["bridge_session"]
+    url = f"{BRIDGE_MGMT_URL}/sanitize/start"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        resp = await session.post(
+            url,
+            json={"sessions": sessions},
+            timeout=timeout,
+        )
+        body = await resp.read()
+        return web.Response(
+            body=body,
+            status=resp.status,
+            content_type=resp.content_type or "application/json",
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"Bridge proxy error (sanitize/start): {e}")
+        return web.json_response({"error": "bridge unavailable"}, status=502)
+
+
+async def handle_sanitize_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/sanitize/status")
+
+
+async def handle_sanitize_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/sanitize/cancel")
+
+
+async def handle_sanitize_download(request: web.Request) -> web.Response:
+    """GET /api/sanitize/download — serve file from shared config dir."""
+    import re as _re
+    filename = request.query.get("file", "")
+    # Security: only allow safe_training_*.jsonl pattern + path traversal check
+    if not _re.match(r'^safe_training_\d{8}_\d{6}\.jsonl$', filename):
+        return web.json_response({"error": "invalid filename"}, status=400)
+
+    filepath = Path(CONFIG_DIR) / filename
+    # Ensure resolved path stays within CONFIG_DIR
+    try:
+        filepath.resolve().relative_to(Path(CONFIG_DIR).resolve())
+    except ValueError:
+        return web.json_response({"error": "invalid path"}, status=400)
+
+    if not filepath.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+
+    return web.FileResponse(
+        filepath,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+# ============================================================
 # アプリケーション構築
 # ============================================================
 
@@ -871,6 +980,12 @@ def create_app() -> web.Application:
     # Export API
     app.router.add_get("/api/export/stats", handle_export_stats)
     app.router.add_get("/api/export/training", handle_export_training)
+
+    # Sanitize batch API (training data anonymization)
+    app.router.add_post("/api/sanitize/start", handle_sanitize_start)
+    app.router.add_get("/api/sanitize/status", handle_sanitize_status)
+    app.router.add_post("/api/sanitize/cancel", handle_sanitize_cancel)
+    app.router.add_get("/api/sanitize/download", handle_sanitize_download)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 
