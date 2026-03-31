@@ -1079,6 +1079,103 @@ main {
     border-radius: 8px;
 }
 
+/* Filter toggle button */
+.filter-toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    padding: 4px 12px;
+    cursor: pointer;
+    line-height: 1.4;
+    flex-shrink: 0;
+}
+
+.filter-toggle-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.filter-toggle-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.filter-icon {
+    font-size: 0.7rem;
+    transition: transform 0.2s;
+}
+
+.filter-toggle-btn.active .filter-icon {
+    transform: rotate(180deg);
+}
+
+.filter-count-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+}
+
+.filter-count-badge.hidden { display: none; }
+
+.filter-clear-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.filter-clear-btn:hover {
+    color: #e74c3c;
+    border-color: #e74c3c;
+}
+
+.filter-clear-btn.hidden { display: none; }
+
+/* Filter panel */
+.filter-panel {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.filter-panel.hidden { display: none; }
+
+.filter-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.filter-group-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
 /* Filter select */
 .filter-select {
     padding: 4px 8px;
@@ -1095,6 +1192,11 @@ main {
     outline: none;
     border-color: var(--accent);
     color: var(--text);
+}
+
+.filter-select.active-filter {
+    border-color: var(--accent);
+    color: var(--accent);
 }
 
 /* Tag badges on session cards */
@@ -1298,6 +1400,14 @@ main {
 
     .segment-speaker {
         display: none;
+    }
+
+    .filter-panel {
+        gap: 12px;
+    }
+
+    .filter-group {
+        flex-wrap: wrap;
     }
 }
 

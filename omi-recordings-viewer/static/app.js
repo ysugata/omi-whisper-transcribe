@@ -608,13 +608,53 @@
     searchInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") doSearch();
     });
-    if (filterActivity) filterActivity.addEventListener("change", function () { loadPage(1); });
-    if (filterMood) filterMood.addEventListener("change", function () { loadPage(1); });
-    if (filterBusinessDomain) filterBusinessDomain.addEventListener("change", function () { loadPage(1); });
-    if (filterImportance) filterImportance.addEventListener("change", function () { loadPage(1); });
-    if (filterSourceType) filterSourceType.addEventListener("change", function () { loadPage(1); });
-    if (filterUserTag) filterUserTag.addEventListener("change", function () { loadPage(1); });
-    if (filterSpeaker) filterSpeaker.addEventListener("change", function () { loadPage(1); });
+    // Filter panel toggle
+    var filterToggleBtn = document.getElementById("filter-toggle-btn");
+    var filterPanel = document.getElementById("filter-panel");
+    var filterClearBtn = document.getElementById("filter-clear-btn");
+    var filterCountBadge = document.getElementById("filter-count-badge");
+    var allFilterSelects = [filterActivity, filterMood, filterBusinessDomain, filterImportance, filterSourceType, filterUserTag, filterSpeaker];
+
+    function updateFilterCount() {
+        var count = 0;
+        allFilterSelects.forEach(function (sel) {
+            if (sel && sel.value) {
+                count++;
+                sel.classList.add("active-filter");
+            } else if (sel) {
+                sel.classList.remove("active-filter");
+            }
+        });
+        if (count > 0) {
+            filterCountBadge.textContent = count;
+            filterCountBadge.classList.remove("hidden");
+            filterClearBtn.classList.remove("hidden");
+        } else {
+            filterCountBadge.classList.add("hidden");
+            filterClearBtn.classList.add("hidden");
+        }
+    }
+
+    if (filterToggleBtn) {
+        filterToggleBtn.addEventListener("click", function () {
+            var isHidden = filterPanel.classList.toggle("hidden");
+            filterToggleBtn.classList.toggle("active", !isHidden);
+        });
+    }
+
+    if (filterClearBtn) {
+        filterClearBtn.addEventListener("click", function () {
+            allFilterSelects.forEach(function (sel) {
+                if (sel) sel.value = "";
+            });
+            updateFilterCount();
+            loadPage(1);
+        });
+    }
+
+    allFilterSelects.forEach(function (sel) {
+        if (sel) sel.addEventListener("change", function () { updateFilterCount(); loadPage(1); });
+    });
     modalClose.addEventListener("click", closeModal);
     modal.addEventListener("click", function (e) {
         if (e.target === modal) closeModal();
