@@ -27,7 +27,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | ハルシネーションフィルタ | 異常出力・ギブリッシュ仮名・句読点のみ等を除去 |
 | セグメント分割 | 長いセグメントを文境界で自然に分割 |
 | Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
-| LLM 後処理 | Gemini によるバッチ用語修正・提案 (コスト最適化済み) |
+| LLM 後処理 (3段階パイプライン) | 用語候補抽出 → 表記補正 → 品質監査の3段階で文字起こし精度を向上 |
 | セッションタグ | LLM による自動タグ付け (活動・気分・トピック・要約) |
 | カスタムユーザータグ | ユーザー定義タグの作成・付与・LLM 自動適用 |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
@@ -210,7 +210,7 @@ open http://localhost:8092
 | `NOISE_REDUCE_ENABLED` | `false` | スペクトルゲーティング方式のノイズ除去 |
 | `NOISE_REDUCE_PROP_DECREASE` | `0.8` | ノイズ低減率 (0.0〜1.0) |
 
-### LLM 後処理
+### LLM 後処理 (3段階パイプライン)
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
@@ -220,6 +220,8 @@ open http://localhost:8092
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
 | `LLM_BATCH_SIZE` | `20` | バッチフラッシュのセグメント数 |
+| `LLM_PIPELINE_STAGES` | `ABC` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
+| `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 
 ### セッションタグ
 
@@ -337,15 +339,80 @@ Viewer の「Diarize」ボタンから、未処理の全録音に対して一括
 - カスタム語の追加も可能
 - `HOTWORDS_ENABLED=false` で無効化
 
-## LLM 後処理
+## LLM 後処理 (3段階パイプライン)
 
-Gemini API を使い、文字起こし結果の用語修正と新規用語の提案をバッチで行います。
+Gemini API を使い、文字起こし結果の品質を3段階のパイプラインで向上させます。
 
-- セグメントを `LLM_BATCH_INTERVAL` 秒 (デフォルト 60) または `LLM_BATCH_SIZE` 個 (デフォルト 20) ごとにまとめて 1 回の API コールで処理
+```
+Layer 2 (辞書置換) 出力
+    │
+    ▼
+3-A: 用語候補抽出 ─── テキスト変更なし、候補 JSON を返す
+    │
+    ▼
+3-B: 表記補正 ──── transcript + glossary + 3-A候補 → 差分 corrections 配列
+    │
+    ▼
+3-C: 品質監査 ──── 修正済みテキストの問題点を検出 → 監査 JSON
+    │  └─ high severity 項目あり → 3-B を再実行 (最大1回)
+    ▼
+インプレース更新 + ログ出力
+```
+
+### Stage 3-A: 用語候補抽出
+
+固有名詞・技術用語・壊れカタカナ・誤認識語を過剰気味に抽出。本文は書き換えない。
+
+- カテゴリ: `proper_noun`, `technical_term`, `broken_katakana`, `misrecognized`
+- 参考用語リスト (辞書 + hotwords) との照合を優先
+- 低 confidence でも候補として含める (3-B で最終判断)
+
+### Stage 3-B: 表記補正
+
+transcript + 参考用語リスト + 3-A 候補を統合し、差分のみの corrections 配列を返す。
+
+- snippet ベースの置換 (全文再生成しない)
+- ポストフィルタ: 空 snippet 除去、no-change 除去、句読点のみ変更除去、snippet 存在チェック
+- ソース: `glossary`, `candidate_3a`, `context`, `dictionary`
+
+### Stage 3-C: 品質監査
+
+修正済みテキストに残る品質問題を検出。
+
+- 検出対象: `uncorrected_term`, `meaningless`, `broken_katakana`, `trailing_fragment`
+- `severity: high` が 1 件以上 → 3-B を再実行 (最大1回)
+- 再実行時は 3-C の指摘を追加ヒントとして 3-B に渡す
+
+### ステージ選択
+
+`LLM_PIPELINE_STAGES` 環境変数で有効にするステージを選択:
+
+| 値 | 動作 |
+|---|---|
+| `ABC` (デフォルト) | フルパイプライン |
+| `B` | 3-B のみ (旧互換モード) |
+| `AB` | 候補抽出 + 補正 (監査なし) |
+| `BC` | 補正 + 監査 (候補抽出なし) |
+
+### Smart Flush
+
+`LLM_FLUSH_MODE=smart` (デフォルト) では、20セグメント到達時にセグメント間のギャップ (2秒以上) を確認し、トピック境界で自動フラッシュ。ギャップがなければ 1.5 倍 (30セグメント) まで待機。タイムアウトでは常に強制フラッシュ。
+
+### その他
+
+- セッション用語集: セグメントテキストに関連する用語のみフィルタ (最大 50 語)
 - セッション終了・無音タイムアウト時にも自動フラッシュ
 - 登録済み用語辞書 (`config/term_corrections.json`) に基づく自動修正
 - 未知の技術用語・固有名詞の修正候補を提案 (`config/pending_suggestions.json`)
 - Viewer の Settings > LLM Suggestions で提案を承認/却下
+
+### コスト見積もり (Gemini 2.5 Flash-Lite)
+
+| 項目 | 1バッチ (20seg) | 月額 (8h/日) |
+|---|---|---|
+| ABC (標準) | ~$0.0015 | ~$21.60 |
+| ABC + 再実行 | ~$0.0025 | ~$36.00 |
+| B のみ (旧互換) | ~$0.0005 | ~$7.20 |
 
 ## セッションタグ
 
@@ -563,7 +630,10 @@ omi_whisper_transcribe/
 ├── gpu_manager.py            # GPU リソース管理 (qwen-tts との排他制御)
 ├── model_manager.py          # Whisper モデルの外部制御 (gpu-shared 用)
 ├── audio_preprocessor.py     # ノイズ除去 + ラウドネス正規化
-├── llm_corrector.py          # Gemini によるバッチ用語修正
+├── llm_pipeline.py           # 3段階 LLM パイプライン (候補抽出→補正→監査)
+├── llm_pipeline_schema.py    # パイプライン用 JSON Schema 定義
+├── llm_pipeline_prompt.py    # パイプライン用システムプロンプト
+├── llm_corrector.py          # Gemini によるバッチ用語修正 (レガシー / retranscribe 用)
 ├── session_tagger.py         # Gemini によるセッションタグ付け
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
