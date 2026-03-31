@@ -67,6 +67,9 @@
 
     var filterActivity = document.getElementById("filter-activity");
     var filterMood = document.getElementById("filter-mood");
+    var filterBusinessDomain = document.getElementById("filter-business-domain");
+    var filterImportance = document.getElementById("filter-importance");
+    var filterSourceType = document.getElementById("filter-source-type");
     var filterUserTag = document.getElementById("filter-user-tag");
     var filterSpeaker = document.getElementById("filter-speaker");
 
@@ -75,6 +78,9 @@
         if (query) url += "&q=" + encodeURIComponent(query);
         if (filterActivity && filterActivity.value) url += "&activity=" + encodeURIComponent(filterActivity.value);
         if (filterMood && filterMood.value) url += "&mood=" + encodeURIComponent(filterMood.value);
+        if (filterBusinessDomain && filterBusinessDomain.value) url += "&business_domain=" + encodeURIComponent(filterBusinessDomain.value);
+        if (filterImportance && filterImportance.value) url += "&importance=" + encodeURIComponent(filterImportance.value);
+        if (filterSourceType && filterSourceType.value) url += "&source_type=" + encodeURIComponent(filterSourceType.value);
         if (filterUserTag && filterUserTag.value) url += "&user_tag=" + encodeURIComponent(filterUserTag.value);
         if (filterSpeaker && filterSpeaker.value) url += "&speaker=" + encodeURIComponent(filterSpeaker.value);
         return fetch(url).then(function (r) { return r.json(); });
@@ -604,6 +610,9 @@
     });
     if (filterActivity) filterActivity.addEventListener("change", function () { loadPage(1); });
     if (filterMood) filterMood.addEventListener("change", function () { loadPage(1); });
+    if (filterBusinessDomain) filterBusinessDomain.addEventListener("change", function () { loadPage(1); });
+    if (filterImportance) filterImportance.addEventListener("change", function () { loadPage(1); });
+    if (filterSourceType) filterSourceType.addEventListener("change", function () { loadPage(1); });
     if (filterUserTag) filterUserTag.addEventListener("change", function () { loadPage(1); });
     if (filterSpeaker) filterSpeaker.addEventListener("change", function () { loadPage(1); });
     modalClose.addEventListener("click", closeModal);

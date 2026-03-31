@@ -312,7 +312,8 @@ class Indexer:
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
         activity: str = "", mood: str = "", user_tag: str = "",
-        speaker: str = "",
+        speaker: str = "", business_domain: str = "",
+        importance: str = "", source_type: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -331,6 +332,18 @@ class Indexer:
         if mood:
             where_clauses.append("tags_mood = ?")
             params.append(mood)
+
+        if business_domain:
+            where_clauses.append("tags_business_domain = ?")
+            params.append(business_domain)
+
+        if importance:
+            where_clauses.append("tags_importance = ?")
+            params.append(importance)
+
+        if source_type:
+            where_clauses.append("tags_source_type = ?")
+            params.append(source_type)
 
         if user_tag:
             where_clauses.append("(tags_user LIKE ? OR tags_user = ?)")

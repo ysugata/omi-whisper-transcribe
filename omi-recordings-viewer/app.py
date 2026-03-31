@@ -102,11 +102,19 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
 
     activity = request.query.get("activity", "").strip()
     mood = request.query.get("mood", "").strip()
+    business_domain = request.query.get("business_domain", "").strip()
+    importance = request.query.get("importance", "").strip()
+    source_type = request.query.get("source_type", "").strip()
     user_tag = request.query.get("user_tag", "").strip()
     speaker = request.query.get("speaker", "").strip()
 
     try:
-        result = await indexer.get_sessions(page, per_page, query, activity=activity, mood=mood, user_tag=user_tag, speaker=speaker)
+        result = await indexer.get_sessions(
+            page, per_page, query, activity=activity, mood=mood,
+            user_tag=user_tag, speaker=speaker,
+            business_domain=business_domain, importance=importance,
+            source_type=source_type,
+        )
     except Exception as e:
         logger.exception("Failed to query sessions")
         return web.json_response({"error": str(e)}, status=500)
