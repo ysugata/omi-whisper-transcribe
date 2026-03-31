@@ -34,6 +34,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
+| Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
 ## 必要環境
@@ -139,6 +140,15 @@ open http://localhost:8092
 | GET | `/session-tags/status` | タグ付け進捗を返す |
 | POST | `/session-tags/cancel` | タグ付けをキャンセル |
 
+### Safe Training Data (匿名化エクスポート)
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/sanitize/start` | バッチ匿名化を開始 (`{"sessions": [...]}`) |
+| GET | `/sanitize/status` | 進捗状態を返す |
+| POST | `/sanitize/cancel` | 実行中のバッチをキャンセル |
+| GET | `/sanitize/download` | 生成された JSONL ファイルをダウンロード |
+
 ### ユーザータグ
 
 | メソッド | パス | 説明 |
@@ -230,7 +240,9 @@ open http://localhost:8092
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `HF_AUTH_TOKEN` | (空) | HuggingFace トークン (話者分離・声紋登録に必須) |
-| `GEMINI_API_KEY` | (空) | Google Gemini API キー (LLM 後処理・セッションタグに必須) |
+| `GEMINI_API_KEY` | (空) | Google Gemini API キー (LLM 後処理・セッションタグ・Chat Completions 匿名化に必須) |
+| `OPENAI_API_KEY` | (空) | OpenAI API キー (Responses API 匿名化に使用、設定時は Gemini より優先) |
+| `SANITIZE_MODEL` | `gemini-2.5-flash` | Chat Completions 匿名化で使うモデル名 |
 
 ### ネットワーク・認証
 
@@ -448,6 +460,68 @@ curl -o sop.jsonl \
   "http://localhost:8092/api/export/training?format=sop&min_segments=1"
 ```
 
+## Safe Training Data エクスポート (LLM 匿名化)
+
+LLM で文字起こしデータを匿名化・構造化し、安全なトレーニングデータとしてエクスポートします。
+
+### 2-step Pipeline
+
+```
+Step 1: 匿名化・構造化 (SANITIZE_SCHEMA)
+  入力: raw_text (ASR 出力)
+  出力: risk, summary, keypoints, safe_conversation, issues_detected
+
+Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
+  入力: Step 1 の cleaned output のみ (raw text は使わない)
+  出力: extractable, question, answer, evidence[], confidence
+```
+
+### プロバイダ
+
+| プロバイダ | API | 特徴 |
+|---|---|---|
+| **OpenAI Responses API** (推奨) | `OPENAI_API_KEY` 設定時 | GPT-5 nano + Structured Outputs で schema 準拠を保証、2-step KC 抽出対応 |
+| **Chat Completions API** (フォールバック) | `GEMINI_API_KEY` のみ | Gemini 2.5 Flash、json_object 形式 |
+
+`OPENAI_API_KEY` が設定されていれば Responses API が優先されます。
+
+### Knowledge Card の抽出ルール
+
+- **「生成」ではなく「根拠付き抽出」**: テキストに書かれていない外部知識を使わない
+- `evidence` (根拠) が必須: safe_conversation からの引用を含める
+- `confidence` が `medium` 以上のみ出力 (`low` / `none` は null にフォールバック)
+- `keypoints` が 3 件未満のセッションは抽出をスキップ
+- question 10文字以上、answer 15文字以上の品質ゲート
+
+### リスク判定
+
+| リスク | 処理 |
+|--------|------|
+| **low** | 個人情報なし → そのまま JSONL に出力 |
+| **medium** | 個人情報あり → 匿名化して出力 (人名→Aさん、会社→X社 等) |
+| **high** | PII 複合 → ドロップ (出力しない) |
+
+### 出力 JSONL 構造
+
+```json
+{
+  "session_id": "2026-03-31/09-35-13",
+  "risk": "low",
+  "summary": {"input": "...", "output": "..."},
+  "keypoints": ["...", "..."],
+  "safe_conversation": [{"speaker": "user", "text": "..."}],
+  "knowledge_card": {
+    "question": "...",
+    "answer": "...",
+    "evidence": ["会話からの引用1", "引用2"],
+    "confidence": "high"
+  },
+  "issues_detected": ["asr_noise"]
+}
+```
+
+`knowledge_card` は抽出できない場合 `null` になります。
+
 ## 録音データ
 
 セッションごとに `recordings/YYYY-MM-DD/HH-MM-SS/` に保存:
@@ -493,6 +567,11 @@ omi_whisper_transcribe/
 ├── session_tagger.py         # Gemini によるセッションタグ付け
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
+├── responses_sanitizer.py    # OpenAI Responses API 匿名化 (2-step pipeline)
+├── training_sanitizer.py     # Chat Completions API 匿名化 (Gemini フォールバック)
+├── sanitize_schema.py        # 匿名化 JSON Schema + KC 抽出スキーマ + 品質ゲート
+├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
+├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (gpu-shared 連携)
@@ -532,4 +611,5 @@ omi_whisper_transcribe/
 | [JMnedict](https://www.edrdg.org/enamdict/enamdict_doc.html) | 固有名詞辞書 | CC-BY-SA 3.0 |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 音声区間検出 | MIT |
 | [noisereduce](https://github.com/timsainb/noisereduce) | ノイズ除去 | MIT |
-| [Gemini API](https://ai.google.dev/) | LLM 後処理・セッションタグ | Google ToS |
+| [Gemini API](https://ai.google.dev/) | LLM 後処理・セッションタグ・匿名化 | Google ToS |
+| [OpenAI Responses API](https://platform.openai.com/) | 匿名化・KC 抽出 (GPT-5 nano) | OpenAI ToS |
