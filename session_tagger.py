@@ -384,3 +384,26 @@ class SessionTagger:
         except Exception as e:
             log.warning(f"SessionTagger API error: {e}")
             return None
+
+    def build_batch_input(self, segments: list[dict]) -> tuple:
+        """Build (system_prompt, user_message) for Batch API submission.
+
+        Returns ("", "") if input is too short.
+        """
+        session_text = self._build_input(segments)
+        if not session_text or len(session_text) < 10:
+            return ("", "")
+        system_prompt = self._build_system_prompt()
+        return (system_prompt, session_text)
+
+    def validate_and_save_tags(self, raw_json: str) -> Optional[dict]:
+        """Parse and validate raw JSON from Batch API response.
+
+        Returns validated tags dict with tagged_at, or None on parse error.
+        """
+        parsed = self._parse_response(raw_json)
+        if parsed is None:
+            return None
+        tags = self._validate_tags(parsed)
+        tags["tagged_at"] = datetime.now().isoformat()
+        return tags

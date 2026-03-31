@@ -15,6 +15,8 @@ from batch_corrector import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
+    JOB_STATUS_TAGGING,
+    JOB_STATUS_TAG_SUBMITTED,
 )
 from llm_pipeline import LLMPipeline, PipelineResult
 
@@ -46,17 +48,34 @@ def _make_mock_pipeline(corrected_texts=None, stages_run=None, api_calls=2):
     return pipeline
 
 
-def _create_test_session(tmpdir, session_id, segments):
+def _make_mock_tagger(tags=None, fail=False):
+    """Create a mock SessionTagger."""
+    tagger = mock.MagicMock()
+    tagger.enabled = True
+
+    if fail:
+        tagger.tag_session.side_effect = Exception("tagger error")
+    else:
+        tagger.tag_session.return_value = tags
+
+    return tagger
+
+
+def _create_test_session(tmpdir, session_id, segments, llm_corrected=False):
     """Create a test session directory with transcript.json."""
     session_dir = os.path.join(tmpdir, session_id)
     os.makedirs(session_dir, exist_ok=True)
+    session_meta = {
+        "start": "2026-03-28T10:00:00",
+        "duration_seconds": 60,
+        "model": "large-v3",
+        "language": "ja",
+    }
+    if llm_corrected:
+        session_meta["llm_corrected"] = True
+        session_meta["llm_corrected_at"] = "2026-03-28T10:05:00"
     transcript = {
-        "session": {
-            "start": "2026-03-28T10:00:00",
-            "duration_seconds": 60,
-            "model": "large-v3",
-            "language": "ja",
-        },
+        "session": session_meta,
         "segments": segments,
     }
     with open(os.path.join(session_dir, "transcript.json"), "w") as f:
@@ -83,6 +102,16 @@ class TestBatchJob:
         restored = BatchJob.from_dict(d)
         assert restored.session_id == "test"
         assert restored.changes == 5
+
+    def test_new_fields_roundtrip(self):
+        """New tagging fields should survive serialization."""
+        job = BatchJob(session_id="t1", tagged=True, tag_error="err")
+        d = job.to_dict()
+        assert d["tagged"] is True
+        assert d["tag_error"] == "err"
+        restored = BatchJob.from_dict(d)
+        assert restored.tagged is True
+        assert restored.tag_error == "err"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +152,21 @@ class TestBatchCorrector:
             bc.enqueue("session1")  # duplicate
             assert bc.get_status()["total"] == 1
 
+    def test_enqueue_dedup_tagging_status(self):
+        """Jobs in TAGGING or TAG_SUBMITTED status should not be re-queued."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=tmpdir, config_dir=config_dir,
+                pipeline=pipeline, known_terms=[],
+            )
+            bc.enqueue("s1")
+            bc._jobs["s1"].status = JOB_STATUS_TAGGING
+            bc.enqueue("s1")  # should not re-queue
+            assert bc._jobs["s1"].status == JOB_STATUS_TAGGING
+
     def test_queue_persistence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_dir = os.path.join(tmpdir, "config")
@@ -162,6 +206,24 @@ class TestBatchCorrector:
             jobs = bc.get_jobs()
             assert jobs[0]["status"] == JOB_STATUS_QUEUED
 
+    def test_tagging_status_preserved_on_restart(self):
+        """TAGGING jobs stay as TAGGING on restart (correction already done)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+
+            queue = [BatchJob(session_id="s1", status=JOB_STATUS_TAGGING).to_dict()]
+            with open(os.path.join(config_dir, "batch_llm_queue.json"), "w") as f:
+                json.dump(queue, f)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=tmpdir, config_dir=config_dir,
+                pipeline=pipeline, known_terms=[],
+            )
+            jobs = bc.get_jobs()
+            assert jobs[0]["status"] == JOB_STATUS_TAGGING
+
     def test_retry_failed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_dir = os.path.join(tmpdir, "config")
@@ -195,6 +257,25 @@ class TestBatchCorrector:
             queued = bc.get_jobs(status=JOB_STATUS_QUEUED)
             assert len(queued) == 1
             assert queued[0]["session_id"] == "s1"
+
+    def test_get_status_includes_tagging(self):
+        """get_status should count tagging/tag_submitted jobs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=tmpdir, config_dir=config_dir,
+                pipeline=pipeline, known_terms=[],
+            )
+            bc.enqueue("s1")
+            bc.enqueue("s2")
+            bc._jobs["s1"].status = JOB_STATUS_TAGGING
+            bc._jobs["s2"].status = JOB_STATUS_TAG_SUBMITTED
+
+            status = bc.get_status()
+            assert status["jobs"]["tagging"] == 1
+            assert status["jobs"]["tag_submitted"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +366,223 @@ class TestBatchProcessing:
 
             assert job.status == JOB_STATUS_FAILED
             assert "not found" in job.error
+
+
+# ---------------------------------------------------------------------------
+# Tagging integration tests
+# ---------------------------------------------------------------------------
+
+class TestBatchTagging:
+    @pytest.mark.asyncio
+    async def test_process_sync_with_tagging(self):
+        """Correction → TAGGING → sync tagging → SUCCEEDED with tags saved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [
+                {"text": "ドッカーのコンテナ", "start": 0.0, "end": 2.0},
+            ]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline(
+                corrected_texts=["Dockerのコンテナ"],
+                stages_run=["A", "B"],
+            )
+            tags = {
+                "topics": ["technology"],
+                "activity": "debugging",
+                "intent": "problem_solving",
+                "mood": "neutral",
+                "quality": "clean",
+                "entities": ["Docker"],
+                "summary": "Dockerコンテナの話",
+                "tagged_at": "2026-04-01T00:00:00",
+            }
+            tagger = _make_mock_tagger(tags=tags)
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=["Docker"],
+                session_tagger=tagger,
+                tagging_enabled=True,
+            )
+
+            job = bc.enqueue("s1")
+
+            # Step 1: correction phase → transitions to TAGGING
+            await bc._process_sync(job)
+            assert job.status == JOB_STATUS_TAGGING
+
+            # Step 2: tagging phase → transitions to SUCCEEDED
+            await bc._process_sync_tagging(job)
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.tagged is True
+            assert job.tag_error == ""
+
+            # Verify transcript.json has both corrections and tags
+            with open(os.path.join(recordings_dir, "s1/transcript.json")) as f:
+                data = json.load(f)
+            assert data["segments"][0]["text"] == "Dockerのコンテナ"
+            assert data["session"]["llm_corrected"] is True
+            assert data["session"]["session_tagged"] is True
+            assert data["session"]["tags"]["activity"] == "debugging"
+
+    @pytest.mark.asyncio
+    async def test_tagging_failure_still_succeeds(self):
+        """Tagging failure → job still SUCCEEDED, tag_error recorded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 2.0}]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline()
+            tagger = _make_mock_tagger(fail=True)
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                session_tagger=tagger,
+                tagging_enabled=True,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)  # correction → TAGGING
+            assert job.status == JOB_STATUS_TAGGING
+
+            await bc._process_sync_tagging(job)  # tagging fails
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.tagged is False
+            assert "tagger error" in job.tag_error
+
+    @pytest.mark.asyncio
+    async def test_tagging_disabled_skips(self):
+        """When tagging_enabled=False, correction → SUCCEEDED directly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 2.0}]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline()
+            tagger = _make_mock_tagger(tags={"topics": ["test"]})
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                session_tagger=tagger,
+                tagging_enabled=False,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.tagged is False
+
+    @pytest.mark.asyncio
+    async def test_tagging_no_tagger_skips(self):
+        """When session_tagger=None, tagging_enabled is forced False."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 2.0}]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline()
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                session_tagger=None,
+                tagging_enabled=True,
+            )
+            # tagging_enabled should be forced False
+            assert bc._tagging_enabled is False
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+            assert job.status == JOB_STATUS_SUCCEEDED
+
+    @pytest.mark.asyncio
+    async def test_skip_correction_if_already_done(self):
+        """Sessions with llm_corrected=True skip correction, go to tagging."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "Dockerのコンテナ", "start": 0.0, "end": 2.0}]
+            _create_test_session(recordings_dir, "s1", segments, llm_corrected=True)
+
+            # Use a mock pipeline that tracks calls
+            pipeline = mock.MagicMock(spec=LLMPipeline)
+            pipeline.enabled = True
+            tags = {"topics": ["tech"], "activity": "other", "tagged_at": "now"}
+            tagger = _make_mock_tagger(tags=tags)
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                session_tagger=tagger,
+                tagging_enabled=True,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+
+            # Should skip correction (pipeline not called) and go to TAGGING
+            assert job.status == JOB_STATUS_TAGGING
+            pipeline.process_segments.assert_not_called()
+
+            # Then tagging
+            await bc._process_sync_tagging(job)
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.tagged is True
+
+    @pytest.mark.asyncio
+    async def test_tagger_returns_none(self):
+        """Tagger returning None → job succeeds with tag_error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 2.0}]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline()
+            tagger = _make_mock_tagger(tags=None)  # returns None
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                session_tagger=tagger,
+                tagging_enabled=True,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)  # → TAGGING
+            await bc._process_sync_tagging(job)
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.tagged is False
+            assert "None" in job.tag_error

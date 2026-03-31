@@ -1044,22 +1044,29 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
             else:
                 log.warning("Post-session diarization failed, keeping original segments")
 
-        # Session tagging (after diarization, outside gpu_lock)
-        if (session_tagger and session_tagger.enabled
-                and len(recorder.all_segments) > 0):
-            try:
-                tags = await loop.run_in_executor(
-                    None,
-                    lambda: session_tagger.tag_session(recorder.all_segments),
-                )
-                if tags:
-                    recorder.session_tags = tags
-            except Exception as e:
-                log.warning(f"Session tagging failed (post-diarize): {e}")
+        # Session tagging: skip if batch_corrector will handle it post-correction
+        if not batch_corrector:
+            if (session_tagger and session_tagger.enabled
+                    and len(recorder.all_segments) > 0):
+                try:
+                    tags = await loop.run_in_executor(
+                        None,
+                        lambda: session_tagger.tag_session(recorder.all_segments),
+                    )
+                    if tags:
+                        recorder.session_tags = tags
+                except Exception as e:
+                    log.warning(f"Session tagging failed (post-diarize): {e}")
     except Exception as e:
         log.error(f"Diarization error: {e}", exc_info=True)
     finally:
         recorder.finalize()
+        # Enqueue for batch LLM correction + tagging
+        if (batch_corrector and recorder.enabled
+                and hasattr(recorder, 'session_dir') and recorder.session_dir
+                and len(recorder.all_segments) > 0):
+            session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
+            batch_corrector.enqueue(session_id)
 
 
 # ============================================================
@@ -1866,23 +1873,27 @@ async def handle_connection(websocket):
         else:
             log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
 
-    async def _tag_and_finalize(rec):
-        """Tag session, finalize recorder, then enqueue for batch LLM correction."""
-        if (session_tagger and session_tagger.enabled
-                and len(rec.all_segments) > 0):
-            try:
-                loop = asyncio.get_running_loop()
-                tags = await loop.run_in_executor(
-                    None,
-                    lambda: session_tagger.tag_session(rec.all_segments),
-                )
-                if tags:
-                    rec.session_tags = tags
-            except Exception as e:
-                log.warning(f"Session tagging failed: {e}")
+    async def _finalize_and_enqueue(rec):
+        """Finalize recorder and enqueue for batch LLM correction + tagging."""
+        # When batch_corrector handles tagging post-correction, skip tagging here
+        if not batch_corrector:
+            # Fallback: tag immediately if no batch corrector
+            if (session_tagger and session_tagger.enabled
+                    and len(rec.all_segments) > 0):
+                try:
+                    loop = asyncio.get_running_loop()
+                    tags = await loop.run_in_executor(
+                        None,
+                        lambda: session_tagger.tag_session(rec.all_segments),
+                    )
+                    if tags:
+                        rec.session_tags = tags
+                except Exception as e:
+                    log.warning(f"Session tagging failed: {e}")
+
         rec.finalize()
 
-        # Enqueue for async LLM correction (Layer 3)
+        # Enqueue for async LLM correction + tagging (Layer 3)
         if batch_corrector and rec.enabled and not rec._finalized:
             pass  # finalize failed or empty session
         elif (batch_corrector and rec.enabled
@@ -1931,7 +1942,7 @@ async def handle_connection(websocket):
                     # 発話なし — セッションタイムアウト判定
                     elapsed_silence = time.time() - last_speech_time
                     if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
-                        await _tag_and_finalize(recorder)
+                        await _finalize_and_enqueue(recorder)
                         log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                         recorder = None
 
@@ -1986,7 +1997,7 @@ async def handle_connection(websocket):
                         if rms < SILENCE_THRESHOLD:
                             elapsed_silence = time.time() - last_speech_time
                             if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
-                                await _tag_and_finalize(recorder)
+                                await _finalize_and_enqueue(recorder)
                                 log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                                 recorder = None
                             total_audio_seconds += buffer_duration
@@ -2054,7 +2065,7 @@ async def handle_connection(websocket):
         else:
             # diarization なし → タグ付け + finalize
             if recorder is not None:
-                await _tag_and_finalize(recorder)
+                await _finalize_and_enqueue(recorder)
 
         duration = time.time() - session_start
         log.info(
@@ -2155,6 +2166,8 @@ async def main():
             mode=LLM_BATCH_MODE,
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=LLM_MODEL,
+            session_tagger=session_tagger,
+            tagging_enabled=TAGGING_ENABLED,
         )
         await batch_corrector.start()
         log.info("Batch LLM corrector: worker started (mode=%s)", LLM_BATCH_MODE)
