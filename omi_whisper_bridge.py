@@ -67,7 +67,7 @@ LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "AB")       # Pipeline stages to run (A/B/C)
 STAGE_C_AUTO = os.environ.get("STAGE_C_AUTO", "true").lower() in ("true", "1", "yes")  # Auto-trigger 3-C
-LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "batch")             # "batch" (Gemini Batch API) or "sync"
+LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "sync")              # "sync" (standard API) or "batch" (Gemini Batch API, slow)
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")

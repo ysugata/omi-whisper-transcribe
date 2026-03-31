@@ -619,6 +619,28 @@ class BatchCorrector:
 
         self._save_queue()
 
+    @staticmethod
+    def _strip_additional_properties(schema: dict) -> dict:
+        """Recursively strip additionalProperties from a JSON Schema.
+
+        Gemini Batch API does not support this keyword and rejects it
+        with 400 INVALID_ARGUMENT.
+        """
+        import copy
+        s = copy.deepcopy(schema)
+
+        def _strip(obj):
+            if isinstance(obj, dict):
+                obj.pop("additionalProperties", None)
+                for v in obj.values():
+                    _strip(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _strip(v)
+
+        _strip(s)
+        return s
+
     def _build_batch_requests(self, segments: list, glossary: list) -> list:
         """Build inline requests for Gemini Batch API from pipeline stages."""
         from llm_pipeline_prompt import CANDIDATE_SYSTEM_PROMPT, CORRECTION_SYSTEM_PROMPT
@@ -658,7 +680,7 @@ class BatchCorrector:
                 "config": {
                     "system_instruction": {"parts": [{"text": CANDIDATE_SYSTEM_PROMPT}]},
                     "response_mime_type": "application/json",
-                    "response_schema": CANDIDATE_OBJECT_SCHEMA,
+                    "response_schema": self._strip_additional_properties(CANDIDATE_OBJECT_SCHEMA),
                 },
             })
 
@@ -678,7 +700,7 @@ class BatchCorrector:
                 "config": {
                     "system_instruction": {"parts": [{"text": CORRECTION_SYSTEM_PROMPT}]},
                     "response_mime_type": "application/json",
-                    "response_schema": CORRECTION_OBJECT_SCHEMA,
+                    "response_schema": self._strip_additional_properties(CORRECTION_OBJECT_SCHEMA),
                 },
             })
 
@@ -759,7 +781,7 @@ class BatchCorrector:
                 "config": {
                     "system_instruction": {"parts": [{"text": system_prompt}]},
                     "response_mime_type": "application/json",
-                    "response_schema": TAGGING_OBJECT_SCHEMA,
+                    "response_schema": self._strip_additional_properties(TAGGING_OBJECT_SCHEMA),
                 },
             }
 
