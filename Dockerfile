@@ -25,6 +25,10 @@ COPY hotword_loader.py .
 COPY speaker_filter.py .
 COPY session_tagger.py .
 COPY training_sanitizer.py .
+COPY responses_sanitizer.py .
+COPY sanitize_provider.py .
+COPY sanitize_schema.py .
+COPY sanitize_prompt.py .
 COPY test_whisper.py .
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント

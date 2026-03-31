@@ -140,6 +140,7 @@ from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
 from session_tagger import SessionTagger
 from training_sanitizer import TrainingSanitizer
+from responses_sanitizer import ResponsesSanitizer
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -199,22 +200,75 @@ if TAGGING_ENABLED and LLM_API_KEY:
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
 # SANITIZE_MODEL supports both Gemini and OpenAI models:
-#   gemini-*  → uses GEMINI_API_KEY + Gemini base URL
-#   gpt-*     → uses OPENAI_API_KEY + OpenAI base URL
+#   gemini-*  → TrainingSanitizer (Chat Completions API, GEMINI_API_KEY)
+#   gpt-*     → ResponsesSanitizer (Responses API + Structured Outputs, OPENAI_API_KEY)
 SANITIZE_MODEL = os.environ.get("SANITIZE_MODEL", "gemini-2.5-flash")
+SANITIZE_USE_RESPONSES_API = os.environ.get(
+    "SANITIZE_USE_RESPONSES_API", "auto"
+).lower()  # auto | true | false
+
+# Responses API 用の追加設定
+OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
+OPENAI_TIMEOUT_MS = int(os.environ.get("OPENAI_TIMEOUT_MS", "60000"))
+
 training_sanitizer: TrainingSanitizer | None = None
-if SANITIZE_MODEL.startswith("gpt-"):
-    _sanitize_key = OPENAI_API_KEY
-    _sanitize_url = "https://api.openai.com/v1/"
-else:
-    _sanitize_key = GEMINI_API_KEY
-    _sanitize_url = LLM_BASE_URL
-if _sanitize_key:
-    training_sanitizer = TrainingSanitizer(
-        api_key=_sanitize_key,
-        base_url=_sanitize_url,
+responses_sanitizer: ResponsesSanitizer | None = None
+
+# Responses API を使うかどうか判定
+_use_responses = False
+if SANITIZE_USE_RESPONSES_API == "true":
+    _use_responses = True
+elif SANITIZE_USE_RESPONSES_API == "auto":
+    _use_responses = SANITIZE_MODEL.startswith("gpt-")
+# else: false → 常に Chat Completions
+
+if _use_responses and OPENAI_API_KEY:
+    responses_sanitizer = ResponsesSanitizer(
+        api_key=OPENAI_API_KEY,
         model=SANITIZE_MODEL,
+        reasoning_effort=OPENAI_REASONING_EFFORT,
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        timeout_ms=OPENAI_TIMEOUT_MS,
     )
+else:
+    # Gemini or fallback Chat Completions API
+    if SANITIZE_MODEL.startswith("gpt-"):
+        _sanitize_key = OPENAI_API_KEY
+        _sanitize_url = "https://api.openai.com/v1/"
+    else:
+        _sanitize_key = GEMINI_API_KEY
+        _sanitize_url = LLM_BASE_URL
+    if _sanitize_key:
+        training_sanitizer = TrainingSanitizer(
+            api_key=_sanitize_key,
+            base_url=_sanitize_url,
+            model=SANITIZE_MODEL,
+        )
+
+
+def _build_raw_text_from_transcript(transcript: dict) -> str:
+    """transcript.json から Responses API 用の raw_text を構築する."""
+    parts = []
+    session = transcript.get("session", {})
+    tags = session.get("tags", {})
+    if tags:
+        summary = tags.get("summary", "")
+        if summary:
+            parts.append(f"[要約] {summary}")
+
+    segments = transcript.get("segments", [])
+    for seg in segments[:80]:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        speaker = seg.get("person_name") or seg.get("speaker", "")
+        if speaker:
+            parts.append(f"[{speaker}] {text}")
+        else:
+            parts.append(text)
+
+    return "\n".join(parts)
 
 
 def _get_known_terms() -> list[str]:
@@ -2670,9 +2724,53 @@ async def main():
                         continue
 
                     try:
-                        result = await loop.run_in_executor(
-                            None, training_sanitizer.sanitize_session, transcript
-                        )
+                        if responses_sanitizer is not None:
+                            # Responses API: transcript → raw_text を構築
+                            raw_text = _build_raw_text_from_transcript(transcript)
+                            rs_result = await loop.run_in_executor(
+                                None,
+                                responses_sanitizer.sanitize,
+                                sess_path, raw_text, "ja",
+                            )
+                            if rs_result is None:
+                                _batch_sanitize_state["failed"] += 1
+                                continue
+                            # Responses API の出力を JSONL に書き込み
+                            out_rec = {"session_id": sess_path, **rs_result.data}
+                            if rs_result.data.get("risk") == "high":
+                                _batch_sanitize_state["dropped"] += 1
+                                _batch_sanitize_state["processed"] += 1
+                                log.info(f"Sanitize: {sess_path} → high risk, dropped")
+                                continue
+                            out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+                            _batch_sanitize_state["records_generated"] += 1
+                            _batch_sanitize_state["processed"] += 1
+                            log.info(
+                                f"Sanitize: {sess_path} → {rs_result.data.get('risk', '?')}"
+                            )
+                        else:
+                            # Chat Completions API (既存)
+                            result = await loop.run_in_executor(
+                                None, training_sanitizer.sanitize_session, transcript
+                            )
+                            if result is None:
+                                _batch_sanitize_state["failed"] += 1
+                                continue
+                            if result["risk_level"] == "high":
+                                _batch_sanitize_state["dropped"] += 1
+                                _batch_sanitize_state["processed"] += 1
+                                log.info(f"Sanitize: {sess_path} → high risk, dropped")
+                                continue
+                            for rec in result["records"]:
+                                rec["session_id"] = sess_path
+                                rec["risk_level"] = result["risk_level"]
+                                out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                                _batch_sanitize_state["records_generated"] += 1
+                            _batch_sanitize_state["processed"] += 1
+                            log.info(
+                                f"Sanitize: {sess_path} → {result['risk_level']}, "
+                                f"{len(result['records'])} records"
+                            )
                     except Exception as e:
                         _batch_sanitize_state["failed"] += 1
                         _batch_sanitize_state["errors"].append(
@@ -2680,28 +2778,6 @@ async def main():
                         )
                         log.error(f"Sanitize error for {sess_path}: {e}")
                         continue
-
-                    if result is None:
-                        _batch_sanitize_state["failed"] += 1
-                        continue
-
-                    if result["risk_level"] == "high":
-                        _batch_sanitize_state["dropped"] += 1
-                        _batch_sanitize_state["processed"] += 1
-                        log.info(f"Sanitize: {sess_path} → high risk, dropped")
-                        continue
-
-                    for rec in result["records"]:
-                        rec["session_id"] = sess_path
-                        rec["risk_level"] = result["risk_level"]
-                        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        _batch_sanitize_state["records_generated"] += 1
-
-                    _batch_sanitize_state["processed"] += 1
-                    log.info(
-                        f"Sanitize: {sess_path} → {result['risk_level']}, "
-                        f"{len(result['records'])} records"
-                    )
                     await asyncio.sleep(0)
 
         except Exception as e:
@@ -2720,9 +2796,9 @@ async def main():
             )
 
     async def handle_sanitize_start(request):
-        if training_sanitizer is None:
+        if training_sanitizer is None and responses_sanitizer is None:
             return web.json_response(
-                {"error": "GEMINI_API_KEY not configured"}, status=503
+                {"error": "No sanitizer configured (set GEMINI_API_KEY or OPENAI_API_KEY)"}, status=503
             )
         if _batch_sanitize_state["running"]:
             return web.json_response(

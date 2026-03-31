@@ -46,6 +46,7 @@ def _make_sanitizer():
         s._model = "gemini-2.0-flash"
         s._temperature = 0.3
         s._max_tokens = 4096
+        s._use_max_completion_tokens = False
         s._client = MagicMock()
         return s
 
