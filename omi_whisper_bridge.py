@@ -67,6 +67,8 @@ LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_BATCH_INTERVAL = float(os.environ.get("LLM_BATCH_INTERVAL", "60"))   # Batch flush interval (seconds)
 LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "20"))             # Flush when this many segments accumulate
+LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "ABC")      # Pipeline stages to run (A/B/C)
+LLM_FLUSH_MODE = os.environ.get("LLM_FLUSH_MODE", "smart")              # "smart" or "fixed"
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -134,6 +136,7 @@ log = logging.getLogger("omi-whisper")
 
 from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
+from llm_pipeline import LLMPipeline
 from diarizer import Diarizer
 from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
@@ -155,6 +158,17 @@ if LLM_ENABLED and LLM_API_KEY:
         base_url=LLM_BASE_URL,
         model=LLM_MODEL,
         timeout=LLM_TIMEOUT,
+    )
+
+# Layer 3 Pipeline: 3-stage LLM correction (replaces single-call corrector for realtime)
+llm_pipeline: LLMPipeline | None = None
+if LLM_ENABLED and LLM_API_KEY:
+    llm_pipeline = LLMPipeline(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=LLM_MODEL,
+        timeout=LLM_TIMEOUT,
+        stages=LLM_PIPELINE_STAGES,
     )
 
 # 話者分離 (HF_AUTH_TOKEN があれば常に利用可能)
@@ -287,6 +301,60 @@ def _get_known_terms() -> list[str]:
         terms.add(w)
 
     return sorted(terms)
+
+
+def _build_session_glossary(
+    segments: list[dict],
+    known_terms: list[str] | None,
+    max_glossary: int = 50,
+) -> list[str]:
+    """Build a session-specific glossary filtered by segment text relevance.
+
+    1. Extract katakana words from segment text
+    2. Include known_terms that substring-match segment text
+    3. Include hotwords that substring-match segment text
+    4. Cap at max_glossary
+    """
+    import re as _re
+    combined_text = " ".join(seg.get("text", "") for seg in segments)
+    if not combined_text.strip():
+        return []
+
+    # Extract katakana words from text (3+ chars)
+    katakana_words = set(_re.findall(r'[\u30A0-\u30FF]{3,}', combined_text))
+
+    glossary: list[str] = []
+    seen: set[str] = set()
+
+    # Add known_terms that appear as substring in text
+    if known_terms:
+        for term in known_terms:
+            if term in combined_text and term not in seen:
+                glossary.append(term)
+                seen.add(term)
+
+    # Add hotwords custom words matching text
+    for word in hotword_loader.get_custom_words():
+        if word in combined_text and word not in seen:
+            glossary.append(word)
+            seen.add(word)
+
+    # Add extracted katakana words not already included
+    for kw in sorted(katakana_words):
+        if kw not in seen:
+            glossary.append(kw)
+            seen.add(kw)
+
+    # Add remaining known_terms (not yet included) up to limit
+    if known_terms:
+        for term in known_terms:
+            if term not in seen:
+                glossary.append(term)
+                seen.add(term)
+            if len(glossary) >= max_glossary:
+                break
+
+    return glossary[:max_glossary]
 
 
 _PENDING_SUGGESTIONS_PATH = os.path.join(CONFIG_DIR, "pending_suggestions.json")
@@ -1702,7 +1770,7 @@ async def handle_connection(websocket):
     )
 
     # Layer 3 用の参考用語リスト
-    session_known_terms = _get_known_terms() if llm_corrector else None
+    session_known_terms = _get_known_terms() if (llm_corrector or llm_pipeline) else None
     # Hotwords (デコーダバイアス)
     session_hotwords = ""
     if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
@@ -1789,7 +1857,7 @@ async def handle_connection(websocket):
             recorder.add_segments(rec_segments)
 
             # Queue for deferred LLM batch correction
-            if llm_corrector:
+            if llm_pipeline or llm_corrector:
                 llm_pending.extend(recorder.all_segments[-len(rec_segments):])
 
             log.info(
@@ -1808,7 +1876,7 @@ async def handle_connection(websocket):
     async def _flush_llm():
         """Flush accumulated segments to LLM for batch correction."""
         nonlocal last_llm_flush
-        if not llm_corrector or not llm_pending:
+        if not (llm_pipeline or llm_corrector) or not llm_pending:
             return
 
         segments_to_correct = list(llm_pending)
@@ -1817,14 +1885,47 @@ async def handle_connection(websocket):
         log.info(f"LLM batch: correcting {len(segments_to_correct)} segments")
 
         loop = asyncio.get_running_loop()
-        corrected = await loop.run_in_executor(
-            None,
-            lambda segs=segments_to_correct, terms=session_known_terms: llm_corrector.correct_segments(
-                segs,
-                known_terms=terms,
-                min_text_length=LLM_MIN_TEXT_LENGTH,
-            ),
-        )
+
+        if llm_pipeline:
+            # 3-stage pipeline
+            glossary = _build_session_glossary(
+                segments_to_correct, session_known_terms,
+            )
+            pipeline_result = await loop.run_in_executor(
+                None,
+                lambda segs=segments_to_correct, terms=session_known_terms, gl=glossary: llm_pipeline.process_segments(
+                    segs,
+                    known_terms=terms,
+                    session_glossary=gl,
+                    min_text_length=LLM_MIN_TEXT_LENGTH,
+                ),
+            )
+            corrected = pipeline_result.corrected_segments
+
+            stages_info = "+".join(pipeline_result.stages_run)
+            retry_info = " (retried)" if pipeline_result.retried else ""
+            log.info(
+                f"LLM pipeline: stages={stages_info}, "
+                f"api_calls={pipeline_result.api_calls}{retry_info}"
+            )
+
+            # Log audit issues if any
+            if pipeline_result.audit and pipeline_result.audit.items:
+                for item in pipeline_result.audit.items:
+                    log.info(
+                        f"LLM audit [{item.severity}] line={item.line} "
+                        f"{item.issue_type}: '{item.text_span}'"
+                    )
+        else:
+            # Legacy single-call corrector
+            corrected = await loop.run_in_executor(
+                None,
+                lambda segs=segments_to_correct, terms=session_known_terms: llm_corrector.correct_segments(
+                    segs,
+                    known_terms=terms,
+                    min_text_length=LLM_MIN_TEXT_LENGTH,
+                ),
+            )
 
         # Apply corrections in place (same objects as recorder.all_segments)
         changed = 0
@@ -1846,10 +1947,29 @@ async def handle_connection(websocket):
 
     async def _maybe_flush_llm():
         """Check if LLM batch should be flushed and do so if needed."""
-        if not llm_corrector or not llm_pending:
+        if not (llm_pipeline or llm_corrector) or not llm_pending:
             return
-        if (len(llm_pending) >= LLM_BATCH_SIZE or
-                time.time() - last_llm_flush >= LLM_BATCH_INTERVAL):
+
+        now = time.time()
+        # Time-based flush is always forced
+        if now - last_llm_flush >= LLM_BATCH_INTERVAL:
+            await _flush_llm()
+            return
+
+        if len(llm_pending) >= LLM_BATCH_SIZE:
+            if LLM_FLUSH_MODE == "smart" and len(llm_pending) < int(LLM_BATCH_SIZE * 1.5):
+                # Smart mode: check for gap between last two segments (topic boundary)
+                if len(llm_pending) >= 2:
+                    prev_end = llm_pending[-2].get("end", 0)
+                    curr_start = llm_pending[-1].get("start", 0)
+                    gap = curr_start - prev_end
+                    if gap >= 2.0:
+                        # Topic boundary detected
+                        log.debug(f"Smart flush: gap={gap:.1f}s detected")
+                        await _flush_llm()
+                        return
+                # No gap — wait up to 1.5x batch size
+                return
             await _flush_llm()
 
     async def _tag_and_finalize(rec):
@@ -2008,7 +2128,7 @@ async def handle_connection(websocket):
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
-                        if llm_corrector:
+                        if llm_pipeline or llm_corrector:
                             llm_pending.extend(recorder.all_segments[-len(rec_segments):])
                         try:
                             ws_segments = _offset_segments(raw_segments, total_audio_seconds)
@@ -2066,8 +2186,12 @@ async def main():
              f"compression_ratio_thresh={COMPRESSION_RATIO_THRESHOLD}")
     log.info(f"Config dir: {CONFIG_DIR}")
     log.info(f"Term corrections: {_TERM_CORRECTIONS_PATH} ({len(term_corrector.list_corrections())} entries)")
-    if llm_corrector:
-        log.info(f"Layer 3 LLM: {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, "
+    if llm_pipeline:
+        log.info(f"Layer 3 LLM Pipeline: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, "
+                 f"flush={LLM_FLUSH_MODE}, min_text={LLM_MIN_TEXT_LENGTH}, "
+                 f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")
+    elif llm_corrector:
+        log.info(f"Layer 3 LLM (legacy): {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, "
                  f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")
     else:
         reason = "DISABLED" if not LLM_ENABLED else "no GEMINI_API_KEY"
