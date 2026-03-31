@@ -113,6 +113,8 @@ class TrainingSanitizer:
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        # OpenAI GPT-5+ models require max_completion_tokens instead of max_tokens
+        self._use_max_completion_tokens = model.startswith("gpt-")
         self._client = None
 
         if self._enabled:
@@ -266,16 +268,21 @@ class TrainingSanitizer:
             return None
 
         try:
-            response = self._client.chat.completions.create(
+            kwargs = dict(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": input_text},
                 ],
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
                 response_format={"type": "json_object"},
             )
+            if self._use_max_completion_tokens:
+                # GPT-5+ models: max_completion_tokens, no custom temperature
+                kwargs["max_completion_tokens"] = self._max_tokens
+            else:
+                kwargs["max_tokens"] = self._max_tokens
+                kwargs["temperature"] = self._temperature
+            response = self._client.chat.completions.create(**kwargs)
             raw = response.choices[0].message.content
             log.debug(f"TrainingSanitizer raw response: {raw[:300]}")
 

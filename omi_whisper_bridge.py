@@ -58,7 +58,9 @@ COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD"
 
 # --- Layer 3: LLM 後処理設定 ---
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
-LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+LLM_API_KEY = GEMINI_API_KEY  # Default LLM uses Gemini
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
@@ -196,12 +198,21 @@ if TAGGING_ENABLED and LLM_API_KEY:
     )
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
+# SANITIZE_MODEL supports both Gemini and OpenAI models:
+#   gemini-*  → uses GEMINI_API_KEY + Gemini base URL
+#   gpt-*     → uses OPENAI_API_KEY + OpenAI base URL
 SANITIZE_MODEL = os.environ.get("SANITIZE_MODEL", "gemini-2.5-flash")
 training_sanitizer: TrainingSanitizer | None = None
-if LLM_API_KEY:
+if SANITIZE_MODEL.startswith("gpt-"):
+    _sanitize_key = OPENAI_API_KEY
+    _sanitize_url = "https://api.openai.com/v1/"
+else:
+    _sanitize_key = GEMINI_API_KEY
+    _sanitize_url = LLM_BASE_URL
+if _sanitize_key:
     training_sanitizer = TrainingSanitizer(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=_sanitize_key,
+        base_url=_sanitize_url,
         model=SANITIZE_MODEL,
     )
 

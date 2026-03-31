@@ -26,6 +26,7 @@ services:
       - NO_SPEECH_THRESHOLD=${NO_SPEECH_THRESHOLD:-0.6}
       - COMPRESSION_RATIO_THRESHOLD=${COMPRESSION_RATIO_THRESHOLD:-2.4}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - LLM_ENABLED=${LLM_ENABLED:-true}
       - LLM_MODEL=${LLM_MODEL:-gemini-2.5-flash-lite}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-10}
@@ -54,6 +55,7 @@ services:
       - VOICE_FILTER_THRESHOLD=${VOICE_FILTER_THRESHOLD:-0}
       - TAGGING_ENABLED=${TAGGING_ENABLED:-true}
       - TAGGING_MODEL=${TAGGING_MODEL:-gemini-2.5-flash-lite}
+      - SANITIZE_MODEL=${SANITIZE_MODEL:-gemini-2.5-flash}
       - OMI_WHISPER_TOKEN=${OMI_WHISPER_TOKEN:-}
     deploy:
       resources:

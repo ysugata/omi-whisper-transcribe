@@ -8,3 +8,5 @@ dist/
 build/
 .venv/
 venv/
+config/safe_training_*.jsonl
+config/model_comparison_*
