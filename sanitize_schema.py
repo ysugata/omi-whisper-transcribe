@@ -3,8 +3,11 @@
 strict: true で安定動作するように設計。
 - 全オブジェクトに additionalProperties: false
 - 全プロパティを required に含める
-- knowledge_card は anyOf で null 許容
 - enum で揺れを防止
+
+2-step pipeline:
+  Step 1 (SANITIZE_SCHEMA): risk, summary, keypoints, safe_conversation, issues_detected
+  Step 2 (KC_EXTRACTION_SCHEMA): evidence-based knowledge_card extraction from cleaned data
 """
 
 import logging
@@ -20,7 +23,6 @@ log = logging.getLogger(__name__)
 # strict: true 制約:
 #   - additionalProperties: false 必須
 #   - required に全プロパティ列挙必須
-#   - anyOf は {"type": "null"} との組み合わせで nullable 表現
 # ---------------------------------------------------------------------------
 
 SANITIZE_SCHEMA = {
@@ -62,21 +64,6 @@ SANITIZE_SCHEMA = {
                     "additionalProperties": False,
                 },
             },
-            "knowledge_card": {
-                # null 許容: 作れない場合は null を返す
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string"},
-                            "answer": {"type": "string"},
-                        },
-                        "required": ["question", "answer"],
-                        "additionalProperties": False,
-                    },
-                    {"type": "null"},
-                ],
-            },
             "issues_detected": {
                 "type": "array",
                 "items": {
@@ -95,7 +82,6 @@ SANITIZE_SCHEMA = {
             "summary",
             "keypoints",
             "safe_conversation",
-            "knowledge_card",
             "issues_detected",
         ],
         "additionalProperties": False,
@@ -145,14 +131,6 @@ def validate_schema(data: dict) -> bool:
     conv = data.get("safe_conversation")
     if not isinstance(conv, list):
         return False
-
-    # knowledge_card (nullable)
-    kc = data.get("knowledge_card")
-    if kc is not None:
-        if not isinstance(kc, dict):
-            return False
-        if "question" not in kc or "answer" not in kc:
-            return False
 
     # issues_detected
     if not isinstance(data.get("issues_detected"), list):
@@ -210,8 +188,115 @@ def run_quality_gates(data: dict) -> list[str]:
         if pii_hits >= 2:
             warnings.append(f"risk_low_but_pii_found:{pii_hits}")
 
-    # 6. knowledge_card が作れない
-    if data.get("knowledge_card") is None:
-        warnings.append("knowledge_card_null")
+    # 6. knowledge_card の品質検証 (Step 2 で追加された場合)
+    kc = data.get("knowledge_card")
+    if kc is not None and isinstance(kc, dict):
+        kc_warnings = validate_knowledge_card(kc)
+        warnings.extend(kc_warnings)
 
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Knowledge Card Extraction Schema
+# ---------------------------------------------------------------------------
+# Step 1 の cleaned output (summary, keypoints, safe_conversation) のみを入力とし、
+# evidence-based で knowledge_card を抽出する。
+# extractable=false の場合は question/answer/evidence は空文字列/空配列。
+# ---------------------------------------------------------------------------
+
+KC_EXTRACTION_SCHEMA = {
+    "type": "json_schema",
+    "name": "knowledge_card_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "extractable": {
+                "type": "boolean",
+            },
+            "question": {
+                "type": "string",
+            },
+            "answer": {
+                "type": "string",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["none", "low", "medium", "high"],
+            },
+        },
+        "required": ["extractable", "question", "answer", "evidence", "confidence"],
+        "additionalProperties": False,
+    },
+}
+
+# Minimum keypoints to attempt KC extraction
+KC_MIN_KEYPOINTS = 3
+
+
+def validate_knowledge_card(kc: dict) -> list[str]:
+    """Knowledge card の品質ゲートを実行し warnings を返す.
+
+    Quality gates:
+    1. evidence が 1 件以上あること
+    2. confidence が low/none でないこと
+    3. question が抽象的すぎないこと (10 文字以上)
+    4. answer が一般論でないこと (15 文字以上)
+    """
+    warnings: list[str] = []
+
+    if not kc.get("extractable", False):
+        return warnings  # extractable=false なら検証不要
+
+    # 1. evidence >= 1
+    evidence = kc.get("evidence", [])
+    if not evidence:
+        warnings.append("kc_no_evidence")
+        return warnings  # evidence なしは致命的 → 他の検証は不要
+
+    # 2. confidence != low/none
+    confidence = kc.get("confidence", "none")
+    if confidence in ("none", "low"):
+        warnings.append(f"kc_weak_confidence:{confidence}")
+
+    # 3. question の長さ
+    question = kc.get("question", "")
+    if len(question) < 10:
+        warnings.append("kc_question_too_short")
+
+    # 4. answer の長さ
+    answer = kc.get("answer", "")
+    if len(answer) < 15:
+        warnings.append("kc_answer_too_short")
+
+    return warnings
+
+
+def should_keep_knowledge_card(kc: dict) -> bool:
+    """Knowledge card を最終出力に含めるべきか判定する.
+
+    False を返す場合、knowledge_card は null にフォールバックする。
+    """
+    if not kc.get("extractable", False):
+        return False
+
+    # evidence must exist
+    if not kc.get("evidence"):
+        return False
+
+    # confidence must be medium or high
+    if kc.get("confidence", "none") in ("none", "low"):
+        return False
+
+    # question/answer must have substance
+    if len(kc.get("question", "")) < 10:
+        return False
+    if len(kc.get("answer", "")) < 15:
+        return False
+
+    return True

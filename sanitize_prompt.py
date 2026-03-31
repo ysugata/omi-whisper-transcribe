@@ -1,11 +1,14 @@
-"""Sanitize system prompt — Responses API 用.
+"""Sanitize system prompts — Responses API 用.
+
+2-step pipeline:
+  Step 1: SANITIZE_INSTRUCTIONS — 匿名化・構造化 (risk, summary, keypoints, safe_conversation, issues_detected)
+  Step 2: KC_EXTRACTION_INSTRUCTIONS — evidence-based knowledge_card extraction from cleaned data
 
 プロンプトを定数として分離し、モデルやプロバイダを問わず再利用できるようにする。
-training_sanitizer.py の旧プロンプトとは出力スキーマが異なる点に注意。
 """
 
 # ---------------------------------------------------------------------------
-# Responses API 用 instructions (system prompt)
+# Step 1: Sanitize instructions (system prompt)
 # ---------------------------------------------------------------------------
 # Responses API では instructions パラメータで渡す。
 # structured outputs (json_schema) を使うため、出力フォーマットの記述は最小限にし、
@@ -66,10 +69,6 @@ raw_text は音声認識の出力なので、以下のノイズが含まれま�
 - ASR ノイズ・誤認識語を含めない
 - 匿名化済み
 
-### knowledge_card
-- 有用な Q&A にできる場合のみ生成する
-- 作れない場合は null を返す
-
 ### issues_detected
 - 以下のいずれかに該当する問題を検出した場合に配列に追加:
   - "asr_noise": 入力に ASR ノイズが多い
@@ -82,4 +81,45 @@ raw_text は音声認識の出力なので、以下のノイズが含まれま�
 - 不明点は断定せず一般化する
 - JSON 以外のテキストは返さない (structured outputs で強制されます)
 - 出力は簡潔だが情報不足にならないようにする
+"""
+
+# ---------------------------------------------------------------------------
+# Step 2: Knowledge Card Extraction instructions
+# ---------------------------------------------------------------------------
+# Step 1 の cleaned output のみを入力とし、evidence-based で Q&A を抽出する。
+# 「生成」ではなく「根拠付き抽出」— テキストに書かれていないことは書かない。
+# ---------------------------------------------------------------------------
+
+KC_EXTRACTION_INSTRUCTIONS = """\
+あなたはテキストから Q&A ペアを**抽出**する専門家です。
+「生成」ではなく「抽出」です。テキストに書かれていない知識を追加しないでください。
+
+## 入力
+匿名化・整理済みのテキスト (summary, keypoints, safe_conversation) が与えられます。
+
+## タスク
+このテキストから、有用な Q&A ペアを **最大 1 つ** 抽出してください。
+
+## ルール
+
+1. **evidence (根拠) が必須**: answer の根拠となる safe_conversation の発話を evidence 配列に入れること。
+   evidence に入れる文は safe_conversation のテキストをそのまま引用すること。
+2. **answer はテキスト内の情報のみ**: evidence に含まれない事実や一般知識を answer に書かない。
+3. **confidence の判定基準**:
+   - high: evidence が 2 件以上かつ answer が evidence だけで完結する
+   - medium: evidence が 1 件で answer が evidence から導ける
+   - low: evidence が曖昧、answer に推測を含む
+   - none: Q&A が抽出できない
+4. **extractable の判定**:
+   - テキストに具体的事実・手順・決定事項が含まれていれば true
+   - 雑談・感情表現のみ・抽象的な話題のみの場合は false
+5. **extractable=false の場合**: question="", answer="", evidence=[], confidence="none"
+6. **question は具体的に**: 「〜について教えてください」のような漠然とした質問ではなく、
+   テキスト内容に基づいた具体的な質問にすること。
+7. **answer は簡潔に**: evidence の情報を整理して 1〜3 文で回答すること。
+
+## 禁止事項
+- テキストに書かれていない外部知識を使わない
+- 一般論や常識的見解で answer を書かない
+- evidence なしで Q&A を作らない
 """

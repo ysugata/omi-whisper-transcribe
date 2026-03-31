@@ -4,6 +4,7 @@
 - OpenAI API はモックする (実 API 呼び出しなし)
 - スキーマ検証・品質ゲートはユニットテスト
 - fixture 2件 (low risk / high risk) を使用
+- 2-step pipeline: Step 1 (sanitize) + Step 2 (knowledge card extraction)
 """
 
 import json
@@ -16,11 +17,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from responses_sanitizer import ResponsesSanitizer, _RetryableError, _FatalError
-from sanitize_schema import SANITIZE_SCHEMA, validate_schema, run_quality_gates
+from sanitize_schema import (
+    KC_EXTRACTION_SCHEMA,
+    KC_MIN_KEYPOINTS,
+    SANITIZE_SCHEMA,
+    run_quality_gates,
+    should_keep_knowledge_card,
+    validate_knowledge_card,
+    validate_schema,
+)
 
 
 # ---------------------------------------------------------------------------
-# Fixture data: LLM の応答をシミュレーション
+# Fixture data: Step 1 LLM response (no knowledge_card)
 # ---------------------------------------------------------------------------
 
 FIXTURE_LOW_RISK = {
@@ -41,10 +50,6 @@ FIXTURE_LOW_RISK = {
         {"speaker": "user", "text": "バックエンドの進捗はどうでしたか？"},
         {"speaker": "assistant", "text": "Aさんから進捗報告がありました。順調に進んでいるとのことです。"},
     ],
-    "knowledge_card": {
-        "question": "プロジェクト計画ミーティングではどのような内容を話し合いますか？",
-        "answer": "新機能の優先順位決定、テストスケジュールの確認、各担当からの進捗報告などを行います。",
-    },
     "issues_detected": ["asr_noise"],
 }
 
@@ -62,8 +67,35 @@ FIXTURE_HIGH_RISK = {
         {"speaker": "assistant", "text": "増員を予定しています。詳細は非開示です。"},
         {"speaker": "user", "text": "了解です。"},
     ],
-    "knowledge_card": None,
     "issues_detected": ["pii_redacted", "asr_noise"],
+}
+
+# Step 2: KC extraction response fixtures
+FIXTURE_KC_EXTRACTABLE = {
+    "extractable": True,
+    "question": "プロジェクト計画ミーティングではどのような決定がされましたか？",
+    "answer": "新機能の優先順位を決定し、テストスケジュールを確認した。バックエンドは順調に進んでいる。",
+    "evidence": [
+        "来月のプロジェクト計画について話し合いました。新機能の優先順位を決めて、テストスケジュールも確認しました。",
+        "Aさんから進捗報告がありました。順調に進んでいるとのことです。",
+    ],
+    "confidence": "high",
+}
+
+FIXTURE_KC_NOT_EXTRACTABLE = {
+    "extractable": False,
+    "question": "",
+    "answer": "",
+    "evidence": [],
+    "confidence": "none",
+}
+
+FIXTURE_KC_WEAK = {
+    "extractable": True,
+    "question": "何を話した？",
+    "answer": "色々。",
+    "evidence": [],
+    "confidence": "low",
 }
 
 
@@ -100,7 +132,7 @@ def _make_sanitizer(model: str = "gpt-5-nano") -> ResponsesSanitizer:
 
 
 # ---------------------------------------------------------------------------
-# Test: sanitize_schema.py
+# Test: sanitize_schema.py — Step 1 Schema
 # ---------------------------------------------------------------------------
 
 class TestSanitizeSchema:
@@ -118,12 +150,39 @@ class TestSanitizeSchema:
     def test_schema_required_fields(self):
         required = SANITIZE_SCHEMA["schema"]["required"]
         for field in ["risk", "summary", "keypoints", "safe_conversation",
-                      "knowledge_card", "issues_detected"]:
+                      "issues_detected"]:
             assert field in required
+
+    def test_schema_no_knowledge_card(self):
+        """Step 1 schema does not include knowledge_card."""
+        required = SANITIZE_SCHEMA["schema"]["required"]
+        assert "knowledge_card" not in required
+        props = SANITIZE_SCHEMA["schema"]["properties"]
+        assert "knowledge_card" not in props
 
     def test_schema_additional_properties_false(self):
         schema = SANITIZE_SCHEMA["schema"]
         assert schema["additionalProperties"] is False
+
+
+class TestKCExtractionSchema:
+    """KC_EXTRACTION_SCHEMA の構造テスト."""
+
+    def test_schema_has_strict(self):
+        assert KC_EXTRACTION_SCHEMA["strict"] is True
+
+    def test_schema_required_fields(self):
+        required = KC_EXTRACTION_SCHEMA["schema"]["required"]
+        for field in ["extractable", "question", "answer", "evidence", "confidence"]:
+            assert field in required
+
+    def test_confidence_enum(self):
+        conf = KC_EXTRACTION_SCHEMA["schema"]["properties"]["confidence"]
+        assert conf["enum"] == ["none", "low", "medium", "high"]
+
+    def test_evidence_is_array(self):
+        ev = KC_EXTRACTION_SCHEMA["schema"]["properties"]["evidence"]
+        assert ev["type"] == "array"
 
 
 class TestValidateSchema:
@@ -151,21 +210,47 @@ class TestValidateSchema:
         assert validate_schema("string") is False
         assert validate_schema([]) is False
 
-    def test_null_knowledge_card(self):
-        data = {**FIXTURE_LOW_RISK, "knowledge_card": None}
-        assert validate_schema(data) is True
 
-    def test_invalid_knowledge_card(self):
-        data = {**FIXTURE_LOW_RISK, "knowledge_card": {"only_question": "test"}}
-        assert validate_schema(data) is False
+class TestKnowledgeCardValidation:
+    """validate_knowledge_card() と should_keep_knowledge_card() のテスト."""
+
+    def test_extractable_high_confidence(self):
+        warnings = validate_knowledge_card(FIXTURE_KC_EXTRACTABLE)
+        assert len(warnings) == 0
+        assert should_keep_knowledge_card(FIXTURE_KC_EXTRACTABLE) is True
+
+    def test_not_extractable(self):
+        warnings = validate_knowledge_card(FIXTURE_KC_NOT_EXTRACTABLE)
+        assert len(warnings) == 0  # extractable=false → no validation
+        assert should_keep_knowledge_card(FIXTURE_KC_NOT_EXTRACTABLE) is False
+
+    def test_weak_confidence_rejected(self):
+        warnings = validate_knowledge_card(FIXTURE_KC_WEAK)
+        assert any("kc_no_evidence" in w for w in warnings)
+        assert should_keep_knowledge_card(FIXTURE_KC_WEAK) is False
+
+    def test_low_confidence_rejected(self):
+        kc = {**FIXTURE_KC_EXTRACTABLE, "confidence": "low"}
+        assert should_keep_knowledge_card(kc) is False
+
+    def test_short_question_rejected(self):
+        kc = {**FIXTURE_KC_EXTRACTABLE, "question": "何？"}
+        assert should_keep_knowledge_card(kc) is False
+
+    def test_short_answer_rejected(self):
+        kc = {**FIXTURE_KC_EXTRACTABLE, "answer": "わからない"}
+        assert should_keep_knowledge_card(kc) is False
+
+    def test_medium_confidence_accepted(self):
+        kc = {**FIXTURE_KC_EXTRACTABLE, "confidence": "medium"}
+        assert should_keep_knowledge_card(kc) is True
 
 
 class TestQualityGates:
     """run_quality_gates() のテスト."""
 
-    def test_clean_data_no_warnings(self):
+    def test_clean_data_no_critical_warnings(self):
         warnings = run_quality_gates(FIXTURE_LOW_RISK)
-        # knowledge_card が有効なので knowledge_card_null は出ない
         assert "keypoints_empty" not in warnings
         assert "conversation_too_short" not in warnings
 
@@ -181,10 +266,31 @@ class TestQualityGates:
         warnings = run_quality_gates(data)
         assert "conversation_too_short" in warnings
 
-    def test_null_knowledge_card_warning(self):
-        data = {**FIXTURE_LOW_RISK, "knowledge_card": None}
+    def test_no_knowledge_card_null_warning(self):
+        """knowledge_card_null warning is removed (Step 2 handles KC)."""
+        data = {**FIXTURE_LOW_RISK}
+        # No knowledge_card key at all
         warnings = run_quality_gates(data)
-        assert "knowledge_card_null" in warnings
+        assert "knowledge_card_null" not in warnings
+
+    def test_kc_quality_gate_integrated(self):
+        """KC quality warnings integrated into run_quality_gates."""
+        data = {
+            **FIXTURE_LOW_RISK,
+            "knowledge_card": FIXTURE_KC_WEAK,
+        }
+        warnings = run_quality_gates(data)
+        assert any("kc_" in w for w in warnings)
+
+    def test_kc_good_no_extra_warnings(self):
+        """Good KC adds no warnings."""
+        data = {
+            **FIXTURE_LOW_RISK,
+            "knowledge_card": FIXTURE_KC_EXTRACTABLE,
+        }
+        warnings = run_quality_gates(data)
+        kc_warnings = [w for w in warnings if w.startswith("kc_")]
+        assert len(kc_warnings) == 0
 
     def test_pii_in_low_risk(self):
         data = {
@@ -220,25 +326,77 @@ class TestQualityGates:
 class TestResponsesSanitizer:
     """ResponsesSanitizer のユニットテスト."""
 
-    def test_sanitize_low_risk(self):
+    def test_sanitize_low_risk_with_kc(self):
+        """Step 1 + Step 2: KC extraction succeeds."""
         s = _make_sanitizer()
-        s._client.responses.create.return_value = _make_mock_response(FIXTURE_LOW_RISK)
+        # Step 1: sanitize, Step 2: KC extraction
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_EXTRACTABLE),
+        ]
 
         result = s.sanitize("test-session/01", "今日のミーティングでは計画を話し合いました。" * 3)
         assert result is not None
         assert result.session_id == "test-session/01"
         assert result.data["risk"] == "low"
-        assert len(result.data["keypoints"]) >= 1
+        assert len(result.data["keypoints"]) >= KC_MIN_KEYPOINTS
+        # KC should be present
+        assert result.data["knowledge_card"] is not None
+        assert result.data["knowledge_card"]["confidence"] == "high"
+        assert len(result.data["knowledge_card"]["evidence"]) >= 1
 
-    def test_sanitize_high_risk(self):
+    def test_sanitize_low_risk_kc_not_extractable(self):
+        """Step 2 returns extractable=false → knowledge_card=null."""
         s = _make_sanitizer()
-        s._client.responses.create.return_value = _make_mock_response(FIXTURE_HIGH_RISK)
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_NOT_EXTRACTABLE),
+        ]
+
+        result = s.sanitize("test-session/01", "今日のミーティングでは計画を話し合いました。" * 3)
+        assert result is not None
+        assert result.data["knowledge_card"] is None
+
+    def test_sanitize_few_keypoints_skips_kc(self):
+        """keypoints < KC_MIN_KEYPOINTS → KC extraction skipped."""
+        s = _make_sanitizer()
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_HIGH_RISK),
+            # Step 2 should NOT be called
+        ]
 
         result = s.sanitize("test-session/02", "佐藤部長が採用計画について説明しました。" * 3)
         assert result is not None
         assert result.data["risk"] == "high"
         assert result.data["knowledge_card"] is None
-        assert "pii_redacted" in result.data["issues_detected"]
+        # Only 1 API call (Step 1 only)
+        assert s._client.responses.create.call_count == 1
+
+    def test_sanitize_kc_quality_gate_rejects(self):
+        """Step 2 returns weak KC → quality gate rejects → null."""
+        s = _make_sanitizer()
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_WEAK),
+        ]
+
+        result = s.sanitize("test-session/01", "今日のミーティングでは計画を話し合いました。" * 3)
+        assert result is not None
+        assert result.data["knowledge_card"] is None
+
+    def test_sanitize_kc_api_error_graceful(self):
+        """Step 2 API error → knowledge_card=null (doesn't fail whole sanitize)."""
+        s = _make_sanitizer()
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_LOW_RISK),
+            Exception("API error"),
+        ]
+
+        result = s.sanitize("test-session/01", "今日のミーティングでは計画を話し合いました。" * 3)
+        assert result is not None
+        assert result.data["knowledge_card"] is None
+        # Step 1 still succeeded
+        assert result.data["risk"] == "low"
 
     def test_sanitize_disabled(self):
         s = _make_sanitizer()
@@ -256,10 +414,11 @@ class TestResponsesSanitizer:
         s = _make_sanitizer()
         s._max_retries = 2
 
-        # 1回目: タイムアウト, 2回目: 成功
+        # 1回目: タイムアウト, 2回目: Step 1 成功 + Step 2 成功
         s._client.responses.create.side_effect = [
             Exception("timeout error"),
             _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_EXTRACTABLE),
         ]
 
         with patch("responses_sanitizer.time.sleep"):  # sleep をスキップ
@@ -277,6 +436,7 @@ class TestResponsesSanitizer:
         s._client.responses.create.side_effect = [
             _make_mock_response(invalid_data),
             _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_EXTRACTABLE),
         ]
 
         result = s.sanitize("test", "テストテキスト" * 10)
@@ -314,7 +474,10 @@ class TestResponsesSanitizer:
     def test_usage_tracking(self):
         """usage 情報がトラッキングされること."""
         s = _make_sanitizer()
-        s._client.responses.create.return_value = _make_mock_response(FIXTURE_LOW_RISK)
+        s._client.responses.create.side_effect = [
+            _make_mock_response(FIXTURE_LOW_RISK),
+            _make_mock_response(FIXTURE_KC_EXTRACTABLE),
+        ]
 
         result = s.sanitize("test", "テストテキスト" * 10)
         assert result is not None
@@ -324,12 +487,15 @@ class TestResponsesSanitizer:
     def test_warnings_tracked(self):
         """品質ゲート warnings が結果に含まれること."""
         s = _make_sanitizer()
-        data_no_kcard = {**FIXTURE_LOW_RISK, "knowledge_card": None}
-        s._client.responses.create.return_value = _make_mock_response(data_no_kcard)
+        # Return data with empty keypoints to trigger warning
+        data_few_kp = {**FIXTURE_LOW_RISK, "keypoints": []}
+        s._client.responses.create.side_effect = [
+            _make_mock_response(data_few_kp),
+        ]
 
         result = s.sanitize("test", "テストテキスト" * 10)
         assert result is not None
-        assert "knowledge_card_null" in result.warnings
+        assert "keypoints_empty" in result.warnings
 
     def test_provider_name(self):
         s = _make_sanitizer()
