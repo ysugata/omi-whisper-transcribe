@@ -6,6 +6,7 @@ API エラー時は元テキストをそのまま返す（テキストを失わ�
 """
 
 import difflib
+import json
 import logging
 import re
 from typing import Optional
@@ -13,10 +14,14 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # 差分検出フィルタ用正規表現
-_PUNCT_RE = re.compile(r'^[\s、。,.!?・…―「」『』（）()\-–—]+$')
+_PUNCT_RE = re.compile(r'^[\s、。,.!?！？・…―「」『』（）()\-–—]+$')
 _NUM_RE = re.compile(r'^[\d０-９\s.,%]+$')
 
-SYSTEM_PROMPT = """あなたは音声文字起こしテキストの校正者です。
+# Punctuation-only diff filter: true if the ONLY difference is punctuation style
+_PUNCT_CHARS = set('、。,.!?！？・…―「」『』（）()-–—　 ')
+
+# Legacy prompt for single-segment correct() — kept for backward compat
+_LEGACY_SYSTEM_PROMPT = """あなたは音声文字起こしテキストの校正者です。
 番号付きの発話テキストが入力されます。全体の文脈と参考用語リストを活用して以下のルールに従ってください:
 
 1. 固有名詞・技術用語・社名・プロダクト名の誤認識を修正する
@@ -29,6 +34,71 @@ SYSTEM_PROMPT = """あなたは音声文字起こしテキストの校正者で�
 8. 句読点の追加・削除はしない
 9. 入力と同じ [番号] 形式で、修正後のテキストだけを返す
 10. 修正が不要な行も入力をそのまま返す"""
+
+# Backward compat alias
+SYSTEM_PROMPT = _LEGACY_SYSTEM_PROMPT
+
+# Optimized prompt for batch correct_segments() — diff-only JSON output
+BATCH_SYSTEM_PROMPT = """あなたは日本語の音声文字起こし (ASR) テキストの校正者です。
+修正が必要な行のみを corrections 配列に返してください。修正不要な行は返さないでください。
+
+## 修正対象 (具体例付き)
+
+### 1. 単語の脱落・途切れ (ASR が途中で切った)
+- 「100年クエス」→「100年クエスト」
+- 「仲いいとことか」→「仲いいところとか」
+- 「諦まないわえ」→「諦めないわ」(活用形の誤り)
+
+### 2. カタカナ技術用語 → 正しい表記
+- 「ドッカー」→「Docker」
+- 「クーバネティス」→「Kubernetes」
+- 「ジュピターノートブック」→「Jupyter Notebook」
+
+### 3. 音が似た別の語への誤認識
+- 「フェアディテール」→「フェアリーテイル」(固有名詞)
+- 「足ごとにも及ばん」→「足元にも及ばん」(慣用句)
+- 「マホウ」→「魔法」(カタカナ→漢字)
+
+### 4. カンマ区切りノイズ断片
+- 「本文、トカ、ナンカ、」→「本文」(末尾ノイズ除去)
+
+## 禁止事項
+- **句読点の変換禁止**: ?, ! はそのまま残す。？, ！ に変えない。逆も同様
+- **句読点の追加・削除禁止**: 「。」「、」を足したり消したりしない
+- 発言の意味・内容・語順を変えない
+- カタカナの会話語をローマ字や英語に変えない (例: 「スターバックス」をそのまま残す)
+- 叫び声・感嘆表現はそのまま残す (例: 「ギルダァァァ!」は変えない)
+- 曖昧な箇所は修正しない — 確信がある誤りだけ修正する
+- 参考用語リストにない語を推測で修正しない"""
+
+CORRECTIONS_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "asr_corrections",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "corrections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "line": {"type": "integer"},
+                            "original": {"type": "string"},
+                            "corrected": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["line", "original", "corrected", "reason"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["corrections"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class LLMCorrector:
@@ -116,7 +186,7 @@ class LLMCorrector:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": _LEGACY_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=self._temperature,
@@ -155,6 +225,50 @@ class LLMCorrector:
 
         return result
 
+    @staticmethod
+    def _is_punctuation_only_change(original: str, corrected: str) -> bool:
+        """Check if the only difference between original and corrected is punctuation."""
+        if original == corrected:
+            return True
+        # Strip all punctuation chars, compare the rest
+        strip = lambda s: ''.join(c for c in s if c not in _PUNCT_CHARS)
+        return strip(original) == strip(corrected)
+
+    @staticmethod
+    def _filter_corrections(
+        corrections: list[dict],
+        original_texts: dict[int, str],
+    ) -> list[dict]:
+        """Post-filter LLM corrections to remove no-ops and punctuation-only changes.
+
+        Args:
+            corrections: list of {"line": int, "original": str, "corrected": str, "reason": str}
+            original_texts: {1-indexed line number: original text} for lookup
+        Returns:
+            Filtered list of corrections.
+        """
+        filtered = []
+        for c in corrections:
+            line = c.get("line", 0)
+            corrected = c.get("corrected", "").strip()
+            # Use the actual original text from input, not what LLM echoes back
+            original = original_texts.get(line, c.get("original", "")).strip()
+
+            # Skip no-change
+            if original == corrected:
+                log.debug(f"Filter: no-change on line {line}")
+                continue
+            # Skip empty corrected
+            if not corrected:
+                continue
+            # Skip punctuation-only changes
+            if LLMCorrector._is_punctuation_only_change(original, corrected):
+                log.debug(f"Filter: punct-only on line {line}: '{original[:40]}' → '{corrected[:40]}'")
+                continue
+
+            filtered.append(c)
+        return filtered
+
     def correct_segments(
         self,
         segments: list[dict],
@@ -163,7 +277,9 @@ class LLMCorrector:
     ) -> list[dict]:
         """セグメントのリストをまとめて1回の API コールで補正する。
 
-        全セグメントを番号付きリストとして送信し、文脈を活用した補正を行う。
+        Optimized prompt + JSON schema で差分のみを受け取り、
+        ポストフィルタで句読点のみの変更等を除去する。
+        JSON パース失敗時は旧番号付きフォーマットにフォールバック。
         min_text_length 未満の短いセグメントはスキップする。
         """
         if not self._enabled:
@@ -181,6 +297,8 @@ class LLMCorrector:
 
         # 番号付きリストを構築
         lines = [f"[{idx + 1}] {text}" for idx, (_, text) in enumerate(eligible)]
+        # 1-indexed line number → original text mapping for post-filter
+        original_by_line = {idx + 1: text for idx, (_, text) in enumerate(eligible)}
 
         parts = []
         if known_terms:
@@ -193,16 +311,32 @@ class LLMCorrector:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": BATCH_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
+                response_format=CORRECTIONS_SCHEMA,
                 temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                max_tokens=max(self._max_tokens, 4096),
             )
             raw = response.choices[0].message.content
             log.info(f"LLM batch request:\n{user_msg}")
             log.info(f"LLM batch response:\n{raw}")
-            corrected_map = self._parse_batch_response(raw, len(eligible))
+
+            # Try JSON parse first
+            corrected_map = {}
+            try:
+                data = json.loads(raw) if raw else {"corrections": []}
+                corrections = data.get("corrections", [])
+                corrections = self._filter_corrections(corrections, original_by_line)
+                for c in corrections:
+                    line_idx = c.get("line", 0) - 1  # convert to 0-indexed
+                    corrected_text = c.get("corrected", "").strip()
+                    if 0 <= line_idx < len(eligible) and corrected_text:
+                        corrected_map[line_idx] = corrected_text
+                log.info(f"LLM batch: {len(corrections)} corrections after filter (from JSON)")
+            except (json.JSONDecodeError, TypeError, KeyError) as e:
+                log.warning(f"JSON parse failed, falling back to numbered format: {e}")
+                corrected_map = self._parse_batch_response(raw, len(eligible))
 
             # 結果を適用
             result = [dict(seg) for seg in segments]
