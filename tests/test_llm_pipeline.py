@@ -575,3 +575,103 @@ class TestSessionGlossary:
         user_msg = call_args[1]["messages"][1]["content"]
         # Docker should appear once
         assert user_msg.count("Docker") == 1
+
+
+# ---------------------------------------------------------------------------
+# should_run_stage_c tests
+# ---------------------------------------------------------------------------
+
+class TestShouldRunStageC:
+    def test_no_trigger_empty(self):
+        """No candidates, no changes → no trigger."""
+        segs = _make_segments(["テストテキスト二十文字以上必要です"])
+        should, reason = LLMPipeline.should_run_stage_c(
+            None, segs, segs, min_text_length=20,
+        )
+        assert should is False
+        assert reason == ""
+
+    def test_trigger_broken_katakana(self):
+        """3+ broken_katakana candidates → trigger."""
+        candidates = CandidateResult(candidates=[
+            TermCandidate(1, "ガーバナ", "broken_katakana", "Grafana", "high"),
+            TermCandidate(1, "ドッカー", "broken_katakana", "Docker", "high"),
+            TermCandidate(1, "クバネテス", "broken_katakana", "Kubernetes", "medium"),
+        ])
+        segs = _make_segments(["テスト"])
+        should, reason = LLMPipeline.should_run_stage_c(candidates, segs, segs)
+        assert should is True
+        assert "broken/misrecognized=3" in reason
+
+    def test_trigger_low_confidence(self):
+        """2+ low confidence candidates → trigger."""
+        candidates = CandidateResult(candidates=[
+            TermCandidate(1, "フォーデックス", "proper_noun", "", "low"),
+            TermCandidate(2, "ナノクロー", "misrecognized", "", "low"),
+        ])
+        segs = _make_segments(["テスト"])
+        should, reason = LLMPipeline.should_run_stage_c(candidates, segs, segs)
+        assert should is True
+        assert "low_confidence=2" in reason
+
+    def test_trigger_high_correction_density(self):
+        """Correction density > 30% → trigger."""
+        orig = _make_segments([
+            "セグメント一のテキスト二十文字以上必要です",
+            "セグメント二のテキスト二十文字以上必要です",
+            "セグメント三のテキスト二十文字以上必要です",
+        ])
+        corrected = [
+            {"text": "セグメント1のテキスト二十文字以上必要です"},  # changed
+            {"text": "セグメント二のテキスト二十文字以上必要です"},  # same
+            {"text": "セグメント三のテキスト二十文字以上必要です"},  # same
+        ]
+        should, reason = LLMPipeline.should_run_stage_c(
+            None, corrected, orig, min_text_length=10,
+        )
+        # 1/3 = 33% > 30%
+        assert should is True
+        assert "correction_density" in reason
+
+    def test_no_trigger_low_density(self):
+        """1/10 correction density → no trigger."""
+        orig = _make_segments([f"セグメント{i}のテキスト二十文字以上必要です" for i in range(10)])
+        corrected = [dict(s) for s in orig]
+        corrected[0]["text"] = "変更済みセグメントのテキスト二十文字以上必要です"
+        should, _ = LLMPipeline.should_run_stage_c(
+            None, corrected, orig, min_text_length=10,
+        )
+        assert should is False
+
+
+class TestAutoC:
+    def test_auto_c_skips_when_no_trigger(self):
+        """auto_c=True with AB stages: 3-C skipped when no trigger."""
+        resp_a = json.dumps({"candidates": []})
+        resp_b = json.dumps({"corrections": []})
+        # No 3-C response needed since it should be skipped
+        pipeline = _make_pipeline([resp_a, resp_b], stages="ABC")
+        segs = _make_segments(["テストテキスト"])
+        result = pipeline.process_segments(segs, auto_c=True)
+        assert "C" not in result.stages_run
+        assert result.api_calls == 2
+
+    def test_auto_c_runs_when_triggered(self):
+        """auto_c=True: 3-C runs when broken_katakana count triggers."""
+        candidates_resp = json.dumps({
+            "candidates": [
+                {"line": 1, "text_span": "ガーバナ", "category": "broken_katakana",
+                 "suggested_form": "Grafana", "confidence": "high"},
+                {"line": 1, "text_span": "ドッカー", "category": "broken_katakana",
+                 "suggested_form": "Docker", "confidence": "high"},
+                {"line": 1, "text_span": "クバネテス", "category": "broken_katakana",
+                 "suggested_form": "Kubernetes", "confidence": "medium"},
+            ]
+        })
+        resp_b = json.dumps({"corrections": []})
+        resp_c = json.dumps({"items": [], "pass": True})
+        pipeline = _make_pipeline([candidates_resp, resp_b, resp_c], stages="ABC")
+        segs = _make_segments(["ガーバナとドッカーとクバネテスのテスト"])
+        result = pipeline.process_segments(segs, auto_c=True)
+        assert "C" in result.stages_run
+        assert result.api_calls == 3

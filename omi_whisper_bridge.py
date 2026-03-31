@@ -65,10 +65,9 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.google
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
-LLM_BATCH_INTERVAL = float(os.environ.get("LLM_BATCH_INTERVAL", "60"))   # Batch flush interval (seconds)
-LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "20"))             # Flush when this many segments accumulate
-LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "ABC")      # Pipeline stages to run (A/B/C)
-LLM_FLUSH_MODE = os.environ.get("LLM_FLUSH_MODE", "smart")              # "smart" or "fixed"
+LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "AB")       # Pipeline stages to run (A/B/C)
+STAGE_C_AUTO = os.environ.get("STAGE_C_AUTO", "true").lower() in ("true", "1", "yes")  # Auto-trigger 3-C
+LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "batch")             # "batch" (Gemini Batch API) or "sync"
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -137,6 +136,7 @@ log = logging.getLogger("omi-whisper")
 from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
 from llm_pipeline import LLMPipeline
+from batch_corrector import BatchCorrector
 from diarizer import Diarizer
 from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
@@ -160,7 +160,7 @@ if LLM_ENABLED and LLM_API_KEY:
         timeout=LLM_TIMEOUT,
     )
 
-# Layer 3 Pipeline: 3-stage LLM correction (replaces single-call corrector for realtime)
+# Layer 3 Pipeline: 3-stage LLM correction (batch post-processing)
 llm_pipeline: LLMPipeline | None = None
 if LLM_ENABLED and LLM_API_KEY:
     llm_pipeline = LLMPipeline(
@@ -170,6 +170,9 @@ if LLM_ENABLED and LLM_API_KEY:
         timeout=LLM_TIMEOUT,
         stages=LLM_PIPELINE_STAGES,
     )
+
+# Batch corrector: post-session async LLM correction
+batch_corrector: BatchCorrector | None = None
 
 # 話者分離 (HF_AUTH_TOKEN があれば常に利用可能)
 diarizer: Diarizer | None = None
@@ -1769,8 +1772,6 @@ async def handle_connection(websocket):
         speech_pad_ms=VAD_SPEECH_PAD_MS,
     )
 
-    # Layer 3 用の参考用語リスト
-    session_known_terms = _get_known_terms() if (llm_corrector or llm_pipeline) else None
     # Hotwords (デコーダバイアス)
     session_hotwords = ""
     if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
@@ -1792,10 +1793,6 @@ async def handle_connection(websocket):
                 voice_filter_inference = None
         else:
             log.warning("Voice filter: ENABLED but no user speakers with embeddings registered")
-
-    # Layer 3: Deferred LLM batch correction
-    llm_pending: list[dict] = []   # Segment dicts awaiting LLM correction (same refs as recorder.all_segments)
-    last_llm_flush = time.time()
 
     # モデル確保 (未ロードなら自動ロード)
     # バッチ処理中 (diarize/speaker-tag) は gpu_lock が保持されるため
@@ -1856,10 +1853,6 @@ async def handle_connection(websocket):
             rec_segments = _offset_segments(raw_segments, rec_offset)
             recorder.add_segments(rec_segments)
 
-            # Queue for deferred LLM batch correction
-            if llm_pipeline or llm_corrector:
-                llm_pending.extend(recorder.all_segments[-len(rec_segments):])
-
             log.info(
                 f"Transcribed {len(raw_segments)} segment(s) "
                 f"[{elapsed:.2f}s processing, "
@@ -1873,107 +1866,8 @@ async def handle_connection(websocket):
         else:
             log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
 
-    async def _flush_llm():
-        """Flush accumulated segments to LLM for batch correction."""
-        nonlocal last_llm_flush
-        if not (llm_pipeline or llm_corrector) or not llm_pending:
-            return
-
-        segments_to_correct = list(llm_pending)
-        originals = [seg["text"] for seg in segments_to_correct]
-
-        log.info(f"LLM batch: correcting {len(segments_to_correct)} segments")
-
-        loop = asyncio.get_running_loop()
-
-        if llm_pipeline:
-            # 3-stage pipeline
-            glossary = _build_session_glossary(
-                segments_to_correct, session_known_terms,
-            )
-            pipeline_result = await loop.run_in_executor(
-                None,
-                lambda segs=segments_to_correct, terms=session_known_terms, gl=glossary: llm_pipeline.process_segments(
-                    segs,
-                    known_terms=terms,
-                    session_glossary=gl,
-                    min_text_length=LLM_MIN_TEXT_LENGTH,
-                ),
-            )
-            corrected = pipeline_result.corrected_segments
-
-            stages_info = "+".join(pipeline_result.stages_run)
-            retry_info = " (retried)" if pipeline_result.retried else ""
-            log.info(
-                f"LLM pipeline: stages={stages_info}, "
-                f"api_calls={pipeline_result.api_calls}{retry_info}"
-            )
-
-            # Log audit issues if any
-            if pipeline_result.audit and pipeline_result.audit.items:
-                for item in pipeline_result.audit.items:
-                    log.info(
-                        f"LLM audit [{item.severity}] line={item.line} "
-                        f"{item.issue_type}: '{item.text_span}'"
-                    )
-        else:
-            # Legacy single-call corrector
-            corrected = await loop.run_in_executor(
-                None,
-                lambda segs=segments_to_correct, terms=session_known_terms: llm_corrector.correct_segments(
-                    segs,
-                    known_terms=terms,
-                    min_text_length=LLM_MIN_TEXT_LENGTH,
-                ),
-            )
-
-        # Apply corrections in place (same objects as recorder.all_segments)
-        changed = 0
-        for orig_seg, corrected_seg in zip(segments_to_correct, corrected):
-            if orig_seg["text"] != corrected_seg["text"]:
-                orig_seg["text"] = corrected_seg["text"]
-                changed += 1
-
-        if changed:
-            log.info(f"LLM batch: {changed}/{len(segments_to_correct)} segments corrected")
-
-        try:
-            _save_llm_suggestions(originals, corrected)
-        except Exception as e:
-            log.warning(f"Failed to save LLM suggestions: {e}")
-
-        llm_pending.clear()
-        last_llm_flush = time.time()
-
-    async def _maybe_flush_llm():
-        """Check if LLM batch should be flushed and do so if needed."""
-        if not (llm_pipeline or llm_corrector) or not llm_pending:
-            return
-
-        now = time.time()
-        # Time-based flush is always forced
-        if now - last_llm_flush >= LLM_BATCH_INTERVAL:
-            await _flush_llm()
-            return
-
-        if len(llm_pending) >= LLM_BATCH_SIZE:
-            if LLM_FLUSH_MODE == "smart" and len(llm_pending) < int(LLM_BATCH_SIZE * 1.5):
-                # Smart mode: check for gap between last two segments (topic boundary)
-                if len(llm_pending) >= 2:
-                    prev_end = llm_pending[-2].get("end", 0)
-                    curr_start = llm_pending[-1].get("start", 0)
-                    gap = curr_start - prev_end
-                    if gap >= 2.0:
-                        # Topic boundary detected
-                        log.debug(f"Smart flush: gap={gap:.1f}s detected")
-                        await _flush_llm()
-                        return
-                # No gap — wait up to 1.5x batch size
-                return
-            await _flush_llm()
-
     async def _tag_and_finalize(rec):
-        """Tag session then finalize recorder."""
+        """Tag session, finalize recorder, then enqueue for batch LLM correction."""
         if (session_tagger and session_tagger.enabled
                 and len(rec.all_segments) > 0):
             try:
@@ -1985,8 +1879,17 @@ async def handle_connection(websocket):
                 if tags:
                     rec.session_tags = tags
             except Exception as e:
-                log.warning(f"Session tagging failed (silence timeout): {e}")
+                log.warning(f"Session tagging failed: {e}")
         rec.finalize()
+
+        # Enqueue for async LLM correction (Layer 3)
+        if batch_corrector and rec.enabled and not rec._finalized:
+            pass  # finalize failed or empty session
+        elif (batch_corrector and rec.enabled
+              and hasattr(rec, 'session_dir') and rec.session_dir
+              and len(rec.all_segments) > 0):
+            session_id = str(rec.session_dir.relative_to(RECORDINGS_DIR))
+            batch_corrector.enqueue(session_id)
 
     try:
         async for message in websocket:
@@ -2028,7 +1931,6 @@ async def handle_connection(websocket):
                     # 発話なし — セッションタイムアウト判定
                     elapsed_silence = time.time() - last_speech_time
                     if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
-                        await _flush_llm()
                         await _tag_and_finalize(recorder)
                         log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                         recorder = None
@@ -2069,7 +1971,6 @@ async def handle_connection(websocket):
                                  f"{trailing_silence:.1f}s trailing silence)")
 
                     await _transcribe_chunk(chunk)
-                    await _maybe_flush_llm()
 
             else:
                 # ============================================================
@@ -2085,7 +1986,6 @@ async def handle_connection(websocket):
                         if rms < SILENCE_THRESHOLD:
                             elapsed_silence = time.time() - last_speech_time
                             if elapsed_silence >= SILENCE_TIMEOUT and recorder is not None:
-                                await _flush_llm()
                                 await _tag_and_finalize(recorder)
                                 log.info(f"Session finalized due to silence timeout ({elapsed_silence:.0f}s)")
                                 recorder = None
@@ -2094,7 +1994,6 @@ async def handle_connection(websocket):
                         last_speech_time = time.time()
 
                     await _transcribe_chunk(chunk)
-                    await _maybe_flush_llm()
 
     except websockets.exceptions.ConnectionClosed:
         log.info(f"Connection closed: {remote}")
@@ -2128,8 +2027,6 @@ async def handle_connection(websocket):
                     if raw_segments:
                         rec_segments = _offset_segments(raw_segments, rec_offset)
                         recorder.add_segments(rec_segments)
-                        if llm_pipeline or llm_corrector:
-                            llm_pending.extend(recorder.all_segments[-len(rec_segments):])
                         try:
                             ws_segments = _offset_segments(raw_segments, total_audio_seconds)
                             await websocket.send(json.dumps({"segments": ws_segments}))
@@ -2137,12 +2034,6 @@ async def handle_connection(websocket):
                             pass
                 except Exception as e:
                     log.error(f"Error processing remaining buffer: {e}", exc_info=True)
-
-        # Flush remaining LLM corrections before finalize
-        try:
-            await _flush_llm()
-        except Exception as e:
-            log.warning(f"Failed to flush LLM on session end: {e}")
 
         # セッション終了: whisper モデルを解放
         model_manager.release()
@@ -2177,6 +2068,7 @@ async def handle_connection(websocket):
 # ============================================================
 
 async def main():
+    global batch_corrector
     log.info(f"Starting Omi-Whisper bridge on ws://{HOST}:{PORT}")
     log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
@@ -2186,13 +2078,12 @@ async def main():
              f"compression_ratio_thresh={COMPRESSION_RATIO_THRESHOLD}")
     log.info(f"Config dir: {CONFIG_DIR}")
     log.info(f"Term corrections: {_TERM_CORRECTIONS_PATH} ({len(term_corrector.list_corrections())} entries)")
-    if llm_pipeline:
-        log.info(f"Layer 3 LLM Pipeline: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, "
-                 f"flush={LLM_FLUSH_MODE}, min_text={LLM_MIN_TEXT_LENGTH}, "
-                 f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")
-    elif llm_corrector:
-        log.info(f"Layer 3 LLM (legacy): {LLM_MODEL} (min_text={LLM_MIN_TEXT_LENGTH}, "
-                 f"batch={LLM_BATCH_SIZE}segs/{LLM_BATCH_INTERVAL}s, timeout={LLM_TIMEOUT}s)")
+    if batch_corrector:
+        log.info(f"Layer 3 LLM Batch: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, "
+                 f"mode={LLM_BATCH_MODE}, auto_c={STAGE_C_AUTO}, "
+                 f"min_text={LLM_MIN_TEXT_LENGTH}, timeout={LLM_TIMEOUT}s)")
+    elif llm_pipeline:
+        log.info(f"Layer 3 LLM Pipeline: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, no batch)")
     else:
         reason = "DISABLED" if not LLM_ENABLED else "no GEMINI_API_KEY"
         log.info(f"Layer 3 LLM: {reason}")
@@ -2249,6 +2140,24 @@ async def main():
 
     # 起動時に古い録音を削除
     cleanup_old_recordings()
+
+    # Batch corrector initialization (needs known_terms which depend on term_corrector + hotword_loader)
+    if llm_pipeline:
+        known_terms = _get_known_terms()
+        batch_corrector = BatchCorrector(
+            recordings_dir=RECORDINGS_DIR,
+            config_dir=CONFIG_DIR,
+            pipeline=llm_pipeline,
+            known_terms=known_terms,
+            hotword_loader=hotword_loader,
+            stage_c_auto=STAGE_C_AUTO,
+            min_text_length=LLM_MIN_TEXT_LENGTH,
+            mode=LLM_BATCH_MODE,
+            gemini_api_key=GEMINI_API_KEY,
+            gemini_model=LLM_MODEL,
+        )
+        await batch_corrector.start()
+        log.info("Batch LLM corrector: worker started (mode=%s)", LLM_BATCH_MODE)
 
     # 管理 REST API を起動
     from aiohttp import web
@@ -2975,6 +2884,44 @@ async def main():
             },
         )
 
+    # --- Batch LLM correction API ---
+    async def handle_batch_llm_status(request):
+        if not batch_corrector:
+            return web.json_response({"error": "LLM pipeline not configured"}, status=503)
+        return web.json_response(batch_corrector.get_status())
+
+    async def handle_batch_llm_jobs(request):
+        if not batch_corrector:
+            return web.json_response({"error": "LLM pipeline not configured"}, status=503)
+        status_filter = request.query.get("status")
+        limit = int(request.query.get("limit", "50"))
+        return web.json_response(batch_corrector.get_jobs(status=status_filter, limit=limit))
+
+    async def handle_batch_llm_retry(request):
+        if not batch_corrector:
+            return web.json_response({"error": "LLM pipeline not configured"}, status=503)
+        session_id = None
+        try:
+            body = await request.json()
+            session_id = body.get("session_id")
+        except Exception:
+            pass
+        count = batch_corrector.retry_failed(session_id)
+        return web.json_response({"retried": count})
+
+    async def handle_batch_llm_process(request):
+        if not batch_corrector:
+            return web.json_response({"error": "LLM pipeline not configured"}, status=503)
+        try:
+            body = await request.json()
+            session_id = body.get("session_id", "")
+        except Exception:
+            return web.json_response({"error": "session_id required"}, status=400)
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        job = batch_corrector.process_now(session_id)
+        return web.json_response(job.to_dict())
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -3017,6 +2964,11 @@ async def main():
     mgmt_app.router.add_get("/sanitize/status", handle_sanitize_status)
     mgmt_app.router.add_post("/sanitize/cancel", handle_sanitize_cancel)
     mgmt_app.router.add_get("/sanitize/download", handle_sanitize_download)
+    # Batch LLM correction API
+    mgmt_app.router.add_get("/batch/status", handle_batch_llm_status)
+    mgmt_app.router.add_get("/batch/jobs", handle_batch_llm_jobs)
+    mgmt_app.router.add_post("/batch/retry", handle_batch_llm_retry)
+    mgmt_app.router.add_post("/batch/process", handle_batch_llm_process)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()

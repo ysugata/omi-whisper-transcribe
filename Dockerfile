@@ -22,6 +22,7 @@ COPY llm_corrector.py .
 COPY llm_pipeline.py .
 COPY llm_pipeline_schema.py .
 COPY llm_pipeline_prompt.py .
+COPY batch_corrector.py .
 COPY diarizer.py .
 COPY audio_preprocessor.py .
 COPY hotword_loader.py .

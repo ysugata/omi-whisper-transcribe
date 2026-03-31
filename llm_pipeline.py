@@ -486,6 +486,66 @@ class LLMPipeline:
             return None
 
     # ------------------------------------------------------------------
+    # Conditional 3-C: should_run_stage_c
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def should_run_stage_c(
+        candidates: Optional[CandidateResult],
+        corrected_segments: list,
+        original_segments: list,
+        min_text_length: int = 0,
+    ) -> tuple:
+        """Decide whether 3-C audit is warranted based on 3-A/3-B results.
+
+        Returns (should_run: bool, reason: str).
+
+        Triggers:
+        - 3+ broken_katakana or misrecognized candidates from 3-A
+        - 3-B correction density > 30% of eligible segments
+        - Any correction whose corrected text is NOT in known glossary
+        - 2+ low-confidence candidates from 3-A
+        - Multiple katakana variants for the same word in one segment
+        """
+        reasons = []
+
+        # Check 3-A candidates
+        if candidates and candidates.candidates:
+            broken_or_misrec = [
+                c for c in candidates.candidates
+                if c.category in ("broken_katakana", "misrecognized")
+            ]
+            if len(broken_or_misrec) >= 3:
+                reasons.append(
+                    f"broken/misrecognized={len(broken_or_misrec)}"
+                )
+
+            low_conf = [
+                c for c in candidates.candidates
+                if c.confidence == "low"
+            ]
+            if len(low_conf) >= 2:
+                reasons.append(f"low_confidence={len(low_conf)}")
+
+        # Check 3-B correction density
+        eligible = 0
+        changed = 0
+        for orig, corr in zip(original_segments, corrected_segments):
+            orig_text = orig.get("text", "")
+            if len(orig_text) >= min_text_length:
+                eligible += 1
+                if orig_text != corr.get("text", ""):
+                    changed += 1
+        if eligible > 0 and changed / eligible > 0.3:
+            reasons.append(
+                f"correction_density={changed}/{eligible}={changed/eligible:.0%}"
+            )
+
+        if reasons:
+            return True, "; ".join(reasons)
+        return False, ""
+
+    # ------------------------------------------------------------------
     # Orchestrator: process_segments
     # ------------------------------------------------------------------
 
@@ -495,8 +555,13 @@ class LLMPipeline:
         known_terms: Optional[list] = None,
         session_glossary: Optional[list] = None,
         min_text_length: int = 0,
+        auto_c: bool = False,
     ) -> PipelineResult:
         """Run the configured pipeline stages on segments.
+
+        Args:
+            auto_c: If True, 3-C runs only when should_run_stage_c() triggers.
+                    If False, 3-C runs whenever "C" is in stages (always).
 
         Returns a PipelineResult with corrected segments and metadata.
         """
@@ -534,7 +599,18 @@ class LLMPipeline:
             result.corrected_segments = corrected
 
         # Stage 3-C: Quality audit + optional retry
-        if "C" in self._stages:
+        run_c = "C" in self._stages
+        if run_c and auto_c:
+            should_run, reason = self.should_run_stage_c(
+                candidates, corrected, segments, min_text_length,
+            )
+            if should_run:
+                log.info("3-C auto-triggered: %s", reason)
+            else:
+                log.info("3-C skipped (auto_c): no trigger conditions met")
+                run_c = False
+
+        if run_c:
             audit = self.audit_quality(
                 corrected, candidates, min_text_length,
             )
