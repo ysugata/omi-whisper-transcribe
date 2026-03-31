@@ -25,7 +25,17 @@ SYSTEM_PROMPT = """あなたは音声文字起こしテキストの分類・要�
   "mood": "one_of_enum",
   "quality": "one_of_enum",
   "entities": ["Entity1", "Entity2"],
-  "summary": "日本語で1-2文の要約"
+  "summary": "日本語で1-2文の要約",
+  "source_type": "one_of_enum",
+  "business_domain": "one_of_enum",
+  "importance": "one_of_enum",
+  "confidentiality": "one_of_enum",
+  "decision_required": true_or_false,
+  "decision_summary": "何が決まったか (50文字以内、なければnull)",
+  "reasoning_summary": "なぜそう決めたか (50文字以内、なければnull)",
+  "action_items": ["次のステップ"],
+  "outcome": "one_of_enum_or_null",
+  "next_action": "次にやること (50文字以内、なければnull)"
 }
 
 ### topics (1-3個、英語)
@@ -47,7 +57,37 @@ clean (明瞭で完全), partial (部分的に不明瞭), noisy (ノイズ多い
 テキスト中に登場する固有名詞 (人名、地名、サービス名、技術名など) をそのまま抽出。なければ空配列。
 
 ### summary
-日本語で1-2文。何について話していたかの概要。"""
+日本語で1-2文。何について話していたかの概要。
+
+### source_type (英語 enum、1つ)
+会話の形式: meeting, monologue, negotiation, phone_call, dictation, casual_chat, discussion, presentation, other
+
+### business_domain (英語 enum、1つ)
+事業領域: sales, hiring, product_planning, purchasing, customer_service, management, finance, technology, personal, other
+
+### importance (英語 enum、1つ)
+重要度: high (事業判断に直結), medium (参考情報), low (雑談等)
+
+### confidentiality (英語 enum、1つ)
+機密レベル: public (社外共有可), internal (社内限定), confidential (関係者限定)
+
+### decision_required (boolean)
+このセッションで何かの意思決定が行われた/必要とされたか。true or false。
+
+### decision_summary
+何が決まったか、日本語50文字以内。決定事項がなければ null。
+
+### reasoning_summary
+なぜそう決めたか (判断の根拠)、日本語50文字以内。なければ null。
+
+### action_items
+次のステップのリスト (日本語)。最大5件。なければ空配列。
+
+### outcome (英語 enum or null)
+結果: pending (保留中), completed (完了), cancelled (中止), deferred (延期)。該当なしなら null。
+
+### next_action
+次にやること、日本語50文字以内。なければ null。"""
 
 
 # Valid enum values for validation
@@ -63,6 +103,17 @@ _VALID_MOOD = {
     "positive", "neutral", "negative", "mixed", "excited", "frustrated",
 }
 _VALID_QUALITY = {"clean", "partial", "noisy", "fragmented"}
+_VALID_SOURCE_TYPE = {
+    "meeting", "monologue", "negotiation", "phone_call", "dictation",
+    "casual_chat", "discussion", "presentation", "other",
+}
+_VALID_BUSINESS_DOMAIN = {
+    "sales", "hiring", "product_planning", "purchasing", "customer_service",
+    "management", "finance", "technology", "personal", "other",
+}
+_VALID_IMPORTANCE = {"high", "medium", "low"}
+_VALID_CONFIDENTIALITY = {"public", "internal", "confidential"}
+_VALID_OUTCOME = {"pending", "completed", "cancelled", "deferred"}
 
 
 class SessionTagger:
@@ -74,7 +125,7 @@ class SessionTagger:
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
         model: str = "gemini-2.5-flash-lite",
         temperature: float = 0,
-        max_tokens: int = 512,
+        max_tokens: int = 768,
         timeout: int = 15,
         user_tags_path: str = "",
     ) -> None:
@@ -226,6 +277,63 @@ class SessionTagger:
             result["user_tags"] = resolved
         else:
             result["user_tags"] = []
+
+        # --- Business succession fields ---
+
+        # source_type: enum
+        source_type = str(tags.get("source_type", "other")).lower().strip()
+        result["source_type"] = source_type if source_type in _VALID_SOURCE_TYPE else "other"
+
+        # business_domain: enum
+        business_domain = str(tags.get("business_domain", "other")).lower().strip()
+        result["business_domain"] = business_domain if business_domain in _VALID_BUSINESS_DOMAIN else "other"
+
+        # importance: enum
+        importance = str(tags.get("importance", "low")).lower().strip()
+        result["importance"] = importance if importance in _VALID_IMPORTANCE else "low"
+
+        # confidentiality: enum
+        confidentiality = str(tags.get("confidentiality", "internal")).lower().strip()
+        result["confidentiality"] = confidentiality if confidentiality in _VALID_CONFIDENTIALITY else "internal"
+
+        # decision_required: bool
+        result["decision_required"] = bool(tags.get("decision_required", False))
+
+        # decision_summary: string or None (truncate to 100 chars)
+        ds = tags.get("decision_summary")
+        if ds and isinstance(ds, str) and ds.strip():
+            result["decision_summary"] = ds.strip()[:100]
+        else:
+            result["decision_summary"] = None
+
+        # reasoning_summary: string or None (truncate to 100 chars)
+        rs = tags.get("reasoning_summary")
+        if rs and isinstance(rs, str) and rs.strip():
+            result["reasoning_summary"] = rs.strip()[:100]
+        else:
+            result["reasoning_summary"] = None
+
+        # action_items: list of strings (max 5)
+        action_items = tags.get("action_items", [])
+        if isinstance(action_items, list):
+            result["action_items"] = [str(a).strip() for a in action_items[:5] if a and str(a).strip()]
+        else:
+            result["action_items"] = []
+
+        # outcome: enum or None
+        outcome = tags.get("outcome")
+        if outcome and isinstance(outcome, str):
+            outcome = outcome.lower().strip()
+            result["outcome"] = outcome if outcome in _VALID_OUTCOME else None
+        else:
+            result["outcome"] = None
+
+        # next_action: string or None (truncate to 100 chars)
+        na = tags.get("next_action")
+        if na and isinstance(na, str) and na.strip():
+            result["next_action"] = na.strip()[:100]
+        else:
+            result["next_action"] = None
 
         return result
 

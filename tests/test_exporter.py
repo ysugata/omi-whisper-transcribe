@@ -9,7 +9,10 @@ import pytest
 # Make the viewer module importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "omi-recordings-viewer"))
 
-from exporter import merge_turns, to_comprehensive, to_openai, to_conversation, export_session
+from exporter import (
+    merge_turns, to_comprehensive, to_openai, to_conversation,
+    to_knowledge, to_decision_log, to_sop, export_session,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +46,20 @@ TAGS = {
     "quality": "clean",
     "entities": ["Docker"],
     "summary": "AIについて議論した",
+}
+
+TAGS_EXTENDED = {
+    **TAGS,
+    "source_type": "meeting",
+    "business_domain": "technology",
+    "importance": "high",
+    "confidentiality": "internal",
+    "decision_required": True,
+    "decision_summary": "新しいフレームワークを採用する",
+    "reasoning_summary": "開発効率が上がるため",
+    "action_items": ["技術検証を行う", "チームに共有する"],
+    "outcome": "pending",
+    "next_action": "来週までにPoCを完成させる",
 }
 
 
@@ -108,6 +125,19 @@ class TestComprehensive:
         transcript = _make_transcript([], TAGS)
         assert to_comprehensive("id", transcript) is None
 
+    def test_extended_tags_included(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+        result = to_comprehensive("id", transcript)
+        assert result is not None
+        assert result["tags"]["source_type"] == "meeting"
+        assert result["tags"]["business_domain"] == "technology"
+        assert result["tags"]["importance"] == "high"
+        assert result["tags"]["decision_required"] is True
+        assert result["tags"]["decision_summary"] == "新しいフレームワークを採用する"
+        assert result["tags"]["action_items"] == ["技術検証を行う", "チームに共有する"]
+        assert result["tags"]["outcome"] == "pending"
+        assert result["tags"]["next_action"] == "来週までにPoCを完成させる"
+
 
 # ---------------------------------------------------------------------------
 # openai format tests
@@ -126,9 +156,14 @@ class TestOpenAI:
         assert "assistant" in roles
         assert "user" in roles
 
-    def test_monologue(self):
+    def test_monologue_skipped_by_default(self):
         transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
         result = to_openai("id", transcript)
+        assert result is None
+
+    def test_monologue_included_when_requested(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        result = to_openai("id", transcript, include_monologue=True)
         assert result is not None
         messages = result["messages"]
         assert messages[0]["role"] == "system"
@@ -170,9 +205,14 @@ class TestConversation:
         assert any(c["from"] == "gpt" for c in convs)
         assert any(c["from"] == "human" for c in convs)
 
-    def test_monologue(self):
+    def test_monologue_skipped_by_default(self):
         transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
         result = to_conversation("id", transcript)
+        assert result is None
+
+    def test_monologue_included_when_requested(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        result = to_conversation("id", transcript, include_monologue=True)
         assert result is not None
         assert result["conversations"][0]["from"] == "human"
         assert result["conversations"][1]["from"] == "gpt"
@@ -182,6 +222,132 @@ class TestConversation:
         result = to_conversation("id", transcript)
         assert "activity" in result["metadata"]
         assert "quality" in result["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# knowledge format tests
+# ---------------------------------------------------------------------------
+
+class TestKnowledge:
+    def test_basic(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+        result = to_knowledge("id", transcript)
+        assert result is not None
+        assert result["id"] == "id"
+        assert result["category"] == "technology"
+        assert result["importance"] == "high"
+        assert "topics" in result
+        assert result["body"]  # non-empty body
+
+    def test_no_summary_returns_none(self):
+        tags_no_summary = {**TAGS_EXTENDED, "summary": ""}
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_summary)
+        result = to_knowledge("id", transcript)
+        assert result is None
+
+    def test_no_tags_returns_none(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION)
+        result = to_knowledge("id", transcript)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# decision_log format tests
+# ---------------------------------------------------------------------------
+
+class TestDecisionLog:
+    def test_with_decision(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+        result = to_decision_log("id", transcript)
+        assert result is not None
+        assert result["decision_id"] == "id"
+        assert result["title"] == "新しいフレームワークを採用する"
+        assert result["decision"] == "新しいフレームワークを採用する"
+        assert result["reason"] == "開発効率が上がるため"
+        assert len(result["action_items"]) == 2
+        assert result["outcome"] == "pending"
+        assert result["next_action"] == "来週までにPoCを完成させる"
+
+    def test_no_decision_returns_none(self):
+        tags_no_decision = {**TAGS_EXTENDED, "decision_required": False}
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_decision)
+        result = to_decision_log("id", transcript)
+        assert result is None
+
+    def test_basic_tags_returns_none(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
+        result = to_decision_log("id", transcript)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# sop format tests
+# ---------------------------------------------------------------------------
+
+class TestSop:
+    def test_with_action_items(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+        result = to_sop("id", transcript)
+        assert result is not None
+        assert result["id"] == "id"
+        assert len(result["steps"]) == 2
+        assert result["domain"] == "technology"
+
+    def test_no_action_items_returns_none(self):
+        tags_no_actions = {**TAGS_EXTENDED, "action_items": []}
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_actions)
+        result = to_sop("id", transcript)
+        assert result is None
+
+    def test_casual_chat_returns_none(self):
+        tags_casual = {**TAGS_EXTENDED, "activity": "casual_chat"}
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_casual)
+        result = to_sop("id", transcript)
+        assert result is None
+
+    def test_casual_chat_source_type_returns_none(self):
+        tags_casual = {**TAGS_EXTENDED, "source_type": "casual_chat"}
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_casual)
+        result = to_sop("id", transcript)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# monologue skip tests
+# ---------------------------------------------------------------------------
+
+class TestMonologueSkip:
+    def test_openai_skips_monologue_by_default(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        assert to_openai("id", transcript) is None
+
+    def test_openai_includes_monologue_when_requested(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        result = to_openai("id", transcript, include_monologue=True)
+        assert result is not None
+
+    def test_conversation_skips_monologue_by_default(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        assert to_conversation("id", transcript) is None
+
+    def test_conversation_includes_monologue_when_requested(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        result = to_conversation("id", transcript, include_monologue=True)
+        assert result is not None
+
+    def test_export_session_respects_include_monologue(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        # Default (include_monologue=False) → openai skips monologue
+        assert export_session("openai", "id", transcript) is None
+        # Explicit include → produces output
+        line = export_session("openai", "id", transcript, include_monologue=True)
+        assert line is not None
+
+    def test_comprehensive_includes_monologue_by_default(self):
+        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
+        # comprehensive has include_monologue=True by default
+        line = export_session("comprehensive", "id", transcript, include_monologue=True)
+        assert line is not None
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +368,10 @@ class TestExportSession:
             export_session("invalid", "id", transcript)
 
     def test_all_formats_produce_valid_json(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        for fmt in ("comprehensive", "openai", "conversation"):
-            line = export_session(fmt, "id", transcript)
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+        for fmt in ("comprehensive", "openai", "conversation",
+                     "knowledge", "decision_log", "sop"):
+            line = export_session(fmt, "id", transcript, include_monologue=True)
             assert line is not None, f"Format {fmt} returned None"
             parsed = json.loads(line)
             assert isinstance(parsed, dict)

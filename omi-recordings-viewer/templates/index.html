@@ -225,6 +225,9 @@
                             <option value="openai">OpenAI Fine-tuning JSONL</option>
                             <option value="conversation">ShareGPT / LLaMA-Factory JSONL</option>
                             <option value="comprehensive">Comprehensive (Full metadata) JSONL</option>
+                            <option value="knowledge">Knowledge Base JSONL</option>
+                            <option value="decision_log">Decision Log JSONL</option>
+                            <option value="sop">SOP (Action Items) JSONL</option>
                         </select>
                     </div>
                     <div class="export-row">
@@ -244,6 +247,22 @@
                         </div>
                     </div>
                     <div class="export-row">
+                        <label>Business Domain</label>
+                        <select id="export-business-domain">
+                            <option value="">All</option>
+                            <option value="sales">Sales</option>
+                            <option value="hiring">Hiring</option>
+                            <option value="product_planning">Product Planning</option>
+                            <option value="purchasing">Purchasing</option>
+                            <option value="customer_service">Customer Service</option>
+                            <option value="management">Management</option>
+                            <option value="finance">Finance</option>
+                            <option value="technology">Technology</option>
+                            <option value="personal">Personal</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+                    <div class="export-row">
                         <label>Speaker</label>
                         <select id="export-speaker-mode">
                             <option value="conversation">Full Conversation</option>
@@ -253,6 +272,12 @@
                     <div class="export-row">
                         <label>Min Segments</label>
                         <input type="number" id="export-min-segments" value="3" min="1" max="100" style="width:80px">
+                    </div>
+                    <div class="export-row">
+                        <label class="toggle-label">
+                            <input type="checkbox" id="export-include-monologue">
+                            <span>Include Monologue Sessions</span>
+                        </label>
                     </div>
                 </div>
                 <div id="export-preview" class="export-preview hidden">

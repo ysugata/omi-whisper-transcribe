@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_user TEXT,
     speakers TEXT,
     last_modified REAL DEFAULT 0,
+    tags_source_type TEXT,
+    tags_business_domain TEXT,
+    tags_importance TEXT,
+    tags_confidentiality TEXT,
+    tags_decision_required INTEGER DEFAULT 0,
+    tags_decision_summary TEXT,
+    tags_action_items TEXT,
+    tags_outcome TEXT,
     UNIQUE(date, time)
 );
 
@@ -49,6 +57,9 @@ POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(tags_activity);
 CREATE INDEX IF NOT EXISTS idx_sessions_mood ON sessions(tags_mood);
 CREATE INDEX IF NOT EXISTS idx_sessions_speakers ON sessions(speakers);
+CREATE INDEX IF NOT EXISTS idx_sessions_business_domain ON sessions(tags_business_domain);
+CREATE INDEX IF NOT EXISTS idx_sessions_importance ON sessions(tags_importance);
+CREATE INDEX IF NOT EXISTS idx_sessions_decision_required ON sessions(tags_decision_required);
 """
 
 # Migration: add tag columns to existing DBs
@@ -64,6 +75,14 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_user TEXT",
     "ALTER TABLE sessions ADD COLUMN speakers TEXT",
     "ALTER TABLE sessions ADD COLUMN last_modified REAL DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_source_type TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_business_domain TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_importance TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_confidentiality TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_decision_required INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_decision_summary TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_action_items TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_outcome TEXT",
 ]
 
 FTS_SCHEMA = """
@@ -185,6 +204,10 @@ class Indexer:
                 speaker_names.add(pn)
         speakers_csv = ",".join(sorted(speaker_names)) if speaker_names else None
 
+        # Extract action_items as comma-separated string
+        action_items = tags.get("action_items", [])
+        tags_action_items = ",".join(action_items) if isinstance(action_items, list) and action_items else None
+
         return {
             "date": date,
             "time": time,
@@ -206,6 +229,14 @@ class Indexer:
             "session_tagged": 1 if session.get("session_tagged") else 0,
             "tags_user": tags_user,
             "speakers": speakers_csv,
+            "tags_source_type": tags.get("source_type"),
+            "tags_business_domain": tags.get("business_domain"),
+            "tags_importance": tags.get("importance"),
+            "tags_confidentiality": tags.get("confidentiality"),
+            "tags_decision_required": 1 if tags.get("decision_required") else 0,
+            "tags_decision_summary": tags.get("decision_summary"),
+            "tags_action_items": tags_action_items,
+            "tags_outcome": tags.get("outcome"),
         }
 
     async def sync(self) -> int:
@@ -253,12 +284,18 @@ class Indexer:
                     audio_size_mb, model, language, transcript_text, segment_count,
                     tags_topics, tags_activity, tags_intent, tags_mood,
                     tags_quality, tags_entities, tags_summary, session_tagged,
-                    tags_user, speakers, last_modified)
+                    tags_user, speakers, last_modified,
+                    tags_source_type, tags_business_domain, tags_importance,
+                    tags_confidentiality, tags_decision_required,
+                    tags_decision_summary, tags_action_items, tags_outcome)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
                            :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                           :tags_user, :speakers, :last_modified)""",
+                           :tags_user, :speakers, :last_modified,
+                           :tags_source_type, :tags_business_domain, :tags_importance,
+                           :tags_confidentiality, :tags_decision_required,
+                           :tags_decision_summary, :tags_action_items, :tags_outcome)""",
                 info,
             )
             count += 1
@@ -364,11 +401,12 @@ class Indexer:
     async def get_export_stats(
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,
-        min_segments: int = 3,
+        min_segments: int = 3, business_domain: str = "",
     ) -> dict:
         """Get stats for export preview (session count, segment count, date range, est size)."""
         where, params = self._build_export_where(
             date_from, date_to, quality, activity, min_segments,
+            business_domain=business_domain,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -391,11 +429,12 @@ class Indexer:
     async def get_export_sessions(
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,
-        min_segments: int = 3,
+        min_segments: int = 3, business_domain: str = "",
     ) -> list[tuple[str, str]]:
         """Get (date, time) pairs matching export filters."""
         where, params = self._build_export_where(
             date_from, date_to, quality, activity, min_segments,
+            business_domain=business_domain,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -409,7 +448,7 @@ class Indexer:
     def _build_export_where(
         self, date_from: str, date_to: str,
         quality: list[str] | None, activity: list[str] | None,
-        min_segments: int,
+        min_segments: int, business_domain: str = "",
     ) -> tuple[list[str], list]:
         """Build WHERE clauses and params for export queries."""
         where: list[str] = []
@@ -435,6 +474,10 @@ class Indexer:
             placeholders = ",".join("?" for _ in activity)
             where.append(f"tags_activity IN ({placeholders})")
             params.extend(activity)
+
+        if business_domain:
+            where.append("tags_business_domain = ?")
+            params.append(business_domain)
 
         return where, params
 

@@ -436,12 +436,18 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                 audio_size_mb, model, language, transcript_text, segment_count,
                 tags_topics, tags_activity, tags_intent, tags_mood,
                 tags_quality, tags_entities, tags_summary, session_tagged,
-                tags_user, speakers, last_modified)
+                tags_user, speakers, last_modified,
+                tags_source_type, tags_business_domain, tags_importance,
+                tags_confidentiality, tags_decision_required,
+                tags_decision_summary, tags_action_items, tags_outcome)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
                        :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                       :tags_user, :speakers, :last_modified)""",
+                       :tags_user, :speakers, :last_modified,
+                       :tags_source_type, :tags_business_domain, :tags_importance,
+                       :tags_confidentiality, :tags_decision_required,
+                       :tags_decision_summary, :tags_action_items, :tags_outcome)""",
             info,
         )
         await indexer._db.commit()
@@ -636,11 +642,19 @@ async def handle_combined_tag_cancel(request: web.Request) -> web.Response:
 # Export API
 # ============================================================
 
+_VALID_EXPORT_FORMATS = {
+    "comprehensive", "openai", "conversation",
+    "knowledge", "decision_log", "sop",
+}
+
+
 def _parse_export_params(request: web.Request) -> dict:
     """Parse common export query parameters."""
     fmt = request.query.get("format", "comprehensive")
-    if fmt not in ("comprehensive", "openai", "conversation"):
-        raise web.HTTPBadRequest(text="format must be comprehensive, openai, or conversation")
+    if fmt not in _VALID_EXPORT_FORMATS:
+        raise web.HTTPBadRequest(
+            text="format must be one of: " + ", ".join(sorted(_VALID_EXPORT_FORMATS))
+        )
 
     quality_raw = request.query.get("quality", "").strip()
     quality = [q.strip() for q in quality_raw.split(",") if q.strip()] or None
@@ -648,14 +662,27 @@ def _parse_export_params(request: web.Request) -> dict:
     activity_raw = request.query.get("activity", "").strip()
     activity = [a.strip() for a in activity_raw.split(",") if a.strip()] or None
 
+    business_domain = request.query.get("business_domain", "").strip()
+
+    # include_monologue: default False for openai/conversation, True otherwise
+    include_monologue_raw = request.query.get("include_monologue", "").strip().lower()
+    if include_monologue_raw in ("true", "1", "yes"):
+        include_monologue = True
+    elif include_monologue_raw in ("false", "0", "no"):
+        include_monologue = False
+    else:
+        include_monologue = fmt not in ("openai", "conversation")
+
     return {
         "format": fmt,
         "date_from": request.query.get("date_from", "").strip(),
         "date_to": request.query.get("date_to", "").strip(),
         "quality": quality,
         "activity": activity,
+        "business_domain": business_domain,
         "speaker_mode": request.query.get("speaker_mode", "conversation"),
         "min_segments": int(request.query.get("min_segments", "3")),
+        "include_monologue": include_monologue,
     }
 
 
@@ -674,6 +701,7 @@ async def handle_export_stats(request: web.Request) -> web.Response:
             quality=params["quality"],
             activity=params["activity"],
             min_segments=params["min_segments"],
+            business_domain=params["business_domain"],
         )
     except Exception as e:
         logger.exception("Export stats failed")
@@ -697,6 +725,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
             quality=params["quality"],
             activity=params["activity"],
             min_segments=params["min_segments"],
+            business_domain=params["business_domain"],
         )
     except Exception as e:
         logger.exception("Export query failed")
@@ -704,6 +733,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
 
     fmt = params["format"]
     speaker_mode = params["speaker_mode"]
+    include_monologue = params["include_monologue"]
 
     response = web.StreamResponse(
         status=200,
@@ -721,7 +751,8 @@ async def handle_export_training(request: web.Request) -> web.Response:
             if not transcript:
                 continue
             session_id = f"{date}/{time}"
-            line = export_session(fmt, session_id, transcript, speaker_mode)
+            line = export_session(fmt, session_id, transcript, speaker_mode,
+                                  include_monologue=include_monologue)
             if line:
                 await response.write((line + "\n").encode("utf-8"))
         except Exception:

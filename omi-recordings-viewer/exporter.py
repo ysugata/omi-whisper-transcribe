@@ -71,7 +71,8 @@ def _session_meta(transcript: dict) -> dict:
 
 
 def to_comprehensive(session_id: str, transcript: dict,
-                      speaker_mode: str = "conversation") -> dict | None:
+                      speaker_mode: str = "conversation",
+                      include_monologue: bool = True) -> dict | None:
     """Convert a session to comprehensive JSONL format (1 dict per session)."""
     segments = transcript.get("segments", [])
     if not segments:
@@ -95,9 +96,13 @@ def to_comprehensive(session_id: str, transcript: dict,
     }
 
     tags_info = {}
-    for key in ("topics", "activity", "mood", "quality", "entities", "summary", "intent"):
-        if tags.get(key):
-            tags_info[key] = tags[key]
+    for key in ("topics", "activity", "mood", "quality", "entities", "summary", "intent",
+                "source_type", "business_domain", "importance", "confidentiality",
+                "decision_required", "decision_summary", "reasoning_summary",
+                "action_items", "outcome", "next_action"):
+        val = tags.get(key)
+        if val is not None and val != "" and val != []:
+            tags_info[key] = val
 
     return {
         "session_id": session_id,
@@ -117,12 +122,13 @@ def to_comprehensive(session_id: str, transcript: dict,
 
 
 def to_openai(session_id: str, transcript: dict,
-              speaker_mode: str = "conversation") -> dict | None:
+              speaker_mode: str = "conversation",
+              include_monologue: bool = False) -> dict | None:
     """Convert a session to OpenAI fine-tuning JSONL format.
 
     - is_user speaker → assistant role (AI learns this)
     - other speakers → user role (input to AI)
-    - monologue → synthetic user prompt + assistant = all speech
+    - monologue → skipped by default (include_monologue=False)
     """
     segments = transcript.get("segments", [])
     if not segments:
@@ -138,6 +144,9 @@ def to_openai(session_id: str, transcript: dict,
     has_user = any(t["is_user"] for t in turns)
     has_other = any(not t["is_user"] for t in turns)
     is_monologue = has_user and not has_other
+
+    if is_monologue and not include_monologue:
+        return None
 
     system_msg = _build_system_message(tags, is_monologue=is_monologue)
     messages: list[dict[str, str]] = [{"role": "system", "content": system_msg}]
@@ -169,7 +178,8 @@ def to_openai(session_id: str, transcript: dict,
 
 
 def to_conversation(session_id: str, transcript: dict,
-                    speaker_mode: str = "conversation") -> dict | None:
+                    speaker_mode: str = "conversation",
+                    include_monologue: bool = False) -> dict | None:
     """Convert a session to ShareGPT/LLaMA-Factory conversation format."""
     segments = transcript.get("segments", [])
     if not segments:
@@ -185,6 +195,9 @@ def to_conversation(session_id: str, transcript: dict,
     has_user = any(t["is_user"] for t in turns)
     has_other = any(not t["is_user"] for t in turns)
     is_monologue = has_user and not has_other
+
+    if is_monologue and not include_monologue:
+        return None
 
     system_msg = _build_system_message(tags, is_monologue=is_monologue)
     conversations: list[dict[str, str]] = []
@@ -222,21 +235,116 @@ def to_conversation(session_id: str, transcript: dict,
     }
 
 
+def to_knowledge(session_id: str, transcript: dict,
+                  speaker_mode: str = "conversation",
+                  include_monologue: bool = True) -> dict | None:
+    """Extract knowledge record from a session.
+
+    Returns None if no summary is available.
+    """
+    meta = _session_meta(transcript)
+    tags = meta["tags"]
+
+    summary = tags.get("summary", "")
+    if not summary:
+        return None
+
+    segments = transcript.get("segments", [])
+    turns = merge_turns(segments)
+    body_parts = [t["text"] for t in turns]
+
+    return {
+        "id": session_id,
+        "title": summary[:60],
+        "body": " ".join(body_parts),
+        "category": tags.get("business_domain", "other"),
+        "topics": tags.get("topics", []),
+        "entities": tags.get("entities", []),
+        "source_sessions": [session_id],
+        "importance": tags.get("importance", "low"),
+        "updated_at": transcript.get("session", {}).get("start"),
+    }
+
+
+def to_decision_log(session_id: str, transcript: dict,
+                     speaker_mode: str = "conversation",
+                     include_monologue: bool = True) -> dict | None:
+    """Extract decision log from a session.
+
+    Returns None if no decision was required.
+    """
+    meta = _session_meta(transcript)
+    tags = meta["tags"]
+
+    if not tags.get("decision_required"):
+        return None
+
+    session = transcript.get("session", {})
+    segments = transcript.get("segments", [])
+    turns = merge_turns(segments)
+    context = " ".join(t["text"] for t in turns[:3])[:200]
+
+    return {
+        "decision_id": session_id,
+        "title": tags.get("decision_summary") or tags.get("summary", "")[:60],
+        "context": context,
+        "decision": tags.get("decision_summary"),
+        "reason": tags.get("reasoning_summary"),
+        "action_items": tags.get("action_items", []),
+        "outcome": tags.get("outcome"),
+        "next_action": tags.get("next_action"),
+        "source_session": session_id,
+        "date": session.get("start"),
+    }
+
+
+def to_sop(session_id: str, transcript: dict,
+           speaker_mode: str = "conversation",
+           include_monologue: bool = True) -> dict | None:
+    """Extract SOP (Standard Operating Procedure) from a session.
+
+    Returns None if no action_items or if casual_chat.
+    """
+    meta = _session_meta(transcript)
+    tags = meta["tags"]
+
+    action_items = tags.get("action_items", [])
+    if not action_items:
+        return None
+
+    if tags.get("activity") == "casual_chat" or tags.get("source_type") == "casual_chat":
+        return None
+
+    return {
+        "id": session_id,
+        "title": tags.get("summary", "")[:60] or "Untitled SOP",
+        "steps": action_items,
+        "context": tags.get("summary", ""),
+        "domain": tags.get("business_domain", "other"),
+        "source_session": session_id,
+    }
+
+
 FORMATTERS = {
     "comprehensive": to_comprehensive,
     "openai": to_openai,
     "conversation": to_conversation,
+    "knowledge": to_knowledge,
+    "decision_log": to_decision_log,
+    "sop": to_sop,
 }
 
 
 def export_session(fmt: str, session_id: str, transcript: dict,
-                   speaker_mode: str = "conversation") -> str | None:
+                   speaker_mode: str = "conversation",
+                   include_monologue: bool = False) -> str | None:
     """Export a single session in the given format. Returns JSONL line or None."""
     formatter = FORMATTERS.get(fmt)
     if not formatter:
         raise ValueError(f"Unknown format: {fmt}")
 
-    result = formatter(session_id, transcript, speaker_mode)
+    result = formatter(session_id, transcript, speaker_mode,
+                       include_monologue=include_monologue)
     if result is None:
         return None
     return json.dumps(result, ensure_ascii=False)

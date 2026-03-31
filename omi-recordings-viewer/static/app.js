@@ -1972,11 +1972,25 @@
     var exportDateTo = document.getElementById("export-date-to");
     var exportSpeakerMode = document.getElementById("export-speaker-mode");
     var exportMinSegments = document.getElementById("export-min-segments");
+    var exportBusinessDomain = document.getElementById("export-business-domain");
+    var exportIncludeMonologue = document.getElementById("export-include-monologue");
     var exportStatsBtn = document.getElementById("export-stats-btn");
     var exportDownloadBtn = document.getElementById("export-download-btn");
     var exportPreview = document.getElementById("export-preview");
     var exportPreviewContent = document.getElementById("export-preview-content");
     var exportStatusEl = document.getElementById("export-status");
+
+    // Update monologue checkbox default based on format
+    if (exportFormatEl) {
+        exportFormatEl.addEventListener("change", function () {
+            var fmt = exportFormatEl.value;
+            if (fmt === "openai" || fmt === "conversation") {
+                exportIncludeMonologue.checked = false;
+            } else {
+                exportIncludeMonologue.checked = true;
+            }
+        });
+    }
 
     function getExportQueryString() {
         var params = "format=" + encodeURIComponent(exportFormatEl.value);
@@ -1989,8 +2003,11 @@
         });
         if (qualities.length > 0) params += "&quality=" + encodeURIComponent(qualities.join(","));
 
+        if (exportBusinessDomain.value) params += "&business_domain=" + encodeURIComponent(exportBusinessDomain.value);
+
         params += "&speaker_mode=" + encodeURIComponent(exportSpeakerMode.value);
         params += "&min_segments=" + encodeURIComponent(exportMinSegments.value || "3");
+        params += "&include_monologue=" + (exportIncludeMonologue.checked ? "true" : "false");
         return params;
     }
 
