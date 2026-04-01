@@ -307,12 +307,15 @@ class LLMPipeline:
         known_terms: Optional[list] = None,
         session_glossary: Optional[list] = None,
         min_text_length: int = 0,
+        segment_indices: Optional[list] = None,
     ) -> Optional[CandidateResult]:
         """Stage 3-A: Extract term candidates without modifying text."""
         if "A" not in self._stages:
             return None
 
-        numbered_text, _, _ = self._build_numbered_input(segments, min_text_length)
+        numbered_text, _, _ = self._build_numbered_input(
+            segments, min_text_length, segment_indices=segment_indices,
+        )
         if not numbered_text:
             return CandidateResult(candidates=[])
 
@@ -447,12 +450,15 @@ class LLMPipeline:
         segments: list,
         candidates: Optional[CandidateResult] = None,
         min_text_length: int = 0,
+        segment_indices: Optional[list] = None,
     ) -> Optional[AuditResult]:
         """Stage 3-C: Audit corrected text for remaining quality issues."""
         if "C" not in self._stages:
             return None
 
-        numbered_text, _, _ = self._build_numbered_input(segments, min_text_length)
+        numbered_text, _, _ = self._build_numbered_input(
+            segments, min_text_length, segment_indices=segment_indices,
+        )
         if not numbered_text:
             return AuditResult(items=[], passed=True)
 
@@ -603,6 +609,7 @@ class LLMPipeline:
         if "A" in self._stages:
             candidates = self.extract_candidates(
                 segments, known_terms, session_glossary, min_text_length,
+                segment_indices=segment_indices,
             )
             api_calls += 1
             result.candidates = candidates
@@ -636,6 +643,7 @@ class LLMPipeline:
         if run_c:
             audit = self.audit_quality(
                 corrected, candidates, min_text_length,
+                segment_indices=segment_indices,
             )
             api_calls += 1
             result.audit = audit
@@ -661,12 +669,14 @@ class LLMPipeline:
                     corrected_retry = self.correct_notation(
                         corrected, candidates, known_terms, session_glossary,
                         min_text_length, audit_hints=high_items,
+                        segment_indices=segment_indices,
                     )
                     api_calls += 1
 
                     # Re-run 3-C
                     audit_retry = self.audit_quality(
                         corrected_retry, candidates, min_text_length,
+                        segment_indices=segment_indices,
                     )
                     api_calls += 1
 
