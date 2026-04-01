@@ -42,7 +42,7 @@ class TestClassifySegment:
 
     def test_no_katakana_words_clean(self):
         """No katakana words of 3+ chars → clean."""
-        seg = {"text": "これは漢字と平仮名だけのテキストです、問題ありません"}
+        seg = {"text": "これは漢字と平仮名だけの文章です、問題ありません"}
         assert classify_segment(seg, set(), min_text_length=5) == "clean"
 
     def test_empty_text(self):
@@ -54,6 +54,19 @@ class TestClassifySegment:
         """Primarily English text → clean (katakana ratio low)."""
         seg = {"text": "This is an English text with no katakana whatsoever right"}
         assert classify_segment(seg, set(), min_text_length=5) == "clean"
+
+    def test_mostly_japanese_with_unknown_katakana_dirty(self):
+        """Japanese text with unknown katakana → dirty (Rule 3 before Rule 4)."""
+        # This text is mostly Japanese but contains unknown katakana "エドラソー"
+        seg = {"text": "彼らはエドラソーの世界に行ったことがあります"}
+        known = set()  # エドラソー is not known
+        assert classify_segment(seg, known, min_text_length=5) == "dirty"
+
+    def test_mostly_japanese_with_known_katakana_clean(self):
+        """Japanese text with known katakana → clean."""
+        seg = {"text": "彼らはレストランの予約をしたことがあります"}
+        known = {"レストラン"}
+        assert classify_segment(seg, known, min_text_length=5) == "clean"
 
 
 class TestClassifySegments:

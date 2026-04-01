@@ -160,6 +160,36 @@ class TestScreenerKnownValues:
         assert "コンビニエンス" in known
 
 
+class TestCommonLoanwords:
+    def test_common_loanword_clean(self):
+        """Segments with only common loanwords → clean (not dirty)."""
+        segments = _make_segments([
+            "レストランでランチを食べてからカフェでコーヒーを飲みました",
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        # All katakana words (レストラン, ランチ, カフェ, コーヒー) are common loanwords
+        assert 0 in result.clean_indices
+
+    def test_unknown_katakana_still_dirty(self):
+        """Unknown katakana not in common loanwords → dirty."""
+        segments = _make_segments([
+            "ガーバナのダッシュボードでメトリクスを確認する",
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        # ガーバナ, ダッシュボード, メトリクス not in common loanwords
+        assert 0 in result.dirty_indices
+
+    def test_known_values_include_common_loanwords(self):
+        """_build_known_values should include common loanwords."""
+        screener = SegmentScreener(min_text_length=5)
+        known = screener._build_known_values()
+        assert "レストラン" in known
+        assert "コンピュータ" in known
+        assert "テスト" in known
+
+
 class TestMetrics:
     def test_metrics_format_log(self):
         """Metrics should format nicely."""

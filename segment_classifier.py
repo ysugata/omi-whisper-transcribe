@@ -43,7 +43,13 @@ def classify_segment(
     if len(text) < min_text_length:
         return "clean"
 
-    # Rule 3: Pure Japanese (low katakana, high kanji+hira) → clean
+    # Rule 3: Unknown katakana words (not in dictionary/hotwords) → dirty
+    katakana_words = _KATAKANA_WORD_RE.findall(text)
+    unknown_katakana = [kw for kw in katakana_words if kw not in known_values]
+    if unknown_katakana:
+        return "dirty"
+
+    # Rule 4: Pure Japanese (low katakana, high kanji+hira) → clean
     katakana_chars = len(_KATAKANA_RE.findall(text))
     kanji_hira_chars = len(_KANJI_HIRA_RE.findall(text))
     total_chars = len(text)
@@ -54,13 +60,7 @@ def classify_segment(
         if katakana_ratio < 0.2 and kanji_hira_ratio > 0.7:
             return "clean"
 
-    # Rule 4: Unknown katakana words (not in dictionary/hotwords) → dirty
-    katakana_words = _KATAKANA_WORD_RE.findall(text)
-    for kw in katakana_words:
-        if kw not in known_values:
-            return "dirty"
-
-    # Rule 5: Trailing truncation pattern → dirty
+    # Rule 5: (reserved) Trailing truncation pattern
     # Check if text ends abruptly (common ASR artifact)
     if text and not text[-1] in "。、.!?！？」』）)…":
         # Text doesn't end with punctuation - check for truncation
