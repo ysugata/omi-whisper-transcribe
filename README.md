@@ -28,6 +28,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | セグメント分割 | 長いセグメントを文境界で自然に分割 |
 | Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
 | LLM 後処理 (3段階パイプライン) | 用語候補抽出 → 表記補正 → 品質監査の3段階で文字起こし精度を向上 |
+| LLM スクリーニング | 辞書補正 + 信頼度スコアで LLM 不要なセグメントを自動スキップ (API call 60-80% 削減) |
 | セッションタグ | LLM による自動タグ付け (活動・気分・トピック・要約) |
 | カスタムユーザータグ | ユーザー定義タグの作成・付与・LLM 自動適用 |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
@@ -220,8 +221,9 @@ open http://localhost:8092
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
 | `LLM_BATCH_SIZE` | `20` | バッチフラッシュのセグメント数 |
-| `LLM_PIPELINE_STAGES` | `ABC` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
+| `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
+| `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
 
 ### セッションタグ
 
@@ -389,8 +391,8 @@ transcript + 参考用語リスト + 3-A 候補を統合し、差分のみの co
 
 | 値 | 動作 |
 |---|---|
-| `ABC` (デフォルト) | フルパイプライン |
-| `B` | 3-B のみ (旧互換モード) |
+| `B` (デフォルト) | 3-B のみ (スクリーニングと組み合わせてコスト最適) |
+| `ABC` | フルパイプライン |
 | `AB` | 候補抽出 + 補正 (監査なし) |
 | `BC` | 補正 + 監査 (候補抽出なし) |
 
@@ -406,13 +408,55 @@ transcript + 参考用語リスト + 3-A 候補を統合し、差分のみの co
 - 未知の技術用語・固有名詞の修正候補を提案 (`config/pending_suggestions.json`)
 - Viewer の Settings > LLM Suggestions で提案を承認/却下
 
+### LLM スクリーニング
+
+LLM を呼ぶ前にルールベースの前処理で補正不要なセグメントを自動スキップし、API コストを大幅に削減します。
+
+```
+全セグメント
+    │
+    ▼
+SegmentScreener.screen()
+    ├─ Step 1: 辞書補正 (term_corrections.json)
+    ├─ Step 2: 自動学習補正 (pending_suggestions.json から高頻度パターン)
+    └─ Step 3: 分類 (dirty / clean)
+          │
+          ├─ dirty → LLM Pipeline (3-A/3-B/3-C)
+          └─ clean → LLM スキップ (0 API calls)
+```
+
+#### 分類ルール (`segment_classifier.py`)
+
+| ルール | 条件 | 判定 |
+|--------|------|------|
+| 1 | `llm_corrected=True` (既に補正済み) | clean |
+| 2 | テキスト長 < 20文字 | clean |
+| 3 | 辞書/hotwords にない未知カタカナ語 (3文字以上) | **dirty** |
+| 4 | Whisper 信頼度が低い (`avg_logprob < -0.5`) | **dirty** |
+| 5 | 純日本語 (カタカナ率 < 20%, 漢字仮名率 > 70%) | clean |
+| 6 | デフォルト | clean |
+
+- **約300語の一般外来語** (レストラン、テスト、コンピュータ等) は既知として扱い、dirty にしない
+- **Confidence-based screening** (Naderi et al., Interspeech 2024): `avg_logprob` が低いセグメントは LLM に送信。Whisper が不確かだった漢字誤読・ひらがなエラー等をキャッチ
+- 旧トランスクリプト (`avg_logprob` なし) は信頼度ルールをスキップし後方互換を維持
+
+#### 効果
+
+| ケース | LLM コスト |
+|--------|-----------|
+| 日常会話セッション (カタカナ少) | **0 API calls** (全 clean) |
+| 技術話題混在 | 1 call (dirty のみ送信) |
+| 全セグメント dirty | 1 call (変わらず) |
+
+実測: 50 セッション / 356 セグメントで **clean 79.8%, dirty 20.2%** → 従来比 38% 以上の API call 削減。
+
 ### コスト見積もり (Gemini 2.5 Flash-Lite)
 
 | 項目 | 1バッチ (20seg) | 月額 (8h/日) |
 |---|---|---|
-| ABC (標準) | ~$0.0015 | ~$21.60 |
+| B + スクリーニング (標準) | ~$0.0001 | ~$1.44 |
+| ABC (フルパイプライン) | ~$0.0015 | ~$21.60 |
 | ABC + 再実行 | ~$0.0025 | ~$36.00 |
-| B のみ (旧互換) | ~$0.0005 | ~$7.20 |
 
 ## セッションタグ
 
@@ -607,6 +651,8 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/build_hotwords.py` | JMnedict から `config/hotwords.json` を生成 |
 | `tools/retranscribe_all.py` | 全セッションの再文字起こし (`--restore` で復元、`--verify` で検証) |
 | `tools/tag_all.py` | 全セッションの一括タグ付け (CLI) |
+| `tools/verify_screening.py` | LLM スクリーニングの精度検証 (パターンマッチ分析) |
+| `tools/verify_confidence_screening.py` | 信頼度スコアベースのスクリーニング効果検証 |
 
 ## GPU 共有デプロイ
 
@@ -634,6 +680,11 @@ omi_whisper_transcribe/
 ├── llm_pipeline_schema.py    # パイプライン用 JSON Schema 定義
 ├── llm_pipeline_prompt.py    # パイプライン用システムプロンプト
 ├── llm_corrector.py          # Gemini によるバッチ用語修正 (レガシー / retranscribe 用)
+├── batch_corrector.py        # バッチ LLM 補正ワーカー (sync/async モード)
+├── segment_screener.py       # LLM スクリーニング (辞書→自動学習→分類)
+├── segment_classifier.py     # dirty/clean 分類ルール (カタカナ + 信頼度)
+├── suggestion_learner.py     # LLM 提案からの自動学習パターン抽出
+├── correction_metrics.py     # スクリーニング統計メトリクス
 ├── session_tagger.py         # Gemini によるセッションタグ付け
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
