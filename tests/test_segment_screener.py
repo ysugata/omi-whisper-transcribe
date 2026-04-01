@@ -16,6 +16,17 @@ def _make_segments(texts):
     return [{"text": t} for t in texts]
 
 
+def _make_segments_with_logprob(items):
+    """Create segments from (text, avg_logprob) tuples."""
+    result = []
+    for text, logprob in items:
+        seg = {"text": text}
+        if logprob is not None:
+            seg["avg_logprob"] = logprob
+        result.append(seg)
+    return result
+
+
 class TestScreenerBasic:
     def test_empty_segments(self):
         """Empty input → empty result."""
@@ -188,6 +199,61 @@ class TestCommonLoanwords:
         assert "レストラン" in known
         assert "コンピュータ" in known
         assert "テスト" in known
+
+
+class TestConfidenceScreening:
+    """Tests for confidence-based (avg_logprob) screening."""
+
+    def test_low_confidence_dirty(self):
+        """Low avg_logprob → dirty even without katakana."""
+        segments = _make_segments_with_logprob([
+            ("今日は天気がとても良いので散歩に行きましょう", -0.8),
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        assert 0 in result.dirty_indices
+
+    def test_high_confidence_clean(self):
+        """High avg_logprob → clean (pure Japanese)."""
+        segments = _make_segments_with_logprob([
+            ("今日は天気がとても良いので散歩に行きましょう", -0.2),
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        assert 0 in result.clean_indices
+
+    def test_missing_logprob_backward_compatible(self):
+        """Missing avg_logprob → old behavior (clean for pure Japanese)."""
+        segments = _make_segments_with_logprob([
+            ("今日は天気がとても良いので散歩に行きましょう", None),
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        assert 0 in result.clean_indices
+
+    def test_mixed_confidence(self):
+        """Mix of segments with and without avg_logprob."""
+        segments = _make_segments_with_logprob([
+            ("今日は天気がとても良いので散歩に行きましょう", -0.2),  # high → clean
+            ("昨日の会議で話した内容を整理しておいてください", -0.8),  # low → dirty
+            ("来週のスケジュールを確認して連絡をください", None),     # no data → clean
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        assert 0 in result.clean_indices
+        assert 1 in result.dirty_indices
+        assert 2 in result.clean_indices
+
+    def test_low_confidence_counts_in_metrics(self):
+        """Low-confidence dirty segments are counted in metrics."""
+        segments = _make_segments_with_logprob([
+            ("今日は天気がとても良いので散歩に行きましょう", -0.8),
+            ("明日も晴れるといいですね、洗濯物を干しましょう", -0.2),
+        ])
+        screener = SegmentScreener(min_text_length=5)
+        result = screener.screen(segments)
+        assert result.metrics.dirty_segments == 1
+        assert result.metrics.screened_out == 1
 
 
 class TestMetrics:

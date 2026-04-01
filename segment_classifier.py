@@ -1,12 +1,24 @@
 """Classify ASR segments as dirty (needs LLM) or clean (skip LLM).
 
 Rule-based classification to minimize unnecessary LLM API calls.
+
+Research basis (Interspeech/EMNLP 2024):
+- Naderi et al.: Confidence-guided correction. Naive LLM on Whisper Large V3
+  WORSENS WER. Selective filtering with confidence thresholds is essential.
+- IBM Conservative Filtering: Reduces correction rate 43%→13.9% while improving accuracy.
+- avg_logprob thresholds: >= -0.3 high confidence, -0.3~-0.5 medium, < -0.5 low.
 """
 
 import re
 import logging
 
 log = logging.getLogger(__name__)
+
+# Confidence threshold: segments with avg_logprob below this are low-confidence
+# and should be sent to LLM even without unknown katakana.
+# Based on Naderi et al. (Interspeech 2024) and Whisper empirical thresholds.
+# -0.5 is conservative: catches genuinely uncertain segments without flooding LLM.
+CONFIDENCE_LOGPROB_THRESHOLD = -0.5
 
 # Katakana detection pattern
 _KATAKANA_RE = re.compile(r'[\u30A0-\u30FF]')
@@ -49,7 +61,15 @@ def classify_segment(
     if unknown_katakana:
         return "dirty"
 
-    # Rule 4: Pure Japanese (low katakana, high kanji+hira) → clean
+    # Rule 4: Low Whisper confidence → dirty (catches non-katakana ASR errors)
+    # Segments where Whisper was uncertain often contain kanji misreadings,
+    # hiragana errors, or other issues invisible to katakana-only checks.
+    # Gracefully skipped when avg_logprob is not available (older transcripts).
+    avg_logprob = segment.get("avg_logprob")
+    if avg_logprob is not None and avg_logprob < CONFIDENCE_LOGPROB_THRESHOLD:
+        return "dirty"
+
+    # Rule 5: Pure Japanese (low katakana, high kanji+hira) → clean
     katakana_chars = len(_KATAKANA_RE.findall(text))
     kanji_hira_chars = len(_KANJI_HIRA_RE.findall(text))
     total_chars = len(text)
@@ -59,16 +79,6 @@ def classify_segment(
         kanji_hira_ratio = kanji_hira_chars / total_chars
         if katakana_ratio < 0.2 and kanji_hira_ratio > 0.7:
             return "clean"
-
-    # Rule 5: (reserved) Trailing truncation pattern
-    # Check if text ends abruptly (common ASR artifact)
-    if text and not text[-1] in "。、.!?！？」』）)…":
-        # Text doesn't end with punctuation - check for truncation
-        last_few = text[-6:] if len(text) >= 6 else text
-        if _TRAILING_TRUNC_RE.search(last_few):
-            # Only flag if the truncated part looks like a broken word
-            # (not a complete word ending naturally)
-            pass  # This is too aggressive; skip for now
 
     # Rule 6: Default → clean
     return "clean"

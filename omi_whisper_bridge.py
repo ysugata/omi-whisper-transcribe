@@ -990,6 +990,7 @@ def transcribe_audio(
             "end": round(seg_end + session_offset, 2),
             "is_user": True,
             "person_id": None,
+            "avg_logprob": round(seg.avg_logprob, 3),
         }
         if LANGUAGE is None:
             seg_dict["language"] = info.language
