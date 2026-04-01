@@ -30,6 +30,10 @@ COPY speaker_filter.py .
 COPY session_tagger.py .
 COPY training_sanitizer.py .
 COPY responses_sanitizer.py .
+COPY suggestion_learner.py .
+COPY segment_classifier.py .
+COPY segment_screener.py .
+COPY correction_metrics.py .
 COPY sanitize_provider.py .
 COPY sanitize_schema.py .
 COPY sanitize_prompt.py .

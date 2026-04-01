@@ -53,6 +53,9 @@ class BatchJob:
     tag_batch_job_name: str = ""  # Gemini Batch API job name for tagging
     tagged: bool = False  # tagging completed
     tag_error: str = ""  # tagging error (correction succeeded but tagging failed)
+    segments_screened: int = 0  # total segments screened
+    segments_dirty: int = 0    # segments sent to LLM
+    dict_corrections: int = 0  # dictionary/learned corrections applied
 
     def __post_init__(self):
         if not self.created_at:
@@ -91,6 +94,7 @@ class BatchCorrector:
         batch_poll_interval: int = 60,
         session_tagger=None,
         tagging_enabled: bool = True,
+        segment_screener=None,
     ):
         self._recordings_dir = recordings_dir
         self._config_dir = config_dir
@@ -105,6 +109,7 @@ class BatchCorrector:
         self._batch_poll_interval = batch_poll_interval
         self._session_tagger = session_tagger
         self._tagging_enabled = tagging_enabled and session_tagger is not None
+        self._segment_screener = segment_screener
 
         self._queue_path = os.path.join(config_dir, "batch_llm_queue.json")
         self._jobs: dict[str, BatchJob] = {}  # session_id -> BatchJob
@@ -203,6 +208,7 @@ class BatchCorrector:
         return {
             "running": self._running,
             "mode": self._mode,
+            "screening_enabled": self._segment_screener is not None,
             "current_session": self._current_session,
             "jobs": counts,
             "total": len(self._jobs),
@@ -354,15 +360,54 @@ class BatchCorrector:
             else:
                 glossary = self._build_session_glossary(segments)
 
+                # Screening: deterministic pre-processing + classification
+                dirty_indices = None
+                screened_segments = segments
+                if self._segment_screener:
+                    screening_result = self._segment_screener.screen(segments)
+                    screened_segments = screening_result.segments
+                    dirty_indices = screening_result.dirty_indices
+                    job.segments_screened = screening_result.metrics.total_segments
+                    job.segments_dirty = len(dirty_indices)
+                    job.dict_corrections = (
+                        screening_result.metrics.dict_corrections
+                        + screening_result.metrics.learned_corrections
+                    )
+
+                    if not dirty_indices:
+                        # All segments clean → skip LLM entirely
+                        log.info(
+                            "BatchCorrector [sync]: session %s all clean, skipping LLM",
+                            session_id,
+                        )
+                        self._apply_and_save(
+                            job, segments, transcript_data, transcript_path,
+                            screened_segments,
+                            stages_run=["screened"],
+                            api_calls=0,
+                            retried=False,
+                        )
+                        if self._tagging_enabled:
+                            job.status = JOB_STATUS_TAGGING
+                            self._save_queue()
+                            self._current_session = None
+                            return
+                        job.status = JOB_STATUS_SUCCEEDED
+                        job.finished_at = datetime.now().isoformat()
+                        self._save_queue()
+                        self._current_session = None
+                        return
+
                 loop = asyncio.get_running_loop()
                 pipeline_result = await loop.run_in_executor(
                     None,
                     lambda: self._pipeline.process_segments(
-                        segments,
+                        screened_segments,
                         known_terms=self._known_terms,
                         session_glossary=glossary,
                         min_text_length=self._min_text_length,
                         auto_c=self._stage_c_auto,
+                        segment_indices=dirty_indices,
                     ),
                 )
 

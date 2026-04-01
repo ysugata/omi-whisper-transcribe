@@ -156,6 +156,21 @@ class TermCorrector:
                 text = text.replace(wrong, self._corrections[wrong])
         return text
 
+    def correct_count(self, text: str) -> tuple:
+        """テキストを補正し、(補正後テキスト, 補正数) を返す。"""
+        self._reload_if_changed()
+        count = 0
+        for wrong in sorted(self._corrections, key=len, reverse=True):
+            if wrong in text:
+                text = text.replace(wrong, self._corrections[wrong])
+                count += 1
+        return text, count
+
+    def get_known_values(self) -> set:
+        """辞書の correct 側の値の集合を返す (スクリーナーのカタカナ既知チェック用)。"""
+        self._reload_if_changed()
+        return set(self._corrections.values())
+
     def list_corrections(self) -> dict[str, str]:
         """現在の辞書の全エントリを返す。"""
         self._reload_if_changed()

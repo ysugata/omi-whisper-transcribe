@@ -65,7 +65,8 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.google
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
-LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "AB")       # Pipeline stages to run (A/B/C)
+LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "B")        # Pipeline stages to run (A/B/C)
+LLM_SCREENING_ENABLED = os.environ.get("LLM_SCREENING_ENABLED", "true").lower() in ("true", "1", "yes")
 STAGE_C_AUTO = os.environ.get("STAGE_C_AUTO", "true").lower() in ("true", "1", "yes")  # Auto-trigger 3-C
 LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "sync")              # "sync" (standard API) or "batch" (Gemini Batch API, slow)
 
@@ -144,6 +145,8 @@ from speaker_filter import SpeakerFilter
 from session_tagger import SessionTagger
 from training_sanitizer import TrainingSanitizer
 from responses_sanitizer import ResponsesSanitizer
+from segment_screener import SegmentScreener
+from suggestion_learner import SuggestionLearner
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -2091,7 +2094,8 @@ async def main():
     log.info(f"Term corrections: {_TERM_CORRECTIONS_PATH} ({len(term_corrector.list_corrections())} entries)")
     if batch_corrector:
         log.info(f"Layer 3 LLM Batch: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, "
-                 f"mode={LLM_BATCH_MODE}, auto_c={STAGE_C_AUTO}, "
+                 f"mode={LLM_BATCH_MODE}, screening={LLM_SCREENING_ENABLED}, "
+                 f"auto_c={STAGE_C_AUTO}, "
                  f"min_text={LLM_MIN_TEXT_LENGTH}, timeout={LLM_TIMEOUT}s)")
     elif llm_pipeline:
         log.info(f"Layer 3 LLM Pipeline: {LLM_MODEL} (stages={LLM_PIPELINE_STAGES}, no batch)")
@@ -2155,6 +2159,23 @@ async def main():
     # Batch corrector initialization (needs known_terms which depend on term_corrector + hotword_loader)
     if llm_pipeline:
         known_terms = _get_known_terms()
+
+        # Segment screener: deterministic pre-processing to minimize LLM calls
+        segment_screener = None
+        if LLM_SCREENING_ENABLED:
+            suggestions_path = os.path.join(CONFIG_DIR, "pending_suggestions.json")
+            suggestion_learner = SuggestionLearner(suggestions_path)
+            segment_screener = SegmentScreener(
+                term_corrector=term_corrector,
+                suggestion_learner=suggestion_learner,
+                hotword_loader=hotword_loader,
+                min_text_length=LLM_MIN_TEXT_LENGTH,
+            )
+            log.info(
+                "Segment screener: ON (learned_patterns=%d)",
+                suggestion_learner.pattern_count,
+            )
+
         batch_corrector = BatchCorrector(
             recordings_dir=RECORDINGS_DIR,
             config_dir=CONFIG_DIR,
@@ -2168,9 +2189,11 @@ async def main():
             gemini_model=LLM_MODEL,
             session_tagger=session_tagger,
             tagging_enabled=TAGGING_ENABLED,
+            segment_screener=segment_screener,
         )
         await batch_corrector.start()
-        log.info("Batch LLM corrector: worker started (mode=%s)", LLM_BATCH_MODE)
+        log.info("Batch LLM corrector: worker started (mode=%s, screening=%s)",
+                 LLM_BATCH_MODE, LLM_SCREENING_ENABLED)
 
     # 管理 REST API を起動
     from aiohttp import web

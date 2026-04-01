@@ -108,6 +108,34 @@ class TestBuildNumberedInput:
         assert orig == {}
         assert line_map == {}
 
+    def test_segment_indices_filter(self):
+        """Only include segments at specified indices."""
+        segs = _make_segments(["aaa", "bbb", "ccc", "ddd"])
+        text, orig, line_map = LLMPipeline._build_numbered_input(
+            segs, segment_indices=[1, 3],
+        )
+        assert text == "[1] bbb\n[2] ddd"
+        assert orig == {1: "bbb", 2: "ddd"}
+        assert line_map == {1: 1, 2: 3}
+
+    def test_segment_indices_empty(self):
+        """Empty segment_indices → no output."""
+        segs = _make_segments(["aaa", "bbb"])
+        text, orig, line_map = LLMPipeline._build_numbered_input(
+            segs, segment_indices=[],
+        )
+        assert text == ""
+
+    def test_segment_indices_with_min_length(self):
+        """segment_indices + min_text_length combo."""
+        segs = _make_segments(["ab", "long text here", "cd", "another long one"])
+        text, orig, line_map = LLMPipeline._build_numbered_input(
+            segs, min_text_length=5, segment_indices=[0, 1, 3],
+        )
+        # index 0 is "ab" (too short), index 1 is long, index 3 is long
+        assert text == "[1] long text here\n[2] another long one"
+        assert line_map == {1: 1, 2: 3}
+
 
 # ---------------------------------------------------------------------------
 # _validate_response tests
@@ -504,6 +532,30 @@ class TestProcessSegments:
         result = pipeline.process_segments(segs)
         assert result.corrected_segments[0]["text"] == "テスト"
         assert result.api_calls == 0
+
+    def test_segment_indices_only_dirty(self):
+        """Only dirty segments (by index) should be sent to LLM."""
+        resp_b = json.dumps({
+            "corrections": [
+                {"line": 1, "original_snippet": "ドッカー", "corrected": "Docker",
+                 "reason": "tech term", "source": "context"},
+            ]
+        })
+        pipeline = _make_pipeline([resp_b], stages="B")
+        segs = _make_segments([
+            "今日は天気がいいです",          # index 0: clean
+            "ドッカーのコンテナを起動する",   # index 1: dirty
+            "明日も晴れるでしょう",           # index 2: clean
+        ])
+        result = pipeline.process_segments(
+            segs, segment_indices=[1],
+        )
+        # Only index 1 should be corrected
+        assert result.corrected_segments[0]["text"] == "今日は天気がいいです"
+        assert result.corrected_segments[1]["text"] == "Dockerのコンテナを起動する"
+        assert result.corrected_segments[2]["text"] == "明日も晴れるでしょう"
+        assert result.segments_sent == 1
+        assert result.segments_total == 3
 
     def test_3a_failure_graceful_degradation(self):
         """3-A failure → 3-B runs without candidates."""

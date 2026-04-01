@@ -586,3 +586,129 @@ class TestBatchTagging:
             assert job.status == JOB_STATUS_SUCCEEDED
             assert job.tagged is False
             assert "None" in job.tag_error
+
+
+# ---------------------------------------------------------------------------
+# Screening integration tests
+# ---------------------------------------------------------------------------
+
+class TestBatchScreening:
+    @pytest.mark.asyncio
+    async def test_all_clean_skips_llm(self):
+        """When screener says all clean → LLM pipeline not called."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [
+                {"text": "今日は天気がいいですね、散歩に行きましょう", "start": 0.0, "end": 3.0},
+            ]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = mock.MagicMock(spec=LLMPipeline)
+            pipeline.enabled = True
+
+            # Create a mock screener that returns all clean
+            from segment_screener import SegmentScreener, ScreeningResult
+            from correction_metrics import CorrectionMetrics
+            screener = mock.MagicMock(spec=SegmentScreener)
+            screener.screen.return_value = ScreeningResult(
+                segments=[dict(seg) for seg in segments],
+                dirty_indices=[],
+                clean_indices=[0],
+                metrics=CorrectionMetrics(total_segments=1, screened_out=1),
+            )
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                segment_screener=screener,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+
+            assert job.status == JOB_STATUS_SUCCEEDED
+            # Pipeline should NOT have been called (all clean)
+            pipeline.process_segments.assert_not_called()
+            assert job.segments_screened == 1
+            assert job.segments_dirty == 0
+
+    @pytest.mark.asyncio
+    async def test_dirty_segments_sent_to_llm(self):
+        """When screener finds dirty segments → only those sent to LLM."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [
+                {"text": "今日は天気がいいですね、散歩に行きましょう", "start": 0.0, "end": 3.0},
+                {"text": "ドッカーのコンテナを起動してください", "start": 3.0, "end": 6.0},
+            ]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline(
+                corrected_texts=[None, "Dockerのコンテナを起動してください"],
+                stages_run=["B"],
+                api_calls=1,
+            )
+
+            from segment_screener import SegmentScreener, ScreeningResult
+            from correction_metrics import CorrectionMetrics
+            screener = mock.MagicMock(spec=SegmentScreener)
+            screener.screen.return_value = ScreeningResult(
+                segments=[dict(seg) for seg in segments],
+                dirty_indices=[1],
+                clean_indices=[0],
+                metrics=CorrectionMetrics(
+                    total_segments=2, screened_out=1, dirty_segments=1,
+                ),
+            )
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=["Docker"],
+                segment_screener=screener,
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.segments_screened == 2
+            assert job.segments_dirty == 1
+
+    @pytest.mark.asyncio
+    async def test_no_screener_full_pipeline(self):
+        """Without screener, all segments go to LLM (backward compat)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [
+                {"text": "テストテキストです、確認してください", "start": 0.0, "end": 2.0},
+            ]
+            _create_test_session(recordings_dir, "s1", segments)
+
+            pipeline = _make_mock_pipeline(stages_run=["B"], api_calls=1)
+
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                segment_screener=None,  # No screener
+            )
+
+            job = bc.enqueue("s1")
+            await bc._process_sync(job)
+
+            assert job.status == JOB_STATUS_SUCCEEDED
+            assert job.segments_screened == 0  # No screening

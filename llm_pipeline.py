@@ -71,6 +71,8 @@ class PipelineResult:
     stages_run: list = field(default_factory=list)
     api_calls: int = 0
     retried: bool = False
+    segments_total: int = 0
+    segments_sent: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +159,14 @@ class LLMPipeline:
     def _build_numbered_input(
         segments: list,
         min_text_length: int = 0,
+        segment_indices: Optional[list] = None,
     ) -> tuple:
         """Build numbered text input and mapping from line number to text.
+
+        Args:
+            segments: List of segment dicts.
+            min_text_length: Minimum text length to include.
+            segment_indices: If provided, only include these segment indices.
 
         Returns:
             (numbered_text, {1-indexed line: original text}, {1-indexed line: segment index})
@@ -168,6 +176,8 @@ class LLMPipeline:
         line_to_seg_idx = {}
         line_num = 0
         for i, seg in enumerate(segments):
+            if segment_indices is not None and i not in segment_indices:
+                continue
             text = seg.get("text", "")
             if len(text) >= min_text_length:
                 line_num += 1
@@ -354,13 +364,14 @@ class LLMPipeline:
         session_glossary: Optional[list] = None,
         min_text_length: int = 0,
         audit_hints: Optional[list] = None,
+        segment_indices: Optional[list] = None,
     ) -> list:
         """Stage 3-B: Apply notation corrections, return new segment list."""
         if "B" not in self._stages:
             return [dict(seg) for seg in segments]
 
         numbered_text, original_by_line, line_to_seg_idx = self._build_numbered_input(
-            segments, min_text_length,
+            segments, min_text_length, segment_indices=segment_indices,
         )
         if not numbered_text:
             return [dict(seg) for seg in segments]
@@ -556,24 +567,36 @@ class LLMPipeline:
         session_glossary: Optional[list] = None,
         min_text_length: int = 0,
         auto_c: bool = False,
+        segment_indices: Optional[list] = None,
     ) -> PipelineResult:
         """Run the configured pipeline stages on segments.
 
         Args:
             auto_c: If True, 3-C runs only when should_run_stage_c() triggers.
                     If False, 3-C runs whenever "C" is in stages (always).
+            segment_indices: If provided, only process these segment indices
+                           (dirty segments from screener). Others pass through unchanged.
 
         Returns a PipelineResult with corrected segments and metadata.
         """
         if not self._enabled:
             return PipelineResult(
                 corrected_segments=[dict(seg) for seg in segments],
+                segments_total=len(segments),
+                segments_sent=0,
             )
 
         result = PipelineResult(
             corrected_segments=[dict(seg) for seg in segments],
+            segments_total=len(segments),
         )
         api_calls = 0
+
+        # Count segments that will be sent
+        if segment_indices is not None:
+            result.segments_sent = len(segment_indices)
+        else:
+            result.segments_sent = len(segments)
 
         # Stage 3-A: Candidate extraction
         candidates = None
@@ -589,7 +612,7 @@ class LLMPipeline:
         if "B" in self._stages:
             corrected = self.correct_notation(
                 segments, candidates, known_terms, session_glossary,
-                min_text_length,
+                min_text_length, segment_indices=segment_indices,
             )
             api_calls += 1
             result.corrected_segments = corrected
