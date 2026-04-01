@@ -33,6 +33,8 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | カスタムユーザータグ | ユーザー定義タグの作成・付与・LLM 自動適用 |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
+| リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
+| 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
@@ -122,12 +124,14 @@ open http://localhost:8092
 |----------|------|------|
 | GET | `/speakers/status` | 話者数・閾値等の状態 |
 | GET | `/speakers/list` | 登録話者一覧 |
+| GET | `/speakers/list-detailed` | 登録話者一覧 (サンプルメタデータ付き、embedding 除外) |
 | POST | `/speakers/add` | 話者を登録 `{"name", "is_user"}` |
 | PUT | `/speakers/{id}` | 話者情報を更新 |
 | DELETE | `/speakers/{id}` | 話者を削除 |
 | POST | `/speakers/{id}/voiceprint` | 声紋サンプルを追加 |
 | DELETE | `/speakers/{id}/voiceprint/{sample_id}` | 声紋サンプルを削除 |
 | PUT | `/speakers/threshold` | 類似度閾値を変更 |
+| PUT | `/speakers/tag-correction` | セグメント個別の話者タグ修正 (`manually_tagged` で上書き保護) |
 | POST | `/speakers/tag/start` | バッチ話者タグ付けを開始 |
 | GET | `/speakers/tag/status` | タグ付け進捗を返す |
 | POST | `/speakers/tag/cancel` | タグ付けをキャンセル |
@@ -140,6 +144,23 @@ open http://localhost:8092
 | POST | `/session-tags/start` | バッチセッションタグ付けを開始 |
 | GET | `/session-tags/status` | タグ付け進捗を返す |
 | POST | `/session-tags/cancel` | タグ付けをキャンセル |
+
+### 一括タグ付け (セッション + 話者)
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/tags/start` | セッションタグ + 話者タグを一括実行 |
+| GET | `/tags/status` | 一括タグ付け進捗を返す |
+| POST | `/tags/cancel` | 一括タグ付けをキャンセル |
+
+### バッチ LLM 補正
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/batch/status` | LLM バッチ補正ステータスを返す |
+| GET | `/batch/jobs` | バッチジョブ一覧 |
+| POST | `/batch/retry` | 失敗ジョブの再試行 |
+| POST | `/batch/process` | 手動でバッチ補正をトリガー |
 
 ### Safe Training Data (匿名化エクスポート)
 
@@ -224,6 +245,9 @@ open http://localhost:8092
 | `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 | `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
+| `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API) |
+| `LLM_BASE_URL` | Gemini OpenAI 互換 | LLM API のベース URL |
+| `CONFIDENCE_LOGPROB_THRESHOLD` | `-0.5` | 信頼度スクリーニング閾値 (低信頼度→dirty) |
 
 ### セッションタグ
 
@@ -231,6 +255,13 @@ open http://localhost:8092
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
 | `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
+
+### リアルタイム声紋フィルタ
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `VOICE_FILTER_ENABLED` | `false` | リアルタイム声紋フィルタ (非ユーザー音声を除去) |
+| `VOICE_FILTER_THRESHOLD` | `0` | 類似度閾値 (0=speakers.json の値を使用) |
 
 ### 機能フラグ
 
@@ -331,6 +362,15 @@ Viewer の「Diarize」ボタンから、未処理の全録音に対して一括
 - 類似度閾値: デフォルト 0.55 (UI スライダーで 0.3〜0.9 調整可)
 - VRAM 管理: diarizer と同パターン (ロード→処理→アンロード)
 - `config/speakers.json` に話者情報・embedding・サンプルを保存
+
+## リアルタイム声紋フィルタ
+
+Whisper 出力後に `is_user` フラグの付いた登録声紋とコサイン類似度を比較し、非ユーザーのセグメント (TV 音声等) を自動除去します。
+
+- Whisper の入力音声は一切変更しない (Post-transcription フィルタ)
+- embedding モデル (~50MB VRAM) は Whisper (~5GB) とセッション中に共存
+- 0.5 秒未満のセグメントは判定スキップ (keep)
+- `VOICE_FILTER_ENABLED=true` で有効化、`VOICE_FILTER_THRESHOLD=0` で speakers.json の閾値を使用
 
 ## Hotwords
 
@@ -653,6 +693,9 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/tag_all.py` | 全セッションの一括タグ付け (CLI) |
 | `tools/verify_screening.py` | LLM スクリーニングの精度検証 (パターンマッチ分析) |
 | `tools/verify_confidence_screening.py` | 信頼度スコアベースのスクリーニング効果検証 |
+| `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
+| `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
+| `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
 
 ## GPU 共有デプロイ
 
@@ -673,8 +716,8 @@ omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて�
 ```
 omi_whisper_transcribe/
 ├── omi_whisper_bridge.py     # メイン: WebSocket + 文字起こし + 管理 API
-├── gpu_manager.py            # GPU リソース管理 (qwen-tts との排他制御)
-├── model_manager.py          # Whisper モデルの外部制御 (gpu-shared 用)
+├── gpu_manager.py            # GPU リソース管理 (レガシー、未使用)
+├── model_manager.py          # Whisper モデルのロード/アンロード管理
 ├── audio_preprocessor.py     # ノイズ除去 + ラウドネス正規化
 ├── llm_pipeline.py           # 3段階 LLM パイプライン (候補抽出→補正→監査)
 ├── llm_pipeline_schema.py    # パイプライン用 JSON Schema 定義
@@ -695,10 +738,10 @@ omi_whisper_transcribe/
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
-├── tts_proxy.py              # TTS プロキシ (gpu-shared 連携)
+├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
 ├── config/                   # 設定ファイル (JSON)
-├── tools/                    # 運用スクリプト
-├── tests/                    # ユニットテスト
+├── tools/                    # 運用・検証スクリプト
+├── tests/                    # ユニットテスト (pytest)
 ├── omi-recordings-viewer/    # Viewer Web アプリ
 │   ├── app.py                # aiohttp サーバー + API
 │   ├── indexer.py            # SQLite インデックス管理
