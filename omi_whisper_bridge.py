@@ -74,6 +74,9 @@ LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "sync")              # "sync" 
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
 TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
 
+# --- 深夜スケジューラ設定 ---
+NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
+
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
@@ -1048,19 +1051,6 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
             else:
                 log.warning("Post-session diarization failed, keeping original segments")
 
-        # Session tagging: skip if batch_corrector will handle it post-correction
-        if not batch_corrector:
-            if (session_tagger and session_tagger.enabled
-                    and len(recorder.all_segments) > 0):
-                try:
-                    tags = await loop.run_in_executor(
-                        None,
-                        lambda: session_tagger.tag_session(recorder.all_segments),
-                    )
-                    if tags:
-                        recorder.session_tags = tags
-                except Exception as e:
-                    log.warning(f"Session tagging failed (post-diarize): {e}")
     except Exception as e:
         log.error(f"Diarization error: {e}", exc_info=True)
     finally:
@@ -1742,6 +1732,100 @@ async def _batch_combined_tag_task(force: bool = False):
 
 
 # ============================================================
+# 深夜スケジューラ (話者分離 + タグ付け一括実行)
+# ============================================================
+
+_nightly_state = {
+    "enabled": False,
+    "hour": 0,
+    "running": False,
+    "phase": None,            # "diarize" | "tag"
+    "last_run": None,
+    "last_result": None,      # "success" | "skipped" | "error"
+    "next_run": None,
+    "error": None,
+}
+
+
+def _calc_next_nightly(hour: int) -> str:
+    """Calculate the next run datetime for the given hour (local time)."""
+    now = datetime.now()
+    today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if now >= today_target:
+        from datetime import timedelta
+        next_run = today_target + timedelta(days=1)
+    else:
+        next_run = today_target
+    return next_run.isoformat()
+
+
+async def _nightly_scheduler():
+    """Background task: run diarize + combined tag at NIGHTLY_SCHEDULE_HOUR."""
+    hour = NIGHTLY_SCHEDULE_HOUR
+    if hour <= 0 or hour > 23:
+        return
+
+    _nightly_state["enabled"] = True
+    _nightly_state["hour"] = hour
+    _nightly_state["next_run"] = _calc_next_nightly(hour)
+    log.info("Nightly scheduler: enabled (hour=%d, next=%s)", hour, _nightly_state["next_run"])
+
+    while True:
+        # Sleep until next target time
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now >= target:
+            from datetime import timedelta
+            target = target + timedelta(days=1)
+
+        _nightly_state["next_run"] = target.isoformat()
+        sleep_seconds = (target - now).total_seconds()
+        log.debug("Nightly scheduler: sleeping %.0f seconds until %s", sleep_seconds, target.isoformat())
+
+        await asyncio.sleep(sleep_seconds)
+
+        # Check if any batch is already running
+        if (_batch_state.get("running")
+                or _batch_combined_tag_state.get("running")
+                or _batch_session_tag_state.get("running")):
+            log.info("Nightly scheduler: skipped (another batch is running)")
+            _nightly_state["last_run"] = datetime.now().isoformat()
+            _nightly_state["last_result"] = "skipped"
+            continue
+
+        log.info("Nightly scheduler: starting (hour=%d)", hour)
+        _nightly_state["running"] = True
+        _nightly_state["error"] = None
+
+        try:
+            # Phase 1: Diarize
+            if diarizer is not None:
+                _nightly_state["phase"] = "diarize"
+                log.info("Nightly scheduler: Phase 1 — diarize")
+                await _batch_diarize_task(force=False)
+
+            # Phase 2: Combined tag (session tag + voice tag)
+            _nightly_state["phase"] = "tag"
+            log.info("Nightly scheduler: Phase 2 — combined tag")
+            await _batch_combined_tag_task(force=False)
+
+            _nightly_state["last_result"] = "success"
+        except Exception as e:
+            log.error("Nightly scheduler: error: %s", e, exc_info=True)
+            _nightly_state["last_result"] = "error"
+            _nightly_state["error"] = str(e)
+        finally:
+            _nightly_state["running"] = False
+            _nightly_state["phase"] = None
+            _nightly_state["last_run"] = datetime.now().isoformat()
+            _nightly_state["next_run"] = _calc_next_nightly(hour)
+            log.info(
+                "Nightly scheduler: finished (result=%s, next=%s)",
+                _nightly_state["last_result"], _nightly_state["next_run"],
+            )
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -1878,23 +1962,7 @@ async def handle_connection(websocket):
             log.debug(f"No speech detected in chunk ({elapsed:.2f}s)")
 
     async def _finalize_and_enqueue(rec):
-        """Finalize recorder and enqueue for batch LLM correction + tagging."""
-        # When batch_corrector handles tagging post-correction, skip tagging here
-        if not batch_corrector:
-            # Fallback: tag immediately if no batch corrector
-            if (session_tagger and session_tagger.enabled
-                    and len(rec.all_segments) > 0):
-                try:
-                    loop = asyncio.get_running_loop()
-                    tags = await loop.run_in_executor(
-                        None,
-                        lambda: session_tagger.tag_session(rec.all_segments),
-                    )
-                    if tags:
-                        rec.session_tags = tags
-                except Exception as e:
-                    log.warning(f"Session tagging failed: {e}")
-
+        """Finalize recorder and enqueue for batch LLM correction."""
         rec.finalize()
 
         # Enqueue for async LLM correction + tagging (Layer 3)
@@ -2188,8 +2256,6 @@ async def main():
             mode=LLM_BATCH_MODE,
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=LLM_MODEL,
-            session_tagger=session_tagger,
-            tagging_enabled=TAGGING_ENABLED,
             segment_screener=segment_screener,
         )
         await batch_corrector.start()
@@ -2959,6 +3025,48 @@ async def main():
         job = batch_corrector.process_now(session_id)
         return web.json_response(job.to_dict())
 
+    # --- Nightly scheduler API ---
+
+    async def handle_nightly_status(request):
+        return web.json_response(_nightly_state)
+
+    async def handle_nightly_trigger(request):
+        if _nightly_state.get("running"):
+            return web.json_response({"error": "already running"}, status=409)
+        if (_batch_state.get("running")
+                or _batch_combined_tag_state.get("running")
+                or _batch_session_tag_state.get("running")):
+            return web.json_response({"error": "another batch is running"}, status=409)
+
+        async def _run_nightly_now():
+            _nightly_state["running"] = True
+            _nightly_state["error"] = None
+            _nightly_state["phase"] = None
+            try:
+                if diarizer is not None:
+                    _nightly_state["phase"] = "diarize"
+                    log.info("Nightly trigger: Phase 1 — diarize")
+                    await _batch_diarize_task(force=False)
+
+                _nightly_state["phase"] = "tag"
+                log.info("Nightly trigger: Phase 2 — combined tag")
+                await _batch_combined_tag_task(force=False)
+
+                _nightly_state["last_result"] = "success"
+            except Exception as e:
+                log.error("Nightly trigger: error: %s", e, exc_info=True)
+                _nightly_state["last_result"] = "error"
+                _nightly_state["error"] = str(e)
+            finally:
+                _nightly_state["running"] = False
+                _nightly_state["phase"] = None
+                _nightly_state["last_run"] = datetime.now().isoformat()
+                if NIGHTLY_SCHEDULE_HOUR > 0:
+                    _nightly_state["next_run"] = _calc_next_nightly(NIGHTLY_SCHEDULE_HOUR)
+
+        asyncio.create_task(_run_nightly_now())
+        return web.json_response({"status": "started"})
+
     mgmt_app = web.Application()
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
@@ -3006,6 +3114,9 @@ async def main():
     mgmt_app.router.add_get("/batch/jobs", handle_batch_llm_jobs)
     mgmt_app.router.add_post("/batch/retry", handle_batch_llm_retry)
     mgmt_app.router.add_post("/batch/process", handle_batch_llm_process)
+    # Nightly scheduler API
+    mgmt_app.router.add_get("/nightly/status", handle_nightly_status)
+    mgmt_app.router.add_post("/nightly/trigger", handle_nightly_trigger)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()
@@ -3022,6 +3133,13 @@ async def main():
         ping_timeout=10,
     ):
         log.info(f"Listening on ws://{HOST}:{PORT}")
+
+        # Start nightly scheduler
+        if NIGHTLY_SCHEDULE_HOUR > 0:
+            asyncio.create_task(_nightly_scheduler())
+        else:
+            log.info("Nightly scheduler: DISABLED (NIGHTLY_SCHEDULE_HOUR=0)")
+
         await asyncio.Future()
 
 

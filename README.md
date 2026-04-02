@@ -35,6 +35,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
+| 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
@@ -162,6 +163,13 @@ open http://localhost:8092
 | POST | `/batch/retry` | 失敗ジョブの再試行 |
 | POST | `/batch/process` | 手動でバッチ補正をトリガー |
 
+### 深夜スケジューラ
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/nightly/status` | スケジューラ状態 (next_run, last_run, running, phase) |
+| POST | `/nightly/trigger` | 手動即時実行 (話者分離 + タグ付け) |
+
 ### Safe Training Data (匿名化エクスポート)
 
 | メソッド | パス | 説明 |
@@ -255,6 +263,12 @@ open http://localhost:8092
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
 | `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
+
+### 深夜スケジューラ
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `NIGHTLY_SCHEDULE_HOUR` | `4` | 深夜バッチ実行時刻 (0=無効, 1-23=実行時刻) |
 
 ### リアルタイム声紋フィルタ
 

@@ -92,8 +92,6 @@ class BatchCorrector:
         gemini_api_key: str = "",
         gemini_model: str = "gemini-2.5-flash-lite",
         batch_poll_interval: int = 60,
-        session_tagger=None,
-        tagging_enabled: bool = True,
         segment_screener=None,
     ):
         self._recordings_dir = recordings_dir
@@ -107,8 +105,6 @@ class BatchCorrector:
         self._gemini_api_key = gemini_api_key
         self._gemini_model = gemini_model
         self._batch_poll_interval = batch_poll_interval
-        self._session_tagger = session_tagger
-        self._tagging_enabled = tagging_enabled and session_tagger is not None
         self._segment_screener = segment_screener
 
         self._queue_path = os.path.join(config_dir, "batch_llm_queue.json")
@@ -143,22 +139,22 @@ class BatchCorrector:
                 data = json.load(f)
             for d in data:
                 job = BatchJob.from_dict(d)
-                # Reset running/tagging jobs back to queued (container restart)
+                # Reset running jobs back to queued (container restart)
                 if job.status == JOB_STATUS_RUNNING:
                     job.status = JOB_STATUS_QUEUED
                     job.started_at = ""
-                elif job.status == JOB_STATUS_TAGGING:
-                    # Correction already done; re-enter as TAGGING on restart
-                    job.status = JOB_STATUS_TAGGING
+                # Migrate legacy TAGGING/TAG_SUBMITTED → SUCCEEDED (correction already done)
+                elif job.status in (JOB_STATUS_TAGGING, JOB_STATUS_TAG_SUBMITTED):
+                    job.status = JOB_STATUS_SUCCEEDED
+                    if not job.finished_at:
+                        job.finished_at = datetime.now().isoformat()
                 self._jobs[job.session_id] = job
             queued = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_QUEUED)
-            tagging = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_TAGGING)
             submitted = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_SUBMITTED)
-            tag_submitted = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_TAG_SUBMITTED)
-            if queued or submitted or tagging or tag_submitted:
+            if queued or submitted:
                 log.info(
-                    "BatchCorrector: loaded %d queued, %d submitted, %d tagging, %d tag_submitted job(s)",
-                    queued, submitted, tagging, tag_submitted,
+                    "BatchCorrector: loaded %d queued, %d submitted job(s)",
+                    queued, submitted,
                 )
         except (json.JSONDecodeError, OSError) as e:
             log.warning("BatchCorrector: failed to load queue: %s", e)
@@ -184,7 +180,6 @@ class BatchCorrector:
             existing = self._jobs[session_id]
             if existing.status in (
                 JOB_STATUS_QUEUED, JOB_STATUS_RUNNING, JOB_STATUS_SUBMITTED,
-                JOB_STATUS_TAGGING, JOB_STATUS_TAG_SUBMITTED,
             ):
                 log.info("BatchCorrector: session %s already %s", session_id, existing.status)
                 return existing
@@ -201,8 +196,7 @@ class BatchCorrector:
         """Get overall batch status."""
         counts = {JOB_STATUS_QUEUED: 0, JOB_STATUS_RUNNING: 0,
                   JOB_STATUS_SUCCEEDED: 0, JOB_STATUS_FAILED: 0,
-                  JOB_STATUS_SUBMITTED: 0,
-                  JOB_STATUS_TAGGING: 0, JOB_STATUS_TAG_SUBMITTED: 0}
+                  JOB_STATUS_SUBMITTED: 0}
         for j in self._jobs.values():
             counts[j.status] = counts.get(j.status, 0) + 1
         return {
@@ -221,11 +215,9 @@ class BatchCorrector:
             jobs = [j for j in jobs if j.status == status]
         jobs.sort(key=lambda j: (
             0 if j.status == JOB_STATUS_RUNNING else
-            1 if j.status == JOB_STATUS_TAGGING else
-            2 if j.status == JOB_STATUS_SUBMITTED else
-            3 if j.status == JOB_STATUS_TAG_SUBMITTED else
-            4 if j.status == JOB_STATUS_QUEUED else
-            5 if j.status == JOB_STATUS_FAILED else 6,
+            1 if j.status == JOB_STATUS_SUBMITTED else
+            2 if j.status == JOB_STATUS_QUEUED else
+            3 if j.status == JOB_STATUS_FAILED else 4,
             j.created_at,
         ))
         return [j.to_dict() for j in jobs[:limit]]
@@ -275,7 +267,7 @@ class BatchCorrector:
         log.info("BatchCorrector: worker stopped")
 
     async def _worker_loop(self):
-        """Main worker loop: poll for queued jobs, tagging jobs, and check submitted jobs."""
+        """Main worker loop: poll for queued jobs and check submitted jobs."""
         while self._running:
             # 1. Process queued jobs (correction phase)
             job = self._next_queued_job()
@@ -286,24 +278,12 @@ class BatchCorrector:
                     await self._process_sync(job)
                 continue
 
-            # 2. Process tagging jobs (sync mode)
-            tag_job = self._next_tagging_job()
-            if tag_job is not None:
-                await self._process_sync_tagging(tag_job)
-                continue
-
-            # 3. Check submitted batch jobs for completion
+            # 2. Check submitted batch jobs for completion
             if self._mode == "batch":
                 submitted = [j for j in self._jobs.values()
                              if j.status == JOB_STATUS_SUBMITTED]
                 for sjob in submitted:
                     await self._check_batch_result(sjob)
-
-                # 4. Check submitted tagging batch jobs
-                tag_submitted = [j for j in self._jobs.values()
-                                 if j.status == JOB_STATUS_TAG_SUBMITTED]
-                for tjob in tag_submitted:
-                    await self._check_tag_batch_result(tjob)
 
             await asyncio.sleep(5 if self._mode == "sync" else self._batch_poll_interval)
 
@@ -317,17 +297,6 @@ class BatchCorrector:
             return None
         queued.sort(key=lambda j: j.created_at)
         return queued[0]
-
-    def _next_tagging_job(self) -> Optional[BatchJob]:
-        """Get the next job awaiting tagging (FIFO by created_at)."""
-        tagging = [
-            j for j in self._jobs.values()
-            if j.status == JOB_STATUS_TAGGING
-        ]
-        if not tagging:
-            return None
-        tagging.sort(key=lambda j: j.created_at)
-        return tagging[0]
 
     # ------------------------------------------------------------------
     # Sync mode: process using LLMPipeline directly
@@ -356,7 +325,7 @@ class BatchCorrector:
             # Skip correction if already done (restart recovery)
             already_corrected = transcript_data.get("session", {}).get("llm_corrected", False)
             if already_corrected:
-                log.info("BatchCorrector [sync]: session %s already corrected, skipping to tagging", session_id)
+                log.info("BatchCorrector [sync]: session %s already corrected, skipping", session_id)
             else:
                 glossary = self._build_session_glossary(segments)
 
@@ -387,11 +356,6 @@ class BatchCorrector:
                             api_calls=0,
                             retried=False,
                         )
-                        if self._tagging_enabled:
-                            job.status = JOB_STATUS_TAGGING
-                            self._save_queue()
-                            self._current_session = None
-                            return
                         job.status = JOB_STATUS_SUCCEEDED
                         job.finished_at = datetime.now().isoformat()
                         self._save_queue()
@@ -419,13 +383,6 @@ class BatchCorrector:
                     pipeline_result.retried,
                 )
 
-            # Transition to tagging phase if tagger enabled
-            if self._tagging_enabled:
-                job.status = JOB_STATUS_TAGGING
-                self._save_queue()
-                self._current_session = None
-                return
-
             job.status = JOB_STATUS_SUCCEEDED
             job.finished_at = datetime.now().isoformat()
 
@@ -437,64 +394,6 @@ class BatchCorrector:
 
         self._save_queue()
         self._current_session = None
-
-    # ------------------------------------------------------------------
-    # Sync tagging: tag session after correction
-    # ------------------------------------------------------------------
-
-    async def _process_sync_tagging(self, job: BatchJob):
-        """Tag a corrected session using SessionTagger (sync API)."""
-        session_id = job.session_id
-        self._current_session = session_id
-        log.info("BatchCorrector [sync]: tagging session %s", session_id)
-
-        try:
-            segments, transcript_data, transcript_path = self._load_transcript(session_id)
-            if segments is None:
-                job.tagged = True
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
-                self._save_queue()
-                self._current_session = None
-                return
-
-            loop = asyncio.get_running_loop()
-            tags = await loop.run_in_executor(
-                None,
-                lambda: self._session_tagger.tag_session(segments),
-            )
-
-            if tags:
-                self._save_tags(transcript_data, transcript_path, tags)
-                job.tagged = True
-                log.info(
-                    "BatchCorrector [sync]: tagged session %s (activity=%s, mood=%s)",
-                    session_id, tags.get("activity"), tags.get("mood"),
-                )
-            else:
-                job.tag_error = "tagger returned None"
-                log.warning("BatchCorrector [sync]: tagging returned None for %s", session_id)
-
-        except Exception as e:
-            log.warning("BatchCorrector [sync]: tagging failed for %s: %s", session_id, e)
-            job.tag_error = str(e)
-
-        # Tagging failure does not fail the job (correction already succeeded)
-        job.status = JOB_STATUS_SUCCEEDED
-        job.finished_at = datetime.now().isoformat()
-        self._save_queue()
-        self._current_session = None
-
-    def _save_tags(self, transcript_data: dict, transcript_path: str, tags: dict):
-        """Save tags to transcript.json atomically."""
-        session_meta = transcript_data.setdefault("session", {})
-        session_meta["tags"] = tags
-        session_meta["session_tagged"] = True
-
-        tmp_path = transcript_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(transcript_data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, transcript_path)
 
     # ------------------------------------------------------------------
     # Batch mode: submit to Gemini Batch API
@@ -646,15 +545,8 @@ class BatchCorrector:
                 corrected_segments, stages, len(responses), False,
             )
 
-            # Transition to tagging phase if tagger enabled
-            if self._tagging_enabled:
-                if self._mode == "batch":
-                    await self._submit_tag_batch_job(job)
-                else:
-                    job.status = JOB_STATUS_TAGGING
-            else:
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
+            job.status = JOB_STATUS_SUCCEEDED
+            job.finished_at = datetime.now().isoformat()
 
         except Exception as e:
             log.error("BatchCorrector [batch]: result processing failed for %s: %s", session_id, e)
@@ -792,125 +684,6 @@ class BatchCorrector:
                     log.warning("BatchCorrector [batch] 3-B: parse error: %s", e)
 
         return corrected
-
-    # ------------------------------------------------------------------
-    # Batch tagging: submit/check tagging batch jobs
-    # ------------------------------------------------------------------
-
-    async def _submit_tag_batch_job(self, job: BatchJob):
-        """Submit a tagging request to Gemini Batch API."""
-        session_id = job.session_id
-
-        try:
-            segments, transcript_data, transcript_path = self._load_transcript(session_id)
-            if segments is None:
-                job.tagged = True
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
-                return
-
-            from llm_pipeline_schema import TAGGING_OBJECT_SCHEMA
-
-            system_prompt, user_text = self._session_tagger.build_batch_input(segments)
-            if not user_text:
-                job.tagged = True
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
-                return
-
-            request = {
-                "contents": [{
-                    "parts": [{"text": user_text}],
-                    "role": "user",
-                }],
-                "config": {
-                    "system_instruction": {"parts": [{"text": system_prompt}]},
-                    "response_mime_type": "application/json",
-                    "response_schema": self._strip_additional_properties(TAGGING_OBJECT_SCHEMA),
-                },
-            }
-
-            loop = asyncio.get_running_loop()
-            batch_result = await loop.run_in_executor(
-                None,
-                lambda: self._genai_client.batches.create(
-                    model=self._gemini_model,
-                    src=[request],
-                    config={"display_name": f"omi-tag-{session_id.replace('/', '-')}"},
-                ),
-            )
-
-            job.tag_batch_job_name = batch_result.name
-            job.status = JOB_STATUS_TAG_SUBMITTED
-            log.info(
-                "BatchCorrector [batch]: tag submitted %s → %s",
-                session_id, batch_result.name,
-            )
-
-        except Exception as e:
-            log.warning("BatchCorrector [batch]: tag submit failed for %s: %s", session_id, e)
-            job.tag_error = str(e)
-            # Tagging failure does not fail the job
-            job.status = JOB_STATUS_SUCCEEDED
-            job.finished_at = datetime.now().isoformat()
-
-    async def _check_tag_batch_result(self, job: BatchJob):
-        """Check if a submitted tagging batch job has completed."""
-        if not self._genai_client or not job.tag_batch_job_name:
-            return
-
-        try:
-            loop = asyncio.get_running_loop()
-            batch_job = await loop.run_in_executor(
-                None,
-                lambda: self._genai_client.batches.get(name=job.tag_batch_job_name),
-            )
-
-            state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
-
-            if state == "JOB_STATE_SUCCEEDED":
-                # Extract response text
-                text = None
-                if hasattr(batch_job, 'dest') and batch_job.dest:
-                    if hasattr(batch_job.dest, 'inlined_responses') and batch_job.dest.inlined_responses:
-                        resp = batch_job.dest.inlined_responses[0]
-                        if hasattr(resp, 'response') and resp.response:
-                            if hasattr(resp.response, 'text'):
-                                text = resp.response.text
-                            elif hasattr(resp.response, 'candidates'):
-                                cands = resp.response.candidates
-                                if cands and cands[0].content and cands[0].content.parts:
-                                    text = cands[0].content.parts[0].text
-
-                if text:
-                    tags = self._session_tagger.validate_and_save_tags(text)
-                    if tags:
-                        segments, transcript_data, transcript_path = self._load_transcript(job.session_id)
-                        if transcript_data:
-                            self._save_tags(transcript_data, transcript_path, tags)
-                            job.tagged = True
-                            log.info("BatchCorrector [batch]: tagged %s", job.session_id)
-                    else:
-                        job.tag_error = "invalid tag response"
-                else:
-                    job.tag_error = "empty tag response"
-
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
-                self._save_queue()
-
-            elif state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
-                log.warning(
-                    "BatchCorrector [batch]: tag batch %s for %s: %s",
-                    state, job.session_id, job.tag_batch_job_name,
-                )
-                job.tag_error = f"Gemini Batch {state}"
-                job.status = JOB_STATUS_SUCCEEDED
-                job.finished_at = datetime.now().isoformat()
-                self._save_queue()
-
-        except Exception as e:
-            log.warning("BatchCorrector [batch]: tag poll error for %s: %s", job.session_id, e)
 
     # ------------------------------------------------------------------
     # Common helpers
