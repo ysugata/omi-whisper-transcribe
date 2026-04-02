@@ -610,7 +610,10 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 |---|---|---|
 | `date_from` / `date_to` | 日付範囲 | 全期間 |
 | `quality` | 文字起こし品質 (カンマ区切り) | 全て |
-| `business_domain` | 事業領域で絞り込み | 全て |
+| `conversation_type` | 会話の種類で絞り込み (V2 タクソノミー) | 全て |
+| `domain` | 事業領域で絞り込み (V2 タクソノミー) | 全て |
+| `importance_v2` | 重要度で絞り込み (高/中/低) | 全て |
+| `business_domain` | 旧事業領域 (後方互換) | 全て |
 | `speaker_mode` | `conversation` (全員) / `user_only` (自分のみ) | conversation |
 | `min_segments` | 最小セグメント数 | 3 |
 | `include_monologue` | 独白セッションを含めるか | フォーマットによる |
@@ -619,7 +622,7 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 
 ```bash
 # プレビュー (件数・サイズ推定)
-curl "http://localhost:8092/api/export/stats?format=knowledge&business_domain=technology"
+curl "http://localhost:8092/api/export/stats?format=knowledge&domain=経営"
 
 # ダウンロード
 curl -o knowledge.jsonl \

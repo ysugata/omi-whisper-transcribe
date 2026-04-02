@@ -478,11 +478,14 @@ class Indexer:
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,
         min_segments: int = 3, business_domain: str = "",
+        conversation_type: str = "", domain: str = "", importance_v2: str = "",
     ) -> dict:
         """Get stats for export preview (session count, segment count, date range, est size)."""
         where, params = self._build_export_where(
             date_from, date_to, quality, activity, min_segments,
             business_domain=business_domain,
+            conversation_type=conversation_type, domain=domain,
+            importance_v2=importance_v2,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -506,11 +509,14 @@ class Indexer:
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,
         min_segments: int = 3, business_domain: str = "",
+        conversation_type: str = "", domain: str = "", importance_v2: str = "",
     ) -> list[tuple[str, str]]:
         """Get (date, time) pairs matching export filters."""
         where, params = self._build_export_where(
             date_from, date_to, quality, activity, min_segments,
             business_domain=business_domain,
+            conversation_type=conversation_type, domain=domain,
+            importance_v2=importance_v2,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -525,6 +531,7 @@ class Indexer:
         self, date_from: str, date_to: str,
         quality: list[str] | None, activity: list[str] | None,
         min_segments: int, business_domain: str = "",
+        conversation_type: str = "", domain: str = "", importance_v2: str = "",
     ) -> tuple[list[str], list]:
         """Build WHERE clauses and params for export queries."""
         where: list[str] = []
@@ -554,6 +561,17 @@ class Indexer:
         if business_domain:
             where.append("tags_business_domain = ?")
             params.append(business_domain)
+
+        # V2 taxonomy filters
+        if conversation_type:
+            where.append("tags_conversation_type = ?")
+            params.append(conversation_type)
+        if domain:
+            where.append("tags_domains LIKE ?")
+            params.append(f"%{domain}%")
+        if importance_v2:
+            where.append("tags_importance_v2 = ?")
+            params.append(importance_v2)
 
         return where, params
 

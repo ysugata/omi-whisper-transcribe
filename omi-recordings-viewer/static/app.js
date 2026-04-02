@@ -115,6 +115,10 @@
         fillSelect(filterOutcome, taxonomy.outcomes, "成果物");
         fillSelect(filterDomain, taxonomy.domains, "事業領域");
         fillSelect(filterImportanceV2, taxonomy.importance, "重要度");
+        // Export filter dropdowns
+        fillSelect(document.getElementById("export-conversation-type"), taxonomy.conversation_type, "All");
+        fillSelect(document.getElementById("export-domain"), taxonomy.domains, "All");
+        fillSelect(document.getElementById("export-importance"), taxonomy.importance, "All");
     }
 
     function fetchSessionDetail(date, time) {
@@ -2101,7 +2105,9 @@
     var exportDateTo = document.getElementById("export-date-to");
     var exportSpeakerMode = document.getElementById("export-speaker-mode");
     var exportMinSegments = document.getElementById("export-min-segments");
-    var exportBusinessDomain = document.getElementById("export-business-domain");
+    var exportConversationType = document.getElementById("export-conversation-type");
+    var exportDomain = document.getElementById("export-domain");
+    var exportImportance = document.getElementById("export-importance");
     var exportIncludeMonologue = document.getElementById("export-include-monologue");
     var exportStatsBtn = document.getElementById("export-stats-btn");
     var exportDownloadBtn = document.getElementById("export-download-btn");
@@ -2136,7 +2142,9 @@
         });
         if (qualities.length > 0) params += "&quality=" + encodeURIComponent(qualities.join(","));
 
-        if (exportBusinessDomain.value) params += "&business_domain=" + encodeURIComponent(exportBusinessDomain.value);
+        if (exportConversationType && exportConversationType.value) params += "&conversation_type=" + encodeURIComponent(exportConversationType.value);
+        if (exportDomain && exportDomain.value) params += "&domain=" + encodeURIComponent(exportDomain.value);
+        if (exportImportance && exportImportance.value) params += "&importance_v2=" + encodeURIComponent(exportImportance.value);
 
         params += "&speaker_mode=" + encodeURIComponent(exportSpeakerMode.value);
         params += "&min_segments=" + encodeURIComponent(exportMinSegments.value || "3");
@@ -2220,25 +2228,54 @@
 
     var taxonomyEditCache = null;
 
+    var taxonomyLoadingEl = document.getElementById("taxonomy-loading");
+    var taxonomyErrorEl = document.getElementById("taxonomy-error");
+    var taxonomyEditorEl = document.getElementById("taxonomy-editor");
+    var taxonomyRetryLink = document.getElementById("taxonomy-retry-link");
+    if (taxonomyRetryLink) {
+        taxonomyRetryLink.addEventListener("click", function (e) {
+            e.preventDefault();
+            loadTaxonomySettings();
+        });
+    }
+
     function loadTaxonomySettings() {
-        fetch("/api/tag-taxonomy").then(function (r) { return r.json(); }).then(function (data) {
+        if (taxonomyLoadingEl) taxonomyLoadingEl.classList.remove("hidden");
+        if (taxonomyErrorEl) taxonomyErrorEl.classList.add("hidden");
+        if (taxonomyEditorEl) taxonomyEditorEl.classList.add("hidden");
+        fetch("/api/tag-taxonomy").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
             taxonomyEditCache = JSON.parse(JSON.stringify(data));
+            if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
+            if (taxonomyEditorEl) taxonomyEditorEl.classList.remove("hidden");
             renderTaxonomySettings();
-        }).catch(function () {});
+        }).catch(function (err) {
+            if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
+            if (taxonomyErrorEl) {
+                taxonomyErrorEl.classList.remove("hidden");
+                taxonomyErrorEl.querySelector("span") || (taxonomyErrorEl.innerHTML =
+                    'タクソノミーの読み込みに失敗しました (' + escapeHtml(err.message) + ')。<a href="#" id="taxonomy-retry-link">再読み込み</a>');
+            }
+        });
     }
 
     function renderTaxonomySettings() {
         if (!taxonomyEditCache) return;
         var axes = [
-            { key: "conversation_type", listId: "taxonomy-conv-type-list" },
-            { key: "outcomes", listId: "taxonomy-outcomes-list" },
-            { key: "domains", listId: "taxonomy-domains-list" },
-            { key: "importance", listId: "taxonomy-importance-list" },
+            { key: "conversation_type", listId: "taxonomy-conv-type-list", countId: "taxonomy-conv-type-count" },
+            { key: "outcomes", listId: "taxonomy-outcomes-list", countId: "taxonomy-outcomes-count" },
+            { key: "domains", listId: "taxonomy-domains-list", countId: "taxonomy-domains-count" },
+            { key: "importance", listId: "taxonomy-importance-list", countId: "taxonomy-importance-count" },
         ];
         axes.forEach(function (axis) {
             var listEl = document.getElementById(axis.listId);
             if (!listEl) return;
             var items = taxonomyEditCache[axis.key] || [];
+            // Update count badge
+            var countEl = document.getElementById(axis.countId);
+            if (countEl) countEl.textContent = items.length;
             var html = "";
             items.forEach(function (item, idx) {
                 html += '<div class="taxonomy-item">';
@@ -2246,7 +2283,7 @@
                 html += '<button class="btn-danger btn-xs taxonomy-del" data-axis="' + axis.key + '" data-idx="' + idx + '">Del</button>';
                 html += '</div>';
             });
-            listEl.innerHTML = html || '<div class="text-dim">No items</div>';
+            listEl.innerHTML = html || '<div class="text-dim">項目がありません</div>';
 
             var delBtns = listEl.querySelectorAll(".taxonomy-del");
             for (var i = 0; i < delBtns.length; i++) {

@@ -788,6 +788,11 @@ def _parse_export_params(request: web.Request) -> dict:
 
     business_domain = request.query.get("business_domain", "").strip()
 
+    # V2 taxonomy filters
+    conversation_type = request.query.get("conversation_type", "").strip()
+    domain = request.query.get("domain", "").strip()
+    importance_v2 = request.query.get("importance_v2", "").strip()
+
     # include_monologue: default False for openai/conversation, True otherwise
     include_monologue_raw = request.query.get("include_monologue", "").strip().lower()
     if include_monologue_raw in ("true", "1", "yes"):
@@ -804,6 +809,9 @@ def _parse_export_params(request: web.Request) -> dict:
         "quality": quality,
         "activity": activity,
         "business_domain": business_domain,
+        "conversation_type": conversation_type,
+        "domain": domain,
+        "importance_v2": importance_v2,
         "speaker_mode": request.query.get("speaker_mode", "conversation"),
         "min_segments": int(request.query.get("min_segments", "3")),
         "include_monologue": include_monologue,
@@ -826,6 +834,9 @@ async def handle_export_stats(request: web.Request) -> web.Response:
             activity=params["activity"],
             min_segments=params["min_segments"],
             business_domain=params["business_domain"],
+            conversation_type=params["conversation_type"],
+            domain=params["domain"],
+            importance_v2=params["importance_v2"],
         )
     except Exception as e:
         logger.exception("Export stats failed")
@@ -850,6 +861,9 @@ async def handle_export_training(request: web.Request) -> web.Response:
             activity=params["activity"],
             min_segments=params["min_segments"],
             business_domain=params["business_domain"],
+            conversation_type=params["conversation_type"],
+            domain=params["domain"],
+            importance_v2=params["importance_v2"],
         )
     except Exception as e:
         logger.exception("Export query failed")
@@ -907,6 +921,9 @@ def _parse_sanitize_params(request: web.Request) -> dict:
         "quality": quality,
         "activity": activity,
         "business_domain": business_domain,
+        "conversation_type": request.query.get("conversation_type", "").strip(),
+        "domain": request.query.get("domain", "").strip(),
+        "importance_v2": request.query.get("importance_v2", "").strip(),
         "min_segments": int(request.query.get("min_segments", "3")),
     }
 
@@ -927,6 +944,9 @@ async def handle_sanitize_start(request: web.Request) -> web.Response:
             activity=params["activity"],
             min_segments=params["min_segments"],
             business_domain=params["business_domain"],
+            conversation_type=params.get("conversation_type", ""),
+            domain=params.get("domain", ""),
+            importance_v2=params.get("importance_v2", ""),
         )
     except Exception as e:
         logger.exception("Sanitize session query failed")
