@@ -165,84 +165,35 @@ AUDIT_SCHEMA = wrap_openai_schema("quality_audit", AUDIT_OBJECT_SCHEMA)
 TAGGING_OBJECT_SCHEMA = {
     "type": "object",
     "properties": {
-        "topics": {
+        "conversation_type": {"type": "string"},
+        "outcomes": {
             "type": "array",
             "items": {"type": "string"},
         },
-        "activity": {
-            "type": "string",
-            "enum": [
-                "casual_chat", "meeting", "brainstorming", "planning",
-                "debugging", "learning", "storytelling", "phone_call",
-                "dictation", "other",
-            ],
-        },
-        "intent": {
-            "type": "string",
-            "enum": [
-                "informing", "planning", "problem_solving", "socializing",
-                "reflecting", "instructing", "requesting", "other",
-            ],
-        },
-        "mood": {
-            "type": "string",
-            "enum": [
-                "positive", "neutral", "negative", "mixed",
-                "excited", "frustrated",
-            ],
-        },
-        "quality": {
-            "type": "string",
-            "enum": ["clean", "partial", "noisy", "fragmented"],
+        "domains": {
+            "type": "array",
+            "items": {"type": "string"},
         },
         "entities": {
             "type": "array",
             "items": {"type": "string"},
         },
         "summary": {"type": "string"},
+        "decision_memo": {"type": "string"},
+        "quality": {
+            "type": "string",
+            "enum": ["clean", "partial", "noisy", "fragmented"],
+        },
+        "importance": {"type": "string"},
         "user_tags": {
             "type": "array",
             "items": {"type": "string"},
         },
-        "source_type": {
-            "type": "string",
-            "enum": [
-                "meeting", "monologue", "negotiation", "phone_call",
-                "dictation", "casual_chat", "discussion", "presentation", "other",
-            ],
-        },
-        "business_domain": {
-            "type": "string",
-            "enum": [
-                "sales", "hiring", "product_planning", "purchasing",
-                "customer_service", "management", "finance", "technology",
-                "personal", "other",
-            ],
-        },
-        "importance": {
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-        },
-        "confidentiality": {
-            "type": "string",
-            "enum": ["public", "internal", "confidential"],
-        },
-        "decision_required": {"type": "boolean"},
-        "decision_summary": {"type": "string"},
-        "reasoning_summary": {"type": "string"},
-        "action_items": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "outcome": {"type": "string"},
-        "next_action": {"type": "string"},
     },
     "required": [
-        "topics", "activity", "intent", "mood", "quality",
-        "entities", "summary", "user_tags",
-        "source_type", "business_domain", "importance", "confidentiality",
-        "decision_required", "decision_summary", "reasoning_summary",
-        "action_items", "outcome", "next_action",
+        "conversation_type", "outcomes", "domains",
+        "entities", "summary", "decision_memo",
+        "quality", "importance", "user_tags",
     ],
     "additionalProperties": False,
 }

@@ -29,7 +29,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
 | LLM 後処理 (3段階パイプライン) | 用語候補抽出 → 表記補正 → 品質監査の3段階で文字起こし精度を向上 |
 | LLM スクリーニング | 辞書補正 + 信頼度スコアで LLM 不要なセグメントを自動スキップ (API call 60-80% 削減) |
-| セッションタグ | LLM による自動タグ付け (活動・気分・トピック・要約) |
+| セッションタグ (3軸分類) | LLM による日本語3軸タグ付け (会話種類・成果物・事業領域 + 要約・判断メモ) |
 | カスタムユーザータグ | ユーザー定義タグの作成・付与・LLM 自動適用 |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
@@ -138,13 +138,14 @@ open http://localhost:8092
 | POST | `/speakers/tag/cancel` | タグ付けをキャンセル |
 | DELETE | `/speakers/all` | 全話者を削除 |
 
-### セッションタグ
+### セッションタグ (3軸分類)
 
 | メソッド | パス | 説明 |
 |----------|------|------|
 | POST | `/session-tags/start` | バッチセッションタグ付けを開始 |
 | GET | `/session-tags/status` | タグ付け進捗を返す |
 | POST | `/session-tags/cancel` | タグ付けをキャンセル |
+| POST | `/taxonomy/reload` | タクソノミー定義を再読み込み |
 
 ### 一括タグ付け (セッション + 話者)
 
@@ -257,7 +258,15 @@ open http://localhost:8092
 | `LLM_BASE_URL` | Gemini OpenAI 互換 | LLM API のベース URL |
 | `CONFIDENCE_LOGPROB_THRESHOLD` | `-0.5` | 信頼度スクリーニング閾値 (低信頼度→dirty) |
 
-### セッションタグ
+### セッションタグ (3軸分類)
+
+セッション終了時に LLM が自動で日本語3軸タグを付与します:
+
+- **会話の種類** (conversation_type): 商談、社内ミーティング、1on1 等 (単一選択)
+- **会話の成果物** (outcomes): 意思決定あり、TODO発生 等 (複数選択)
+- **事業領域** (domains): 水中超音波、物販、経営 等 (複数選択、任意)
+
+タクソノミー (分類軸の項目) は `config/tag_taxonomy.json` で定義し、Viewer の Settings > Taxonomy タブから編集可能です。
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
@@ -754,6 +763,7 @@ omi_whisper_transcribe/
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
 ├── config/                   # 設定ファイル (JSON)
+│   ├── tag_taxonomy.json     # セッションタグ3軸分類 (会話種類・成果物・事業領域)
 ├── tools/                    # 運用・検証スクリプト
 ├── tests/                    # ユニットテスト (pytest)
 ├── omi-recordings-viewer/    # Viewer Web アプリ

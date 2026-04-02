@@ -1,7 +1,10 @@
 """Session-level tagging module using Gemini API.
 
-Tags each recording session with topics, activity, intent, mood,
-quality, entities, and a short Japanese summary.
+Tags each recording session with 3-axis Japanese taxonomy:
+- conversation_type (会話の種類): single-select
+- outcomes (会話の成果物): multi-select
+- domains (事業領域): multi-select
+Plus entities, summary, decision_memo, quality, importance, user_tags.
 Uses OpenAI-compatible API (same as LLMCorrector).
 """
 
@@ -14,44 +17,77 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """あなたは音声文字起こしテキストの分類・要約者です。
-セッションの全発話テキストが入力されます。以下の分類を JSON で返してください。
+# ---------------------------------------------------------------------------
+# Default taxonomy (hardcoded fallback)
+# ---------------------------------------------------------------------------
 
-出力フォーマット (JSON のみ、他のテキストは不要):
-{
-  "topics": ["topic1", "topic2"],
-  "activity": "one_of_enum",
-  "intent": "one_of_enum",
-  "mood": "one_of_enum",
-  "quality": "one_of_enum",
-  "entities": ["Entity1", "Entity2"],
-  "summary": "日本語で1-2文の要約",
-  "source_type": "one_of_enum",
-  "business_domain": "one_of_enum",
-  "importance": "one_of_enum",
-  "confidentiality": "one_of_enum",
-  "decision_required": true_or_false,
-  "decision_summary": "何が決まったか (50文字以内、なければnull)",
-  "reasoning_summary": "なぜそう決めたか (50文字以内、なければnull)",
-  "action_items": ["次のステップ"],
-  "outcome": "one_of_enum_or_null",
-  "next_action": "次にやること (50文字以内、なければnull)"
+_DEFAULT_TAXONOMY = {
+    "version": 1,
+    "conversation_type": [
+        "商談", "社内ミーティング", "1on1", "アイデア出し",
+        "顧客ヒアリング", "採用面接", "雑談・移動中メモ",
+        "外部セミナー", "電話", "独り言・メモ", "その他",
+    ],
+    "outcomes": [
+        "意思決定あり", "TODO発生", "方針転換", "情報共有のみ",
+        "問題提起", "アイデア創出", "感情共有", "なし",
+    ],
+    "domains": [
+        "水中超音波", "物販", "SNS集客", "観光業", "ダクト設備", "投資", "経営", "AI", "個人",
+    ],
+    "importance": ["高", "中", "低"],
 }
 
-### topics (1-3個、英語)
-自由形式の短いトピックラベル。例: "technology", "cooking", "work", "health", "travel", "gaming", "finance", "family", "education"
+_VALID_QUALITY = {"clean", "partial", "noisy", "fragmented"}
 
-### activity (英語 enum、1つ)
-casual_chat, meeting, brainstorming, planning, debugging, learning, storytelling, phone_call, dictation, other
 
-### intent (英語 enum、1つ)
-informing, planning, problem_solving, socializing, reflecting, instructing, requesting, other
+def _load_taxonomy(path: str) -> dict:
+    """Load taxonomy from JSON file, falling back to defaults."""
+    if not path or not os.path.exists(path):
+        return dict(_DEFAULT_TAXONOMY)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "conversation_type" in data:
+            return data
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Failed to load taxonomy from %s: %s", path, e)
+    return dict(_DEFAULT_TAXONOMY)
 
-### mood (英語 enum、1つ)
-positive, neutral, negative, mixed, excited, frustrated
 
-### quality (英語 enum、1つ)
-clean (明瞭で完全), partial (部分的に不明瞭), noisy (ノイズ多い), fragmented (断片的)
+# ---------------------------------------------------------------------------
+# System prompt template
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """あなたは音声文字起こしテキストの分類・要約者です。
+セッションの全発話テキストが入力されます。以下の3軸で分類し、JSON で返してください。
+
+出力フォーマット (JSON のみ、他のテキストは不要):
+{{
+  "conversation_type": "種類",
+  "outcomes": ["成果物1", "成果物2"],
+  "domains": ["事業領域1"],
+  "entities": ["Entity1", "Entity2"],
+  "summary": "日本語で1-2文の要約",
+  "decision_memo": "何が決まったか (80文字以内、なければnull)",
+  "quality": "clean|partial|noisy|fragmented",
+  "importance": "高|中|低"
+}}
+
+### Axis 1: conversation_type (会話の種類、1つだけ選択、必須)
+{conversation_type_list}
+
+### Axis 2: outcomes (会話の成果物、1〜4つ選択、必須)
+{outcomes_list}
+
+### Axis 3: domains (事業領域、0〜3つ選択、任意)
+{domains_list}
+
+#### domains 選択ルール:
+- 「経営」: 特定事業に属さない全社横断の意思決定・財務・組織の話題のみ
+- 「AI」: AI技術そのものが主題の話題のみ。既存事業のAI活用は事業ラインを選択
+- 「個人」: 業務外の個人的な話題（家族、健康、趣味等）
+- 複数事業にまたがる場合は該当する全事業を選択（最大3つ）
 
 ### entities
 テキスト中に登場する固有名詞 (人名、地名、サービス名、技術名など) をそのまま抽出。なければ空配列。
@@ -59,65 +95,26 @@ clean (明瞭で完全), partial (部分的に不明瞭), noisy (ノイズ多い
 ### summary
 日本語で1-2文。何について話していたかの概要。
 
-### source_type (英語 enum、1つ)
-会話の形式: meeting, monologue, negotiation, phone_call, dictation, casual_chat, discussion, presentation, other
+### decision_memo
+「意思決定あり」を outcomes に含めた場合のみ、何が決まったかを日本語80文字以内で記述。該当なしなら null。
 
-### business_domain (英語 enum、1つ)
-事業領域: sales, hiring, product_planning, purchasing, customer_service, management, finance, technology, personal, other
+### quality (英語 enum、1つ)
+clean (明瞭で完全), partial (部分的に不明瞭), noisy (ノイズ多い), fragmented (断片的)
 
-### importance (英語 enum、1つ)
-重要度: high (事業判断に直結), medium (参考情報), low (雑談等)
+### importance (日本語、1つ)
+{importance_list}
 
-### confidentiality (英語 enum、1つ)
-機密レベル: public (社外共有可), internal (社内限定), confidential (関係者限定)
+#### importance 判定基準:
+- 高: 事業判断に直結する内容、重要な意思決定
+- 中: 参考情報、進捗確認、定例的な打ち合わせ
+- 低: 雑談、移動中のメモ、個人的な話題
 
-### decision_required (boolean)
-このセッションで何かの意思決定が行われた/必要とされたか。true or false。
-
-### decision_summary
-何が決まったか、日本語50文字以内。決定事項がなければ null。
-
-### reasoning_summary
-なぜそう決めたか (判断の根拠)、日本語50文字以内。なければ null。
-
-### action_items
-次のステップのリスト (日本語)。最大5件。なければ空配列。
-
-### outcome (英語 enum or null)
-結果: pending (保留中), completed (完了), cancelled (中止), deferred (延期)。該当なしなら null。
-
-### next_action
-次にやること、日本語50文字以内。なければ null。"""
-
-
-# Valid enum values for validation
-_VALID_ACTIVITY = {
-    "casual_chat", "meeting", "brainstorming", "planning", "debugging",
-    "learning", "storytelling", "phone_call", "dictation", "other",
-}
-_VALID_INTENT = {
-    "informing", "planning", "problem_solving", "socializing",
-    "reflecting", "instructing", "requesting", "other",
-}
-_VALID_MOOD = {
-    "positive", "neutral", "negative", "mixed", "excited", "frustrated",
-}
-_VALID_QUALITY = {"clean", "partial", "noisy", "fragmented"}
-_VALID_SOURCE_TYPE = {
-    "meeting", "monologue", "negotiation", "phone_call", "dictation",
-    "casual_chat", "discussion", "presentation", "other",
-}
-_VALID_BUSINESS_DOMAIN = {
-    "sales", "hiring", "product_planning", "purchasing", "customer_service",
-    "management", "finance", "technology", "personal", "other",
-}
-_VALID_IMPORTANCE = {"high", "medium", "low"}
-_VALID_CONFIDENTIALITY = {"public", "internal", "confidential"}
-_VALID_OUTCOME = {"pending", "completed", "cancelled", "deferred"}
+### タグ数制限
+conversation_type (1) + outcomes (1-4) + domains (0-3) の合計が5以下になるようにしてください。"""
 
 
 class SessionTagger:
-    """Tags a session with topics, activity, intent, mood, quality, entities, summary."""
+    """Tags a session with 3-axis Japanese taxonomy."""
 
     def __init__(
         self,
@@ -128,6 +125,7 @@ class SessionTagger:
         max_tokens: int = 768,
         timeout: int = 15,
         user_tags_path: str = "",
+        taxonomy_path: str = "",
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
@@ -136,6 +134,8 @@ class SessionTagger:
         self._client = None
         self._user_tags_path = user_tags_path
         self._user_tags: list[dict] = []
+        self._taxonomy_path = taxonomy_path
+        self._taxonomy = _load_taxonomy(taxonomy_path)
 
         if user_tags_path:
             self._load_user_tags()
@@ -174,13 +174,31 @@ class SessionTagger:
         """Reload user tag definitions (called when tags are updated via CRUD)."""
         self._load_user_tags()
 
+    def reload_taxonomy(self) -> None:
+        """Reload taxonomy from file."""
+        self._taxonomy = _load_taxonomy(self._taxonomy_path)
+        log.info("SessionTagger: taxonomy reloaded (%d types, %d outcomes, %d domains)",
+                 len(self._taxonomy.get("conversation_type", [])),
+                 len(self._taxonomy.get("outcomes", [])),
+                 len(self._taxonomy.get("domains", [])))
+
     @property
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def taxonomy(self) -> dict:
+        return self._taxonomy
+
     def _build_system_prompt(self) -> str:
-        """Build the system prompt, including user tag definitions if any."""
-        prompt = SYSTEM_PROMPT
+        """Build the system prompt with taxonomy values injected."""
+        t = self._taxonomy
+        prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            conversation_type_list=", ".join(f'"{v}"' for v in t.get("conversation_type", [])),
+            outcomes_list=", ".join(f'"{v}"' for v in t.get("outcomes", [])),
+            domains_list=", ".join(f'"{v}"' for v in t.get("domains", [])),
+            importance_list=", ".join(f'"{v}"' for v in t.get("importance", ["高", "中", "低"])),
+        )
         if self._user_tags:
             prompt += "\n\n### user_tags (ユーザー定義タグ、該当するもの全て)\n"
             prompt += "利用可能なタグ:\n"
@@ -207,10 +225,8 @@ class SessionTagger:
 
     def _parse_response(self, raw: str) -> Optional[dict]:
         """Parse JSON response from LLM."""
-        # Try to extract JSON from response (may have markdown code fences)
         raw = raw.strip()
         if raw.startswith("```"):
-            # Remove markdown code fences
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
             raw = re.sub(r'\s*```$', '', raw)
 
@@ -227,31 +243,49 @@ class SessionTagger:
         return data
 
     def _validate_tags(self, tags: dict) -> dict:
-        """Validate and normalize tag values."""
+        """Validate and normalize tag values against taxonomy."""
+        t = self._taxonomy
         result = {}
 
-        # topics: list of strings
-        topics = tags.get("topics", [])
-        if isinstance(topics, list):
-            result["topics"] = [str(t).lower().strip() for t in topics[:5] if t]
+        valid_conv_types = set(t.get("conversation_type", []))
+        valid_outcomes = set(t.get("outcomes", []))
+        valid_domains = set(t.get("domains", []))
+        valid_importance = set(t.get("importance", ["高", "中", "低"]))
+
+        # conversation_type: single-select, required
+        conv_type = str(tags.get("conversation_type", "")).strip()
+        if conv_type not in valid_conv_types:
+            conv_type = "その他" if "その他" in valid_conv_types else (
+                list(valid_conv_types)[0] if valid_conv_types else "その他"
+            )
+        result["conversation_type"] = conv_type
+
+        # outcomes: multi-select, required, 1-4
+        outcomes_raw = tags.get("outcomes", [])
+        if isinstance(outcomes_raw, list):
+            outcomes = [str(o).strip() for o in outcomes_raw if str(o).strip() in valid_outcomes]
         else:
-            result["topics"] = []
+            outcomes = []
+        if not outcomes:
+            outcomes = ["なし"] if "なし" in valid_outcomes else []
+        result["outcomes"] = outcomes[:4]
 
-        # activity: enum
-        activity = str(tags.get("activity", "other")).lower().strip()
-        result["activity"] = activity if activity in _VALID_ACTIVITY else "other"
+        # domains: multi-select, optional, 0-3
+        domains_raw = tags.get("domains", [])
+        if isinstance(domains_raw, list):
+            domains = [str(d).strip() for d in domains_raw if str(d).strip() in valid_domains]
+        else:
+            domains = []
+        result["domains"] = domains[:3]
 
-        # intent: enum
-        intent = str(tags.get("intent", "other")).lower().strip()
-        result["intent"] = intent if intent in _VALID_INTENT else "other"
-
-        # mood: enum
-        mood = str(tags.get("mood", "neutral")).lower().strip()
-        result["mood"] = mood if mood in _VALID_MOOD else "neutral"
-
-        # quality: enum
-        quality = str(tags.get("quality", "clean")).lower().strip()
-        result["quality"] = quality if quality in _VALID_QUALITY else "clean"
+        # 5-tag limit enforcement: conv_type(1) + outcomes + domains <= 5
+        total_tags = 1 + len(result["outcomes"]) + len(result["domains"])
+        while total_tags > 5 and result["domains"]:
+            result["domains"].pop()
+            total_tags -= 1
+        while total_tags > 5 and len(result["outcomes"]) > 1:
+            result["outcomes"].pop()
+            total_tags -= 1
 
         # entities: list of strings (preserve case)
         entities = tags.get("entities", [])
@@ -264,10 +298,24 @@ class SessionTagger:
         summary = str(tags.get("summary", "")).strip()
         result["summary"] = summary[:200] if summary else ""
 
+        # decision_memo: string or None (80 chars max)
+        dm = tags.get("decision_memo")
+        if dm and isinstance(dm, str) and dm.strip():
+            result["decision_memo"] = dm.strip()[:80]
+        else:
+            result["decision_memo"] = None
+
+        # quality: enum (English, internal use)
+        quality = str(tags.get("quality", "clean")).lower().strip()
+        result["quality"] = quality if quality in _VALID_QUALITY else "clean"
+
+        # importance: Japanese
+        importance = str(tags.get("importance", "低")).strip()
+        result["importance"] = importance if importance in valid_importance else "低"
+
         # user_tags: list of tag names → convert to tag IDs
         user_tags_raw = tags.get("user_tags", [])
         if isinstance(user_tags_raw, list) and self._user_tags:
-            # Build name→id map
             name_to_id = {t["name"]: t["id"] for t in self._user_tags if t.get("name") and t.get("id")}
             resolved = []
             for tag_name in user_tags_raw:
@@ -277,63 +325,6 @@ class SessionTagger:
             result["user_tags"] = resolved
         else:
             result["user_tags"] = []
-
-        # --- Business succession fields ---
-
-        # source_type: enum
-        source_type = str(tags.get("source_type", "other")).lower().strip()
-        result["source_type"] = source_type if source_type in _VALID_SOURCE_TYPE else "other"
-
-        # business_domain: enum
-        business_domain = str(tags.get("business_domain", "other")).lower().strip()
-        result["business_domain"] = business_domain if business_domain in _VALID_BUSINESS_DOMAIN else "other"
-
-        # importance: enum
-        importance = str(tags.get("importance", "low")).lower().strip()
-        result["importance"] = importance if importance in _VALID_IMPORTANCE else "low"
-
-        # confidentiality: enum
-        confidentiality = str(tags.get("confidentiality", "internal")).lower().strip()
-        result["confidentiality"] = confidentiality if confidentiality in _VALID_CONFIDENTIALITY else "internal"
-
-        # decision_required: bool
-        result["decision_required"] = bool(tags.get("decision_required", False))
-
-        # decision_summary: string or None (truncate to 100 chars)
-        ds = tags.get("decision_summary")
-        if ds and isinstance(ds, str) and ds.strip():
-            result["decision_summary"] = ds.strip()[:100]
-        else:
-            result["decision_summary"] = None
-
-        # reasoning_summary: string or None (truncate to 100 chars)
-        rs = tags.get("reasoning_summary")
-        if rs and isinstance(rs, str) and rs.strip():
-            result["reasoning_summary"] = rs.strip()[:100]
-        else:
-            result["reasoning_summary"] = None
-
-        # action_items: list of strings (max 5)
-        action_items = tags.get("action_items", [])
-        if isinstance(action_items, list):
-            result["action_items"] = [str(a).strip() for a in action_items[:5] if a and str(a).strip()]
-        else:
-            result["action_items"] = []
-
-        # outcome: enum or None
-        outcome = tags.get("outcome")
-        if outcome and isinstance(outcome, str):
-            outcome = outcome.lower().strip()
-            result["outcome"] = outcome if outcome in _VALID_OUTCOME else None
-        else:
-            result["outcome"] = None
-
-        # next_action: string or None (truncate to 100 chars)
-        na = tags.get("next_action")
-        if na and isinstance(na, str) and na.strip():
-            result["next_action"] = na.strip()[:100]
-        else:
-            result["next_action"] = None
 
         return result
 
@@ -373,10 +364,12 @@ class SessionTagger:
 
             tags = self._validate_tags(parsed)
             tags["tagged_at"] = datetime.now().isoformat()
+            tags["tag_version"] = 2
 
             log.info(
-                f"SessionTagger: activity={tags['activity']}, "
-                f"mood={tags['mood']}, topics={tags['topics']}, "
+                f"SessionTagger: type={tags['conversation_type']}, "
+                f"outcomes={tags['outcomes']}, "
+                f"domains={tags['domains']}, "
                 f"summary={tags['summary'][:50]}"
             )
             return tags
@@ -406,4 +399,5 @@ class SessionTagger:
             return None
         tags = self._validate_tags(parsed)
         tags["tagged_at"] = datetime.now().isoformat()
+        tags["tag_version"] = 2
         return tags

@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_decision_summary TEXT,
     tags_action_items TEXT,
     tags_outcome TEXT,
+    tags_conversation_type TEXT,
+    tags_outcomes TEXT,
+    tags_domains TEXT,
+    tags_decision_memo TEXT,
+    tags_importance_v2 TEXT,
+    tags_version INTEGER DEFAULT 0,
     UNIQUE(date, time)
 );
 
@@ -60,6 +66,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_speakers ON sessions(speakers);
 CREATE INDEX IF NOT EXISTS idx_sessions_business_domain ON sessions(tags_business_domain);
 CREATE INDEX IF NOT EXISTS idx_sessions_importance ON sessions(tags_importance);
 CREATE INDEX IF NOT EXISTS idx_sessions_decision_required ON sessions(tags_decision_required);
+CREATE INDEX IF NOT EXISTS idx_sessions_conversation_type ON sessions(tags_conversation_type);
+CREATE INDEX IF NOT EXISTS idx_sessions_importance_v2 ON sessions(tags_importance_v2);
 """
 
 # Migration: add tag columns to existing DBs
@@ -83,6 +91,12 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_decision_summary TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_action_items TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_outcome TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_conversation_type TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_outcomes TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_domains TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_decision_memo TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_importance_v2 TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_version INTEGER DEFAULT 0",
 ]
 
 FTS_SCHEMA = """
@@ -208,6 +222,23 @@ class Indexer:
         action_items = tags.get("action_items", [])
         tags_action_items = ",".join(action_items) if isinstance(action_items, list) and action_items else None
 
+        # V2 (3-axis) tag detection
+        is_v2 = bool(tags.get("conversation_type"))
+        tag_version = tags.get("tag_version", 0)
+        if is_v2 and tag_version == 0:
+            tag_version = 2
+        elif not is_v2 and session.get("session_tagged") and tag_version == 0:
+            tag_version = 1
+
+        # V2 fields
+        tags_conversation_type = tags.get("conversation_type") if is_v2 else None
+        outcomes = tags.get("outcomes", [])
+        tags_outcomes = ",".join(outcomes) if isinstance(outcomes, list) and outcomes else None
+        domains = tags.get("domains", [])
+        tags_domains = ",".join(domains) if isinstance(domains, list) and domains else None
+        tags_decision_memo = tags.get("decision_memo") if is_v2 else None
+        tags_importance_v2 = tags.get("importance") if is_v2 else None
+
         return {
             "date": date,
             "time": time,
@@ -237,6 +268,12 @@ class Indexer:
             "tags_decision_summary": tags.get("decision_summary"),
             "tags_action_items": tags_action_items,
             "tags_outcome": tags.get("outcome"),
+            "tags_conversation_type": tags_conversation_type,
+            "tags_outcomes": tags_outcomes,
+            "tags_domains": tags_domains,
+            "tags_decision_memo": tags_decision_memo,
+            "tags_importance_v2": tags_importance_v2,
+            "tags_version": tag_version,
         }
 
     async def sync(self) -> int:
@@ -287,7 +324,9 @@ class Indexer:
                     tags_user, speakers, last_modified,
                     tags_source_type, tags_business_domain, tags_importance,
                     tags_confidentiality, tags_decision_required,
-                    tags_decision_summary, tags_action_items, tags_outcome)
+                    tags_decision_summary, tags_action_items, tags_outcome,
+                    tags_conversation_type, tags_outcomes, tags_domains,
+                    tags_decision_memo, tags_importance_v2, tags_version)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -295,7 +334,9 @@ class Indexer:
                            :tags_user, :speakers, :last_modified,
                            :tags_source_type, :tags_business_domain, :tags_importance,
                            :tags_confidentiality, :tags_decision_required,
-                           :tags_decision_summary, :tags_action_items, :tags_outcome)""",
+                           :tags_decision_summary, :tags_action_items, :tags_outcome,
+                           :tags_conversation_type, :tags_outcomes, :tags_domains,
+                           :tags_decision_memo, :tags_importance_v2, :tags_version)""",
                 info,
             )
             count += 1
@@ -314,6 +355,8 @@ class Indexer:
         activity: str = "", mood: str = "", user_tag: str = "",
         speaker: str = "", business_domain: str = "",
         importance: str = "", source_type: str = "",
+        conversation_type: str = "", outcome: str = "",
+        domain: str = "", importance_v2: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -325,6 +368,7 @@ class Indexer:
             where_clauses.append("transcript_text LIKE ?")
             params.append("%" + query + "%")
 
+        # V1 filters (backward compat)
         if activity:
             where_clauses.append("tags_activity = ?")
             params.append(activity)
@@ -344,6 +388,25 @@ class Indexer:
         if source_type:
             where_clauses.append("tags_source_type = ?")
             params.append(source_type)
+
+        # V2 filters (3-axis)
+        if conversation_type:
+            where_clauses.append("tags_conversation_type = ?")
+            params.append(conversation_type)
+
+        if outcome:
+            where_clauses.append("(tags_outcomes LIKE ? OR tags_outcomes = ?)")
+            params.append("%" + outcome + "%")
+            params.append(outcome)
+
+        if domain:
+            where_clauses.append("(tags_domains LIKE ? OR tags_domains = ?)")
+            params.append("%" + domain + "%")
+            params.append(domain)
+
+        if importance_v2:
+            where_clauses.append("tags_importance_v2 = ?")
+            params.append(importance_v2)
 
         if user_tag:
             where_clauses.append("(tags_user LIKE ? OR tags_user = ?)")

@@ -211,6 +211,7 @@ if HF_AUTH_TOKEN:
 
 # セッションタグ付け (LLM API キーがあれば利用可能)
 _USER_TAGS_PATH = os.path.join(CONFIG_DIR, "user_tags.json")
+TAG_TAXONOMY_PATH = os.path.join(CONFIG_DIR, "tag_taxonomy.json")
 
 session_tagger: SessionTagger | None = None
 if TAGGING_ENABLED and LLM_API_KEY:
@@ -219,6 +220,7 @@ if TAGGING_ENABLED and LLM_API_KEY:
         base_url=LLM_BASE_URL,
         model=TAGGING_MODEL,
         user_tags_path=_USER_TAGS_PATH,
+        taxonomy_path=TAG_TAXONOMY_PATH,
     )
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
@@ -2702,6 +2704,13 @@ async def main():
             session_tagger.reload_user_tags()
         return web.json_response({"status": "ok"})
 
+    # --- Taxonomy reload API ---
+
+    async def handle_taxonomy_reload(request):
+        if session_tagger is not None:
+            session_tagger.reload_taxonomy()
+        return web.json_response({"status": "ok"})
+
     # --- Session Tagging バッチ API ---
 
     async def handle_session_tag_start(request):
@@ -3096,6 +3105,8 @@ async def main():
     mgmt_app.router.add_delete("/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
     # User tags reload
     mgmt_app.router.add_post("/user-tags/reload", handle_user_tags_reload)
+    # Taxonomy reload
+    mgmt_app.router.add_post("/taxonomy/reload", handle_taxonomy_reload)
     # Session tagging batch API
     mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
     mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)

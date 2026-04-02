@@ -1,23 +1,23 @@
-"""Tests for SessionTagger."""
+"""Tests for SessionTagger (V2 3-axis taxonomy)."""
 
 import json
+import os
 from unittest import mock
 
 import pytest
 
-from session_tagger import SessionTagger
+from session_tagger import SessionTagger, _load_taxonomy, _DEFAULT_TAXONOMY
 
 
 @pytest.fixture
 def mock_openai():
     """Patch OpenAI client to return controlled responses."""
     with mock.patch("session_tagger.OpenAI", create=True) as MockOpenAI:
-        # Ignore the import inside __init__
         with mock.patch.dict("sys.modules", {"openai": mock.MagicMock()}):
             yield MockOpenAI
 
 
-def _make_tagger(mock_openai, response_content):
+def _make_tagger(mock_openai, response_content, taxonomy=None):
     """Create a SessionTagger with mocked API response."""
     mock_client = mock.MagicMock()
     mock_openai.return_value = mock_client
@@ -27,29 +27,28 @@ def _make_tagger(mock_openai, response_content):
     mock_response.choices[0].message.content = response_content
     mock_client.chat.completions.create.return_value = mock_response
 
-    # We need to mock the import inside __init__
-    with mock.patch("builtins.__import__", side_effect=lambda name, *a, **kw: mock.MagicMock() if name == "openai" else __builtins__.__import__(name, *a, **kw)):
-        pass
-
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
     tagger._model = "gemini-2.5-flash-lite"
     tagger._temperature = 0
-    tagger._max_tokens = 512
+    tagger._max_tokens = 768
     tagger._client = mock_client
     tagger._user_tags_path = ""
     tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = taxonomy or dict(_DEFAULT_TAXONOMY)
     return tagger
 
 
 VALID_RESPONSE = json.dumps({
-    "topics": ["technology", "work"],
-    "activity": "casual_chat",
-    "intent": "planning",
-    "mood": "positive",
-    "quality": "clean",
+    "conversation_type": "商談",
+    "outcomes": ["意思決定あり", "TODO発生"],
+    "domains": ["水中超音波"],
     "entities": ["Docker", "GPU"],
-    "summary": "DockerとGPU共有の設計について雑談",
+    "summary": "DockerとGPU共有の設計について商談",
+    "decision_memo": "GPU共有方式をDocker使用に決定",
+    "quality": "clean",
+    "importance": "高",
 })
 
 SEGMENTS = [
@@ -58,18 +57,24 @@ SEGMENTS = [
 ]
 
 
+# ============================================================
+# Core tagging tests
+# ============================================================
+
 def test_tag_session_valid(mock_openai):
-    """Valid API response should return normalized tags."""
+    """Valid API response should return normalized V2 tags."""
     tagger = _make_tagger(mock_openai, VALID_RESPONSE)
     result = tagger.tag_session(SEGMENTS)
     assert result is not None
-    assert result["topics"] == ["technology", "work"]
-    assert result["activity"] == "casual_chat"
-    assert result["intent"] == "planning"
-    assert result["mood"] == "positive"
-    assert result["quality"] == "clean"
+    assert result["conversation_type"] == "商談"
+    assert result["outcomes"] == ["意思決定あり", "TODO発生"]
+    assert result["domains"] == ["水中超音波"]
     assert result["entities"] == ["Docker", "GPU"]
     assert "Docker" in result["summary"]
+    assert result["decision_memo"] == "GPU共有方式をDocker使用に決定"
+    assert result["quality"] == "clean"
+    assert result["importance"] == "高"
+    assert result["tag_version"] == 2
     assert "tagged_at" in result
 
 
@@ -79,27 +84,29 @@ def test_tag_session_markdown_fenced(mock_openai):
     tagger = _make_tagger(mock_openai, fenced)
     result = tagger.tag_session(SEGMENTS)
     assert result is not None
-    assert result["activity"] == "casual_chat"
+    assert result["conversation_type"] == "商談"
 
 
-def test_tag_session_invalid_enum(mock_openai):
-    """Invalid enum values should fall back to defaults."""
+def test_tag_session_invalid_values(mock_openai):
+    """Invalid taxonomy values should fall back to defaults."""
     bad_response = json.dumps({
-        "topics": ["tech"],
-        "activity": "invalid_activity",
-        "intent": "invalid_intent",
-        "mood": "invalid_mood",
-        "quality": "invalid_quality",
+        "conversation_type": "存在しない種類",
+        "outcomes": ["存在しない成果物"],
+        "domains": ["存在しない領域"],
         "entities": [],
         "summary": "テスト",
+        "decision_memo": None,
+        "quality": "invalid_quality",
+        "importance": "存在しない重要度",
     })
     tagger = _make_tagger(mock_openai, bad_response)
     result = tagger.tag_session(SEGMENTS)
     assert result is not None
-    assert result["activity"] == "other"
-    assert result["intent"] == "other"
-    assert result["mood"] == "neutral"
+    assert result["conversation_type"] == "その他"
+    assert result["outcomes"] == ["なし"]
+    assert result["domains"] == []
     assert result["quality"] == "clean"
+    assert result["importance"] == "低"
 
 
 def test_tag_session_empty_segments(mock_openai):
@@ -138,6 +145,8 @@ def test_tag_session_disabled():
     tagger._client = None
     tagger._user_tags_path = ""
     tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     result = tagger.tag_session(SEGMENTS)
     assert result is None
 
@@ -152,32 +161,225 @@ def test_tag_session_with_speaker_names(mock_openai):
     result = tagger.tag_session(segments_with_names)
     assert result is not None
 
-    # Verify the input sent to the API includes speaker labels
     call_args = tagger._client.chat.completions.create.call_args
     user_msg = call_args[1]["messages"][1]["content"]
     assert "[Taro]" in user_msg
     assert "[SPEAKER_01]" in user_msg
 
 
-def test_validate_tags_truncates():
-    """Validation should truncate long values."""
+# ============================================================
+# 5-tag limit tests
+# ============================================================
+
+def test_five_tag_limit_trims_domains(mock_openai):
+    """When total tags > 5, domains should be trimmed first."""
+    response = json.dumps({
+        "conversation_type": "商談",
+        "outcomes": ["意思決定あり", "TODO発生", "方針転換"],
+        "domains": ["水中超音波", "物販", "経営"],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "中",
+    })
+    tagger = _make_tagger(mock_openai, response)
+    result = tagger.tag_session(SEGMENTS)
+    assert result is not None
+    # 1 (conv_type) + 3 (outcomes) + domains trimmed to 1 = 5
+    total = 1 + len(result["outcomes"]) + len(result["domains"])
+    assert total <= 5
+    assert len(result["outcomes"]) == 3  # outcomes preserved
+
+
+def test_five_tag_limit_max_outcomes(mock_openai):
+    """outcomes should be capped at 4."""
+    response = json.dumps({
+        "conversation_type": "商談",
+        "outcomes": ["意思決定あり", "TODO発生", "方針転換", "情報共有のみ", "アイデア創出"],
+        "domains": [],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "中",
+    })
+    tagger = _make_tagger(mock_openai, response)
+    result = tagger.tag_session(SEGMENTS)
+    assert result is not None
+    assert len(result["outcomes"]) <= 4
+
+
+def test_five_tag_limit_zero_domains(mock_openai):
+    """0 domains should be OK."""
+    response = json.dumps({
+        "conversation_type": "雑談・移動中メモ",
+        "outcomes": ["なし"],
+        "domains": [],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "低",
+    })
+    tagger = _make_tagger(mock_openai, response)
+    result = tagger.tag_session(SEGMENTS)
+    assert result is not None
+    assert result["conversation_type"] == "雑談・移動中メモ"
+    assert result["outcomes"] == ["なし"]
+    assert result["domains"] == []
+    total = 1 + len(result["outcomes"]) + len(result["domains"])
+    assert total == 2
+
+
+# ============================================================
+# Taxonomy loading tests
+# ============================================================
+
+def test_load_taxonomy_from_file(tmp_path):
+    """Taxonomy should load from a valid JSON file."""
+    taxonomy = {
+        "version": 1,
+        "conversation_type": ["テスト種類"],
+        "outcomes": ["テスト成果"],
+        "domains": ["テスト領域"],
+        "importance": ["高", "低"],
+    }
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps(taxonomy, ensure_ascii=False), encoding="utf-8")
+
+    result = _load_taxonomy(str(path))
+    assert result["conversation_type"] == ["テスト種類"]
+    assert result["outcomes"] == ["テスト成果"]
+
+
+def test_load_taxonomy_fallback_on_missing_file():
+    """Missing file should return default taxonomy."""
+    result = _load_taxonomy("/nonexistent/path.json")
+    assert result["conversation_type"] == _DEFAULT_TAXONOMY["conversation_type"]
+
+
+def test_load_taxonomy_fallback_on_invalid_json(tmp_path):
+    """Invalid JSON should return default taxonomy."""
+    path = tmp_path / "bad.json"
+    path.write_text("not json", encoding="utf-8")
+    result = _load_taxonomy(str(path))
+    assert result["conversation_type"] == _DEFAULT_TAXONOMY["conversation_type"]
+
+
+def test_load_taxonomy_fallback_on_empty_path():
+    """Empty path should return default taxonomy."""
+    result = _load_taxonomy("")
+    assert result["conversation_type"] == _DEFAULT_TAXONOMY["conversation_type"]
+
+
+def test_reload_taxonomy(tmp_path):
+    """reload_taxonomy() should re-read the file."""
+    path = tmp_path / "taxonomy.json"
+    taxonomy_v1 = dict(_DEFAULT_TAXONOMY)
+    path.write_text(json.dumps(taxonomy_v1, ensure_ascii=False), encoding="utf-8")
+
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
+    tagger._taxonomy_path = str(path)
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     tagger._user_tags_path = ""
     tagger._user_tags = []
+
+    # Write updated taxonomy
+    taxonomy_v2 = dict(_DEFAULT_TAXONOMY)
+    taxonomy_v2["conversation_type"] = ["新種類1", "新種類2"]
+    path.write_text(json.dumps(taxonomy_v2, ensure_ascii=False), encoding="utf-8")
+
+    tagger.reload_taxonomy()
+    assert tagger._taxonomy["conversation_type"] == ["新種類1", "新種類2"]
+
+
+def test_custom_taxonomy_validation(mock_openai, tmp_path):
+    """Custom taxonomy values should be used for validation."""
+    custom_taxonomy = {
+        "version": 1,
+        "conversation_type": ["カスタム種類", "その他"],
+        "outcomes": ["カスタム成果", "なし"],
+        "domains": ["カスタム領域"],
+        "importance": ["高", "中", "低"],
+    }
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps(custom_taxonomy, ensure_ascii=False), encoding="utf-8")
+
+    response = json.dumps({
+        "conversation_type": "カスタム種類",
+        "outcomes": ["カスタム成果"],
+        "domains": ["カスタム領域"],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "高",
+    })
+    tagger = _make_tagger(mock_openai, response, _load_taxonomy(str(path)))
+    result = tagger.tag_session(SEGMENTS)
+    assert result is not None
+    assert result["conversation_type"] == "カスタム種類"
+    assert result["outcomes"] == ["カスタム成果"]
+    assert result["domains"] == ["カスタム領域"]
+
+
+# ============================================================
+# Validation edge cases
+# ============================================================
+
+def test_validate_truncates_values(mock_openai):
+    """Validation should truncate long values."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
     tags = {
-        "topics": ["a"] * 10,  # should be capped to 5
+        "conversation_type": "商談",
+        "outcomes": ["意思決定あり"],
+        "domains": [],
         "entities": ["e"] * 30,  # should be capped to 20
         "summary": "x" * 300,  # should be capped to 200
-        "activity": "casual_chat",
-        "intent": "planning",
-        "mood": "positive",
+        "decision_memo": "y" * 100,  # should be capped to 80
         "quality": "clean",
+        "importance": "高",
     }
     result = tagger._validate_tags(tags)
-    assert len(result["topics"]) == 5
     assert len(result["entities"]) == 20
     assert len(result["summary"]) == 200
+    assert len(result["decision_memo"]) == 80
+
+
+def test_validate_decision_memo_null_when_empty(mock_openai):
+    """decision_memo should be None when empty/null."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    tags = {
+        "conversation_type": "商談",
+        "outcomes": ["情報共有のみ"],
+        "domains": [],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": "",
+        "quality": "clean",
+        "importance": "中",
+    }
+    result = tagger._validate_tags(tags)
+    assert result["decision_memo"] is None
+
+
+def test_domains_capped_at_3(mock_openai):
+    """domains should be capped at 3."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    tags = {
+        "conversation_type": "商談",
+        "outcomes": ["なし"],
+        "domains": ["水中超音波", "物販", "SNS集客", "観光業", "投資"],
+        "entities": [],
+        "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "中",
+    }
+    result = tagger._validate_tags(tags)
+    assert len(result["domains"]) <= 3
 
 
 # ============================================================
@@ -190,13 +392,14 @@ USER_TAGS = [
 ]
 
 RESPONSE_WITH_USER_TAGS = json.dumps({
-    "topics": ["work"],
-    "activity": "meeting",
-    "intent": "planning",
-    "mood": "neutral",
-    "quality": "clean",
+    "conversation_type": "社内ミーティング",
+    "outcomes": ["情報共有のみ"],
+    "domains": [],
     "entities": [],
     "summary": "仕事の打ち合わせ",
+    "decision_memo": None,
+    "quality": "clean",
+    "importance": "中",
     "user_tags": ["仕事", "重要"],
 })
 
@@ -221,13 +424,14 @@ def test_user_tags_resolved_to_ids(mock_openai):
 def test_user_tags_unknown_name_ignored(mock_openai):
     """Unknown tag names from LLM should be silently ignored."""
     response = json.dumps({
-        "topics": ["work"],
-        "activity": "meeting",
-        "intent": "planning",
-        "mood": "neutral",
-        "quality": "clean",
+        "conversation_type": "社内ミーティング",
+        "outcomes": ["情報共有のみ"],
+        "domains": [],
         "entities": [],
         "summary": "テスト",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "中",
         "user_tags": ["仕事", "未定義タグ"],
     })
     tagger = _make_tagger_with_user_tags(mock_openai, response, USER_TAGS)
@@ -244,16 +448,32 @@ def test_user_tags_empty_when_no_definitions(mock_openai):
     assert result["user_tags"] == []
 
 
+def test_build_system_prompt_includes_taxonomy():
+    """System prompt should include taxonomy values."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
+    prompt = tagger._build_system_prompt()
+    assert "商談" in prompt
+    assert "意思決定あり" in prompt
+    assert "水中超音波" in prompt
+    assert "conversation_type" in prompt
+
+
 def test_build_system_prompt_with_user_tags():
     """System prompt should include user tag definitions."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
     tagger._user_tags_path = ""
     tagger._user_tags = USER_TAGS
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     prompt = tagger._build_system_prompt()
     assert "user_tags" in prompt
     assert "仕事" in prompt
-    assert "重要" in prompt
     assert "仕事関連" in prompt
 
 
@@ -263,6 +483,8 @@ def test_build_system_prompt_without_user_tags():
     tagger._enabled = True
     tagger._user_tags_path = ""
     tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     prompt = tagger._build_system_prompt()
     assert "user_tags" not in prompt
 
@@ -276,9 +498,48 @@ def test_reload_user_tags(tmp_path):
     tagger._enabled = True
     tagger._user_tags_path = str(tags_file)
     tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
 
-    # Write tags and reload
     tags_file.write_text(json.dumps(USER_TAGS), encoding="utf-8")
     tagger.reload_user_tags()
     assert len(tagger._user_tags) == 2
     assert tagger._user_tags[0]["name"] == "仕事"
+
+
+# ============================================================
+# build_batch_input / validate_and_save_tags
+# ============================================================
+
+def test_build_batch_input(mock_openai):
+    """build_batch_input should return system prompt and user text."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    system, user = tagger.build_batch_input(SEGMENTS)
+    assert system != ""
+    assert user != ""
+    assert "Docker" in user
+
+
+def test_build_batch_input_short_text(mock_openai):
+    """Too short text should return empty strings."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    system, user = tagger.build_batch_input([{"text": "あ"}])
+    assert system == ""
+    assert user == ""
+
+
+def test_validate_and_save_tags(mock_openai):
+    """validate_and_save_tags should parse and validate raw JSON."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    result = tagger.validate_and_save_tags(VALID_RESPONSE)
+    assert result is not None
+    assert result["conversation_type"] == "商談"
+    assert result["tag_version"] == 2
+    assert "tagged_at" in result
+
+
+def test_validate_and_save_tags_invalid_json(mock_openai):
+    """Invalid JSON should return None."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    result = tagger.validate_and_save_tags("not json")
+    assert result is None

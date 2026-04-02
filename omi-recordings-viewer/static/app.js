@@ -65,25 +65,56 @@
 
     // --- API ---
 
-    var filterActivity = document.getElementById("filter-activity");
-    var filterMood = document.getElementById("filter-mood");
-    var filterBusinessDomain = document.getElementById("filter-business-domain");
-    var filterImportance = document.getElementById("filter-importance");
-    var filterSourceType = document.getElementById("filter-source-type");
+    // V2 filter elements (3-axis taxonomy)
+    var filterConversationType = document.getElementById("filter-conversation-type");
+    var filterOutcome = document.getElementById("filter-outcome");
+    var filterDomain = document.getElementById("filter-domain");
+    var filterImportanceV2 = document.getElementById("filter-importance-v2");
     var filterUserTag = document.getElementById("filter-user-tag");
     var filterSpeaker = document.getElementById("filter-speaker");
+
+    // Taxonomy cache
+    var taxonomyCache = null;
 
     function fetchSessions(page, query) {
         var url = "/api/sessions?page=" + page + "&per_page=20";
         if (query) url += "&q=" + encodeURIComponent(query);
-        if (filterActivity && filterActivity.value) url += "&activity=" + encodeURIComponent(filterActivity.value);
-        if (filterMood && filterMood.value) url += "&mood=" + encodeURIComponent(filterMood.value);
-        if (filterBusinessDomain && filterBusinessDomain.value) url += "&business_domain=" + encodeURIComponent(filterBusinessDomain.value);
-        if (filterImportance && filterImportance.value) url += "&importance=" + encodeURIComponent(filterImportance.value);
-        if (filterSourceType && filterSourceType.value) url += "&source_type=" + encodeURIComponent(filterSourceType.value);
+        if (filterConversationType && filterConversationType.value) url += "&conversation_type=" + encodeURIComponent(filterConversationType.value);
+        if (filterOutcome && filterOutcome.value) url += "&outcome=" + encodeURIComponent(filterOutcome.value);
+        if (filterDomain && filterDomain.value) url += "&domain=" + encodeURIComponent(filterDomain.value);
+        if (filterImportanceV2 && filterImportanceV2.value) url += "&importance_v2=" + encodeURIComponent(filterImportanceV2.value);
         if (filterUserTag && filterUserTag.value) url += "&user_tag=" + encodeURIComponent(filterUserTag.value);
         if (filterSpeaker && filterSpeaker.value) url += "&speaker=" + encodeURIComponent(filterSpeaker.value);
         return fetch(url).then(function (r) { return r.json(); });
+    }
+
+    function loadTaxonomy() {
+        return fetch("/api/tag-taxonomy").then(function (r) { return r.json(); }).then(function (data) {
+            taxonomyCache = data;
+            populateFilterDropdowns(data);
+        }).catch(function () {
+            taxonomyCache = null;
+        });
+    }
+
+    function populateFilterDropdowns(taxonomy) {
+        if (!taxonomy) return;
+        function fillSelect(sel, items, label) {
+            if (!sel) return;
+            var currentVal = sel.value;
+            sel.innerHTML = '<option value="">' + label + '</option>';
+            (items || []).forEach(function (item) {
+                var opt = document.createElement("option");
+                opt.value = item;
+                opt.textContent = item;
+                sel.appendChild(opt);
+            });
+            sel.value = currentVal;
+        }
+        fillSelect(filterConversationType, taxonomy.conversation_type, "種類");
+        fillSelect(filterOutcome, taxonomy.outcomes, "成果物");
+        fillSelect(filterDomain, taxonomy.domains, "事業領域");
+        fillSelect(filterImportanceV2, taxonomy.importance, "重要度");
     }
 
     function fetchSessionDetail(date, time) {
@@ -118,8 +149,29 @@
             html += '<div class="session-preview' + (isEmpty ? " empty" : "") + '">';
             html += isEmpty ? "(no transcript)" : escapeHtml(preview);
             html += "</div>";
-            // Tag badges
-            if (s.tags_activity || s.tags_mood || s.tags_topics) {
+            // Tag badges — V2 (3-axis) preferred, V1 fallback
+            var hasV2 = !!s.tags_conversation_type;
+            if (hasV2) {
+                html += '<div class="session-tags">';
+                html += '<span class="tag-badge conv-type">' + escapeHtml(s.tags_conversation_type) + '</span>';
+                if (s.tags_outcomes) {
+                    var outcomes = s.tags_outcomes.split(",");
+                    for (var oi = 0; oi < outcomes.length; oi++) {
+                        html += '<span class="tag-badge outcome">' + escapeHtml(outcomes[oi].trim()) + '</span>';
+                    }
+                }
+                if (s.tags_domains) {
+                    var domains = s.tags_domains.split(",");
+                    for (var di = 0; di < domains.length; di++) {
+                        html += '<span class="tag-badge domain">' + escapeHtml(domains[di].trim()) + '</span>';
+                    }
+                }
+                if (s.tags_importance_v2) {
+                    var impClass = s.tags_importance_v2 === "高" ? "imp-high" : s.tags_importance_v2 === "中" ? "imp-med" : "imp-low";
+                    html += '<span class="tag-badge ' + impClass + '">' + escapeHtml(s.tags_importance_v2) + '</span>';
+                }
+                html += '</div>';
+            } else if (s.tags_activity || s.tags_mood || s.tags_topics) {
                 html += '<div class="session-tags">';
                 if (s.tags_activity) {
                     html += '<span class="tag-badge activity">' + escapeHtml(s.tags_activity.replace(/_/g, " ")) + '</span>';
@@ -147,13 +199,7 @@
                     }
                 }
                 if (uTagHtml) {
-                    if (!s.tags_activity && !s.tags_mood && !s.tags_topics) {
-                        html += '<div class="session-tags">' + uTagHtml + '</div>';
-                    } else {
-                        // Append to existing tags div — we need to inject before closing
-                        // Actually since we already closed the div above, just add another row
-                        html += '<div class="session-tags">' + uTagHtml + '</div>';
-                    }
+                    html += '<div class="session-tags">' + uTagHtml + '</div>';
                 }
             }
             if (s.tags_summary) {
@@ -228,17 +274,37 @@
             (s.audio_size_mb ? "<span>Size: " + s.audio_size_mb.toFixed(1) + " MB</span>" : "") +
             "</div>";
 
-        // Tag info in detail
+        // Tag info in detail — V2 preferred, V1 fallback
         var tags = (t && t.session && t.session.tags) ? t.session.tags : null;
         if (tags) {
+            var isV2Detail = !!tags.conversation_type;
             var tagsHtml = '<div class="detail-tags">';
-            if (tags.activity) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.activity.replace(/_/g, " ")) + '</span>';
-            if (tags.intent) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.intent.replace(/_/g, " ")) + '</span>';
-            if (tags.mood) tagsHtml += '<span class="tag-badge mood-' + tags.mood + '">' + escapeHtml(tags.mood) + '</span>';
-            if (tags.quality) tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.quality) + '</span>';
-            if (tags.topics) {
-                for (var tti = 0; tti < tags.topics.length; tti++) {
-                    tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.topics[tti]) + '</span>';
+            if (isV2Detail) {
+                tagsHtml += '<span class="tag-badge conv-type">' + escapeHtml(tags.conversation_type) + '</span>';
+                if (tags.outcomes) {
+                    for (var doi = 0; doi < tags.outcomes.length; doi++) {
+                        tagsHtml += '<span class="tag-badge outcome">' + escapeHtml(tags.outcomes[doi]) + '</span>';
+                    }
+                }
+                if (tags.domains) {
+                    for (var ddi = 0; ddi < tags.domains.length; ddi++) {
+                        tagsHtml += '<span class="tag-badge domain">' + escapeHtml(tags.domains[ddi]) + '</span>';
+                    }
+                }
+                if (tags.importance) {
+                    var dImpClass = tags.importance === "高" ? "imp-high" : tags.importance === "中" ? "imp-med" : "imp-low";
+                    tagsHtml += '<span class="tag-badge ' + dImpClass + '">' + escapeHtml(tags.importance) + '</span>';
+                }
+                if (tags.quality) tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.quality) + '</span>';
+            } else {
+                if (tags.activity) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.activity.replace(/_/g, " ")) + '</span>';
+                if (tags.intent) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.intent.replace(/_/g, " ")) + '</span>';
+                if (tags.mood) tagsHtml += '<span class="tag-badge mood-' + tags.mood + '">' + escapeHtml(tags.mood) + '</span>';
+                if (tags.quality) tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.quality) + '</span>';
+                if (tags.topics) {
+                    for (var tti = 0; tti < tags.topics.length; tti++) {
+                        tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.topics[tti]) + '</span>';
+                    }
                 }
             }
             if (tags.entities) {
@@ -250,6 +316,9 @@
             detailHeader.innerHTML += tagsHtml;
             if (tags.summary) {
                 detailHeader.innerHTML += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
+            }
+            if (isV2Detail && tags.decision_memo) {
+                detailHeader.innerHTML += '<div class="detail-decision-memo">&#9997; ' + escapeHtml(tags.decision_memo) + '</div>';
             }
         }
 
@@ -613,7 +682,7 @@
     var filterPanel = document.getElementById("filter-panel");
     var filterClearBtn = document.getElementById("filter-clear-btn");
     var filterCountBadge = document.getElementById("filter-count-badge");
-    var allFilterSelects = [filterActivity, filterMood, filterBusinessDomain, filterImportance, filterSourceType, filterUserTag, filterSpeaker];
+    var allFilterSelects = [filterConversationType, filterOutcome, filterDomain, filterImportanceV2, filterUserTag, filterSpeaker];
 
     function updateFilterCount() {
         var count = 0;
@@ -674,6 +743,7 @@
         loadHotwordsSettings();
         loadVoiceSettings();
         loadUserTagsSettings();
+        loadTaxonomySettings();
     }
 
     function closeSettings() {
@@ -2144,8 +2214,132 @@
         });
     }
 
+    // ============================================================
+    // Taxonomy Settings tab
+    // ============================================================
+
+    var taxonomyEditCache = null;
+
+    function loadTaxonomySettings() {
+        fetch("/api/tag-taxonomy").then(function (r) { return r.json(); }).then(function (data) {
+            taxonomyEditCache = JSON.parse(JSON.stringify(data));
+            renderTaxonomySettings();
+        }).catch(function () {});
+    }
+
+    function renderTaxonomySettings() {
+        if (!taxonomyEditCache) return;
+        var axes = [
+            { key: "conversation_type", listId: "taxonomy-conv-type-list" },
+            { key: "outcomes", listId: "taxonomy-outcomes-list" },
+            { key: "domains", listId: "taxonomy-domains-list" },
+            { key: "importance", listId: "taxonomy-importance-list" },
+        ];
+        axes.forEach(function (axis) {
+            var listEl = document.getElementById(axis.listId);
+            if (!listEl) return;
+            var items = taxonomyEditCache[axis.key] || [];
+            var html = "";
+            items.forEach(function (item, idx) {
+                html += '<div class="taxonomy-item">';
+                html += '<span class="taxonomy-item-text">' + escapeHtml(item) + '</span>';
+                html += '<button class="btn-danger btn-xs taxonomy-del" data-axis="' + axis.key + '" data-idx="' + idx + '">Del</button>';
+                html += '</div>';
+            });
+            listEl.innerHTML = html || '<div class="text-dim">No items</div>';
+
+            var delBtns = listEl.querySelectorAll(".taxonomy-del");
+            for (var i = 0; i < delBtns.length; i++) {
+                delBtns[i].addEventListener("click", function () {
+                    var ak = this.getAttribute("data-axis");
+                    var ai = parseInt(this.getAttribute("data-idx"), 10);
+                    taxonomyEditCache[ak].splice(ai, 1);
+                    renderTaxonomySettings();
+                });
+            }
+        });
+    }
+
+    // Add buttons
+    var taxonomyAddBtns = document.querySelectorAll(".taxonomy-add-btn");
+    for (var tai = 0; tai < taxonomyAddBtns.length; tai++) {
+        taxonomyAddBtns[tai].addEventListener("click", function () {
+            var axis = this.getAttribute("data-axis");
+            var inputMap = {
+                "conversation_type": "taxonomy-conv-type-input",
+                "outcomes": "taxonomy-outcomes-input",
+                "domains": "taxonomy-domains-input",
+                "importance": "taxonomy-importance-input",
+            };
+            var input = document.getElementById(inputMap[axis]);
+            if (!input) return;
+            var val = input.value.trim();
+            if (!val || !taxonomyEditCache) return;
+            if (!taxonomyEditCache[axis]) taxonomyEditCache[axis] = [];
+            if (taxonomyEditCache[axis].indexOf(val) === -1) {
+                taxonomyEditCache[axis].push(val);
+            }
+            input.value = "";
+            renderTaxonomySettings();
+        });
+    }
+
+    // Save button
+    var taxonomySaveBtn = document.getElementById("taxonomy-save-btn");
+    var taxonomyStatusEl = document.getElementById("taxonomy-status");
+    if (taxonomySaveBtn) {
+        taxonomySaveBtn.addEventListener("click", function () {
+            if (!taxonomyEditCache) return;
+            taxonomySaveBtn.disabled = true;
+            taxonomyStatusEl.textContent = "Saving...";
+            taxonomyStatusEl.style.color = "";
+            fetch("/api/tag-taxonomy", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ taxonomy: taxonomyEditCache }),
+            }).then(function (r) { return r.json(); }).then(function (data) {
+                if (data.error) {
+                    taxonomyStatusEl.textContent = "Error: " + data.error;
+                    taxonomyStatusEl.style.color = "#e74c3c";
+                    return;
+                }
+                taxonomyStatusEl.textContent = "Saved!";
+                taxonomyStatusEl.style.color = "#2ecc71";
+                // Refresh filter dropdowns
+                loadTaxonomy();
+                // Check impact
+                if (data.impact && Object.keys(data.impact).length > 0) {
+                    var impactMsg = "以下のタグ値が使用中のセッションで削除されます:\n";
+                    for (var k in data.impact) {
+                        impactMsg += "  " + k + ": " + data.impact[k] + " セッション\n";
+                    }
+                    impactMsg += "\n再タグ付けを実行しますか？";
+                    if (confirm(impactMsg)) {
+                        fetch("/api/tag-taxonomy", {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ taxonomy: taxonomyEditCache, retag: true }),
+                        }).then(function (r) { return r.json(); }).then(function (rd) {
+                            if (rd.retag_started) {
+                                taxonomyStatusEl.textContent = "Saved + retag started!";
+                                showBatchPanel("tags", { running: true, total: 0, processed: 0 });
+                                startBatchPolling("tags");
+                            }
+                        });
+                    }
+                }
+                setTimeout(function () { taxonomyStatusEl.textContent = ""; }, 3000);
+            }).catch(function (err) {
+                taxonomyStatusEl.textContent = "Error: " + err.message;
+                taxonomyStatusEl.style.color = "#e74c3c";
+            }).finally(function () {
+                taxonomySaveBtn.disabled = false;
+            });
+        });
+    }
+
     // --- Init ---
-    Promise.all([loadUserTagsCache(), loadSpeakerNames()]).then(function () {
+    Promise.all([loadUserTagsCache(), loadSpeakerNames(), loadTaxonomy()]).then(function () {
         loadPage(1);
     });
     checkBatchStatus("diarize");

@@ -25,62 +25,21 @@
 
     <div id="filter-panel" class="filter-panel hidden">
         <div class="filter-group">
-            <span class="filter-group-label">Session</span>
-            <select id="filter-activity" class="filter-select" title="Filter by activity">
-                <option value="">Activity</option>
-                <option value="casual_chat">Casual Chat</option>
-                <option value="meeting">Meeting</option>
-                <option value="brainstorming">Brainstorming</option>
-                <option value="planning">Planning</option>
-                <option value="debugging">Debugging</option>
-                <option value="learning">Learning</option>
-                <option value="storytelling">Storytelling</option>
-                <option value="phone_call">Phone Call</option>
-                <option value="dictation">Dictation</option>
-                <option value="other">Other</option>
+            <span class="filter-group-label">種類</span>
+            <select id="filter-conversation-type" class="filter-select" title="会話の種類でフィルタ">
+                <option value="">種類</option>
             </select>
-            <select id="filter-mood" class="filter-select" title="Filter by mood">
-                <option value="">Mood</option>
-                <option value="positive">Positive</option>
-                <option value="neutral">Neutral</option>
-                <option value="negative">Negative</option>
-                <option value="mixed">Mixed</option>
-                <option value="excited">Excited</option>
-                <option value="frustrated">Frustrated</option>
-            </select>
-            <select id="filter-source-type" class="filter-select" title="Filter by source type">
-                <option value="">Source</option>
-                <option value="meeting">Meeting</option>
-                <option value="monologue">Monologue</option>
-                <option value="discussion">Discussion</option>
-                <option value="negotiation">Negotiation</option>
-                <option value="phone_call">Phone Call</option>
-                <option value="dictation">Dictation</option>
-                <option value="casual_chat">Casual Chat</option>
-                <option value="presentation">Presentation</option>
-                <option value="other">Other</option>
+            <select id="filter-outcome" class="filter-select" title="成果物でフィルタ">
+                <option value="">成果物</option>
             </select>
         </div>
         <div class="filter-group">
-            <span class="filter-group-label">Business</span>
-            <select id="filter-business-domain" class="filter-select" title="Filter by business domain">
-                <option value="">Domain</option>
-                <option value="sales">Sales</option>
-                <option value="hiring">Hiring</option>
-                <option value="product_planning">Product Planning</option>
-                <option value="purchasing">Purchasing</option>
-                <option value="customer_service">Customer Service</option>
-                <option value="management">Management</option>
-                <option value="finance">Finance</option>
-                <option value="technology">Technology</option>
-                <option value="personal">Personal</option>
-                <option value="other">Other</option>
+            <span class="filter-group-label">事業</span>
+            <select id="filter-domain" class="filter-select" title="事業領域でフィルタ">
+                <option value="">事業領域</option>
             </select>
-            <select id="filter-importance" class="filter-select" title="Filter by importance">
-                <option value="">Importance</option>
-                <option value="high">High</option>
-                <option value="medium">Medium</option>
-                <option value="low">Low</option>
+            <select id="filter-importance-v2" class="filter-select" title="重要度でフィルタ">
+                <option value="">重要度</option>
             </select>
         </div>
         <div class="filter-group">
@@ -159,6 +118,7 @@
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
                 <button class="tab" data-tab="voice-tab">Voice</button>
                 <button class="tab" data-tab="user-tags-tab">Tags</button>
+                <button class="tab" data-tab="taxonomy-tab">Taxonomy</button>
                 <button class="tab" data-tab="export-tab">Export</button>
             </div>
 
@@ -262,6 +222,47 @@
                     <button id="voice-delete-all-btn" class="btn-danger">Delete All Speakers</button>
                 </div>
                 <span id="voice-status" class="save-status"></span>
+            </div>
+
+            <!-- Taxonomy tab -->
+            <div id="taxonomy-tab" class="tab-content">
+                <p class="text-dim">セッションタグの分類軸を編集できます。各軸の項目を追加・削除できます。</p>
+                <div class="taxonomy-section">
+                    <h3>会話の種類 (conversation_type)</h3>
+                    <div id="taxonomy-conv-type-list" class="taxonomy-list"></div>
+                    <div class="term-add-row">
+                        <input type="text" id="taxonomy-conv-type-input" placeholder="新しい種類を追加">
+                        <button class="btn-primary taxonomy-add-btn" data-axis="conversation_type">Add</button>
+                    </div>
+                </div>
+                <div class="taxonomy-section">
+                    <h3>成果物 (outcomes)</h3>
+                    <div id="taxonomy-outcomes-list" class="taxonomy-list"></div>
+                    <div class="term-add-row">
+                        <input type="text" id="taxonomy-outcomes-input" placeholder="新しい成果物を追加">
+                        <button class="btn-primary taxonomy-add-btn" data-axis="outcomes">Add</button>
+                    </div>
+                </div>
+                <div class="taxonomy-section">
+                    <h3>事業領域 (domains)</h3>
+                    <div id="taxonomy-domains-list" class="taxonomy-list"></div>
+                    <div class="term-add-row">
+                        <input type="text" id="taxonomy-domains-input" placeholder="新しい事業領域を追加">
+                        <button class="btn-primary taxonomy-add-btn" data-axis="domains">Add</button>
+                    </div>
+                </div>
+                <div class="taxonomy-section">
+                    <h3>重要度 (importance)</h3>
+                    <div id="taxonomy-importance-list" class="taxonomy-list"></div>
+                    <div class="term-add-row">
+                        <input type="text" id="taxonomy-importance-input" placeholder="新しい重要度を追加">
+                        <button class="btn-primary taxonomy-add-btn" data-axis="importance">Add</button>
+                    </div>
+                </div>
+                <div class="taxonomy-actions">
+                    <button id="taxonomy-save-btn" class="btn-primary">Save Taxonomy</button>
+                    <span id="taxonomy-status" class="save-status"></span>
+                </div>
             </div>
 
             <!-- Export tab -->

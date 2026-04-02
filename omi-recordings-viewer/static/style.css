@@ -1225,6 +1225,14 @@ main {
 .tag-badge.mood-frustrated { background: #e74c3c; color: #fff; }
 .tag-badge.topic { background: var(--accent-dim); color: #d0d8e8; }
 
+/* V2 3-axis tag badges */
+.tag-badge.conv-type { background: #2980b9; color: #fff; }
+.tag-badge.outcome { background: #e67e22; color: #fff; }
+.tag-badge.domain { background: #8e44ad; color: #fff; }
+.tag-badge.imp-high { background: #c0392b; color: #fff; }
+.tag-badge.imp-med { background: #7f8c8d; color: #fff; }
+.tag-badge.imp-low { background: #555; color: #aaa; }
+
 .session-summary {
     font-size: 0.8rem;
     color: var(--text-dim);
@@ -1254,6 +1262,30 @@ main {
     background: var(--surface2);
     border-radius: 6px;
 }
+
+.detail-decision-memo {
+    font-size: 0.8rem;
+    color: #e67e22;
+    margin-bottom: 8px;
+    padding: 4px 10px;
+    background: rgba(230, 126, 34, 0.1);
+    border-radius: 6px;
+    border-left: 3px solid #e67e22;
+}
+
+/* Taxonomy Settings */
+.taxonomy-section { margin-bottom: 16px; }
+.taxonomy-section h3 { font-size: 0.85rem; margin-bottom: 6px; color: var(--text-dim); }
+.taxonomy-list { margin-bottom: 8px; }
+.taxonomy-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+}
+.taxonomy-item-text { flex: 1; font-size: 0.85rem; }
+.taxonomy-actions { margin-top: 16px; display: flex; gap: 8px; align-items: center; }
+.btn-xs { font-size: 0.65rem; padding: 1px 6px; }
 
 /* User Tags */
 .user-tag-add-row {

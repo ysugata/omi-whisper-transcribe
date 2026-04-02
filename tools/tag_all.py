@@ -86,7 +86,22 @@ def main():
             print(f"  {s['path']} ({seg_count} segments)")
         return
 
-    tagger = SessionTagger(api_key=api_key, model=model)
+    taxonomy_path = os.path.join(
+        os.path.dirname(args.recordings_dir.rstrip("/")),
+        "config", "tag_taxonomy.json"
+    )
+    # Also check alongside recordings dir
+    if not os.path.exists(taxonomy_path):
+        taxonomy_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "config", "tag_taxonomy.json"
+        )
+
+    tagger = SessionTagger(
+        api_key=api_key,
+        model=model,
+        taxonomy_path=taxonomy_path if os.path.exists(taxonomy_path) else "",
+    )
     if not tagger.enabled:
         print("Error: SessionTagger initialization failed")
         sys.exit(1)
@@ -114,7 +129,9 @@ def main():
                     json.dump(data, f, ensure_ascii=False, indent=2)
 
                 processed += 1
-                print(f"OK ({tags.get('activity', '?')}, {tags.get('mood', '?')})")
+                conv_type = tags.get('conversation_type', '?')
+                outcomes = ','.join(tags.get('outcomes', []))
+                print(f"OK ({conv_type}, [{outcomes}])")
             else:
                 failed += 1
                 print("SKIP (tagger returned None)")

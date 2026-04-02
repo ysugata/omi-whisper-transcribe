@@ -33,6 +33,7 @@ _PENDING_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_suggestions.json"
 _AUTO_DETECTED_PATH = Path(CONFIG_DIR) / "auto_detected_terms.json"
 _HOTWORDS_CUSTOM_PATH = Path(CONFIG_DIR) / "hotwords_custom.json"
 _USER_TAGS_PATH = Path(CONFIG_DIR) / "user_tags.json"
+_TAG_TAXONOMY_PATH = Path(CONFIG_DIR) / "tag_taxonomy.json"
 
 # 初期辞書 (term_corrector.py と同じもの、viewer 単体でも初期生成できるように)
 _INITIAL_DICT = {
@@ -108,12 +109,20 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
     user_tag = request.query.get("user_tag", "").strip()
     speaker = request.query.get("speaker", "").strip()
 
+    # V2 (3-axis) filters
+    conversation_type = request.query.get("conversation_type", "").strip()
+    outcome = request.query.get("outcome", "").strip()
+    domain = request.query.get("domain", "").strip()
+    importance_v2 = request.query.get("importance_v2", "").strip()
+
     try:
         result = await indexer.get_sessions(
             page, per_page, query, activity=activity, mood=mood,
             user_tag=user_tag, speaker=speaker,
             business_domain=business_domain, importance=importance,
             source_type=source_type,
+            conversation_type=conversation_type, outcome=outcome,
+            domain=domain, importance_v2=importance_v2,
         )
     except Exception as e:
         logger.exception("Failed to query sessions")
@@ -447,7 +456,9 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                 tags_user, speakers, last_modified,
                 tags_source_type, tags_business_domain, tags_importance,
                 tags_confidentiality, tags_decision_required,
-                tags_decision_summary, tags_action_items, tags_outcome)
+                tags_decision_summary, tags_action_items, tags_outcome,
+                tags_conversation_type, tags_outcomes, tags_domains,
+                tags_decision_memo, tags_importance_v2, tags_version)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -455,7 +466,9 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                        :tags_user, :speakers, :last_modified,
                        :tags_source_type, :tags_business_domain, :tags_importance,
                        :tags_confidentiality, :tags_decision_required,
-                       :tags_decision_summary, :tags_action_items, :tags_outcome)""",
+                       :tags_decision_summary, :tags_action_items, :tags_outcome,
+                       :tags_conversation_type, :tags_outcomes, :tags_domains,
+                       :tags_decision_memo, :tags_importance_v2, :tags_version)""",
             info,
         )
         await indexer._db.commit()
@@ -628,6 +641,108 @@ async def handle_session_tag_status(request: web.Request) -> web.Response:
 
 async def handle_session_tag_cancel(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/session-tags/cancel")
+
+
+# ============================================================
+# Tag Taxonomy API
+# ============================================================
+
+async def handle_get_tag_taxonomy(request: web.Request) -> web.Response:
+    """GET /api/tag-taxonomy — return current taxonomy."""
+    data = _read_json(_TAG_TAXONOMY_PATH, None)
+    if data is None:
+        # Return default taxonomy
+        from session_tagger import _DEFAULT_TAXONOMY
+        data = dict(_DEFAULT_TAXONOMY)
+        _write_json(_TAG_TAXONOMY_PATH, data)
+    return web.json_response(data)
+
+
+async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
+    """PUT /api/tag-taxonomy — update taxonomy + optionally retag affected sessions."""
+    body = await request.json()
+    new_taxonomy = body.get("taxonomy")
+    if not new_taxonomy or not isinstance(new_taxonomy, dict):
+        return web.json_response({"error": "taxonomy object required"}, status=400)
+
+    # Validate required fields
+    for key in ("conversation_type", "outcomes", "domains", "importance"):
+        if key not in new_taxonomy or not isinstance(new_taxonomy[key], list):
+            return web.json_response({"error": f"{key} must be a list"}, status=400)
+
+    # Check impact: count sessions using removed values
+    old_taxonomy = _read_json(_TAG_TAXONOMY_PATH, None)
+    impact = {}
+    if old_taxonomy and isinstance(old_taxonomy, dict):
+        indexer: Indexer = request.app["indexer"]
+        for axis, col in [
+            ("conversation_type", "tags_conversation_type"),
+            ("outcomes", "tags_outcomes"),
+            ("domains", "tags_domains"),
+            ("importance", "tags_importance_v2"),
+        ]:
+            old_vals = set(old_taxonomy.get(axis, []))
+            new_vals = set(new_taxonomy.get(axis, []))
+            removed = old_vals - new_vals
+            if removed:
+                for val in removed:
+                    try:
+                        if axis in ("outcomes", "domains"):
+                            cursor = await indexer._db.execute(
+                                f"SELECT COUNT(*) as cnt FROM sessions WHERE {col} LIKE ?",
+                                ["%" + val + "%"],
+                            )
+                        else:
+                            cursor = await indexer._db.execute(
+                                f"SELECT COUNT(*) as cnt FROM sessions WHERE {col} = ?",
+                                [val],
+                            )
+                        row = await cursor.fetchone()
+                        cnt = row["cnt"] if row else 0
+                        if cnt > 0:
+                            impact[val] = cnt
+                    except Exception:
+                        pass
+
+    # Save new taxonomy
+    new_taxonomy["version"] = (old_taxonomy or {}).get("version", 0) + 1
+    _write_json(_TAG_TAXONOMY_PATH, new_taxonomy)
+
+    # Notify Bridge to reload taxonomy
+    await _notify_bridge_taxonomy_reload(request)
+
+    retag = body.get("retag", False)
+    retag_started = False
+    if retag and BRIDGE_MGMT_URL:
+        try:
+            session_obj: aiohttp.ClientSession = request.app["bridge_session"]
+            timeout = aiohttp.ClientTimeout(total=5)
+            await session_obj.post(
+                f"{BRIDGE_MGMT_URL}/session-tags/start",
+                json={"force": True},
+                timeout=timeout,
+            )
+            retag_started = True
+        except Exception as e:
+            logger.warning(f"Failed to start retag: {e}")
+
+    return web.json_response({
+        "status": "ok",
+        "impact": impact,
+        "retag_started": retag_started,
+    })
+
+
+async def _notify_bridge_taxonomy_reload(request: web.Request) -> None:
+    """Notify Bridge to reload taxonomy."""
+    if not BRIDGE_MGMT_URL:
+        return
+    session_obj: aiohttp.ClientSession = request.app["bridge_session"]
+    try:
+        timeout = aiohttp.ClientTimeout(total=3)
+        await session_obj.post(f"{BRIDGE_MGMT_URL}/taxonomy/reload", timeout=timeout)
+    except Exception as e:
+        logger.debug(f"Bridge taxonomy reload notification failed: {e}")
 
 
 # ============================================================
@@ -971,6 +1086,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/session-tags/start", handle_session_tag_start)
     app.router.add_get("/api/session-tags/status", handle_session_tag_status)
     app.router.add_post("/api/session-tags/cancel", handle_session_tag_cancel)
+
+    # Tag taxonomy API
+    app.router.add_get("/api/tag-taxonomy", handle_get_tag_taxonomy)
+    app.router.add_put("/api/tag-taxonomy", handle_put_tag_taxonomy)
 
     # Combined tag プロキシ API (Session Tag → Voice Tag)
     app.router.add_post("/api/tags/start", handle_combined_tag_start)
