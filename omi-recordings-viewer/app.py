@@ -748,7 +748,7 @@ async def _notify_bridge_taxonomy_reload(request: web.Request) -> None:
 
 
 # ============================================================
-# Combined Tag プロキシ API (Session Tag → Voice Tag)
+# Combined Tag プロキシ API (Voice Tag → Session Tag)
 # ============================================================
 
 async def handle_combined_tag_start(request: web.Request) -> web.Response:
@@ -1113,7 +1113,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/tag-taxonomy", handle_get_tag_taxonomy)
     app.router.add_put("/api/tag-taxonomy", handle_put_tag_taxonomy)
 
-    # Combined tag プロキシ API (Session Tag → Voice Tag)
+    # Combined tag プロキシ API (Voice Tag → Session Tag)
     app.router.add_post("/api/tags/start", handle_combined_tag_start)
     app.router.add_get("/api/tags/status", handle_combined_tag_status)
     app.router.add_post("/api/tags/cancel", handle_combined_tag_cancel)

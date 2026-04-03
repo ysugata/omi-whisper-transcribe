@@ -119,16 +119,46 @@ class ModelManager:
             self._unload_model()
             return True
 
-    async def force_unload(self) -> bool:
-        """バッチ処理用。session_count を無視して強制アンロード。
+    async def force_unload(self, wait_sessions: bool = False,
+                           wait_timeout: float = 120) -> bool:
+        """バッチ処理用アンロード。
 
-        既存 WS セッションの model 参照は無効になるため、
+        Args:
+            wait_sessions: True の場合、アクティブセッション完了を待ってから
+                           アンロードする (安全)。False は即座にアンロード (旧動作)。
+            wait_timeout: wait_sessions=True 時の最大待機秒数。
+                          タイムアウト後はアンロードせず False を返す。
+
         呼び出し元が gpu_lock を保持していることが前提。
         """
+        if wait_sessions and self._session_count > 0:
+            log.info(f"force_unload: waiting for {self._session_count} session(s) "
+                     f"to finish (timeout={wait_timeout}s)")
+            try:
+                waited = 0.0
+                interval = 1.0
+                while self._session_count > 0 and waited < wait_timeout:
+                    # gpu_lock を一時解放して WS セッションが完了できるようにする
+                    self._gpu_lock.release()
+                    try:
+                        await asyncio.sleep(interval)
+                        waited += interval
+                    finally:
+                        await self._gpu_lock.acquire()
+                if self._session_count > 0:
+                    log.warning(f"force_unload: timeout after {waited}s, "
+                                f"session_count still {self._session_count}")
+                    return False
+                log.info(f"force_unload: all sessions ended after {waited}s")
+            except Exception as e:
+                log.error(f"force_unload: error waiting for sessions: {e}")
+                return False
+
         async with self._lock:
             if self._model is None:
                 return True
-            log.warning(f"force_unload: unloading with session_count={self._session_count}")
+            if self._session_count > 0 and not wait_sessions:
+                log.warning(f"force_unload: unloading with session_count={self._session_count}")
             self._unload_model()
             return True
 

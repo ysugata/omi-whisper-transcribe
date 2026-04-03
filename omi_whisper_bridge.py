@@ -1167,10 +1167,6 @@ async def _batch_diarize_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Force-unload Whisper once before the batch
-        async with model_manager.gpu_lock:
-            await model_manager.force_unload()
-
         for sess in sessions:
             if _batch_state["cancel_requested"]:
                 log.info("Batch diarization cancelled by user")
@@ -1180,12 +1176,9 @@ async def _batch_diarize_task(force: bool = False):
             log.info(f"Batch diarize: {sess['path']}")
 
             try:
-                # Per-session gpu_lock: allows WS handlers to run between sessions
+                # Pyannote (~2GB) + Whisper (~5GB) = ~7GB — fits in RTX 3060 12GB.
+                # No need to unload Whisper. gpu_lock blocks new WS sessions.
                 async with model_manager.gpu_lock:
-                    # Whisper が (セッション間に) 再ロードされた場合に備え強制アンロード
-                    if model_manager.loaded:
-                        log.info("Force-unloading Whisper before diarize session")
-                        await model_manager.force_unload()
                     updated, success = await loop.run_in_executor(
                         None,
                         lambda s=sess: diarizer.diarize(
@@ -1337,10 +1330,6 @@ async def _batch_tag_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        # Force-unload Whisper once before the batch
-        async with model_manager.gpu_lock:
-            await model_manager.force_unload()
-
         for sess in sessions:
             if _batch_tag_state["cancel_requested"]:
                 log.info("Batch speaker tagging cancelled by user")
@@ -1350,17 +1339,14 @@ async def _batch_tag_task(force: bool = False):
             log.info(f"Batch tag: {sess['path']}")
 
             try:
-                # Per-session gpu_lock: load → tag → unload → release
+                # Voice embedding model (~50MB) coexists with Whisper (~5GB),
+                # so no need to unload Whisper. gpu_lock blocks new WS sessions.
                 async with model_manager.gpu_lock:
-                    # Whisper が (セッション間に) 再ロードされた場合に備え強制アンロード
-                    if model_manager.loaded:
-                        log.info("Force-unloading Whisper before speaker tag session")
-                        await model_manager.force_unload()
                     inference = await loop.run_in_executor(
                         None, speaker_filter._load_model
                     )
                     try:
-                        original_segments = s["data"]["segments"]
+                        original_segments = sess["data"]["segments"]
                         updated = await loop.run_in_executor(
                             None,
                             lambda s=sess: speaker_filter.tag_segments_with_model(
@@ -1549,12 +1535,12 @@ async def _batch_session_tag_task(force: bool = False):
 
 
 # ============================================================
-# 統合タグ付けバッチ (Session Tag → Voice Tag)
+# 統合タグ付けバッチ (Voice Tag → Session Tag)
 # ============================================================
 
 _batch_combined_tag_state = {
     "running": False,
-    "phase": None,            # "session_tag" | "voice_tag"
+    "phase": None,            # "voice_tag" | "session_tag"
     "total": 0,
     "processed": 0,
     "failed": 0,
@@ -1574,7 +1560,11 @@ _batch_combined_tag_state = {
 
 
 async def _batch_combined_tag_task(force: bool = False):
-    """統合タグ付けバッチ: Session Tag → Voice Tag を順番に実行する。"""
+    """統合タグ付けバッチ: Voice Tag → Session Tag の順に実行する。
+
+    声紋タグを先に実行することで、LLM セッションタグ付け時に
+    話者情報 (is_user, person_name) を参照できる。
+    """
     import shutil
 
     st = _batch_combined_tag_state
@@ -1595,74 +1585,18 @@ async def _batch_combined_tag_task(force: bool = False):
     st["voice_tag_failed"] = 0
 
     try:
-        # --- Phase 1: Session Tag (LLM) ---
-        st["phase"] = "session_tag"
-        session_tag_sessions = _find_untagged_session_tag_sessions(force=force)
-        st["session_tag_total"] = len(session_tag_sessions)
-        st["total"] = len(session_tag_sessions)
-        log.info(f"Combined tag Phase 1 (session tag): {len(session_tag_sessions)} session(s) (force={force})")
-
-        if session_tag_sessions and session_tagger is not None:
-            loop = asyncio.get_running_loop()
-            for sess in session_tag_sessions:
-                if st["cancel_requested"]:
-                    log.info("Combined tag cancelled by user (session tag phase)")
-                    break
-
-                st["current_session"] = sess["path"]
-                try:
-                    segments = sess["data"].get("segments", [])
-                    tags = await loop.run_in_executor(
-                        None,
-                        lambda segs=segments: session_tagger.tag_session(segs),
-                    )
-
-                    if tags:
-                        bak_path = str(sess["transcript_path"]) + ".bak"
-                        shutil.copy2(sess["transcript_path"], bak_path)
-
-                        data = sess["data"]
-                        data["session"]["tags"] = tags
-                        data["session"]["session_tagged"] = True
-
-                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
-
-                        st["session_tag_processed"] += 1
-                        st["processed"] += 1
-                    else:
-                        st["session_tag_failed"] += 1
-                        st["failed"] += 1
-                        st["errors"].append(f"{sess['path']}: tagger returned None")
-
-                except Exception as e:
-                    st["session_tag_failed"] += 1
-                    st["failed"] += 1
-                    err_msg = f"{sess['path']}: {e}"
-                    st["errors"].append(err_msg)
-                    log.error(f"Combined tag session-tag error: {err_msg}", exc_info=True)
-
-                await asyncio.sleep(0)
-
-        # --- Phase 2: Voice Tag (Speaker) ---
-        if st["cancel_requested"]:
-            return
-
+        # --- Phase 1: Voice Tag (Speaker) ---
+        # 声紋タグを先に実行し、セグメントに is_user / person_name を付与する。
+        # これにより Phase 2 の LLM タグ付けで話者情報を活用できる。
         st["phase"] = "voice_tag"
         if speaker_filter is not None:
             voice_sessions = _find_untagged_sessions(force=force)
             st["voice_tag_total"] = len(voice_sessions)
-            st["total"] = st["session_tag_total"] + len(voice_sessions)
-            st["processed"] = st["session_tag_processed"] + st["session_tag_failed"]
-            st["failed"] = 0  # Reset failed count for combined progress
-            log.info(f"Combined tag Phase 2 (voice tag): {len(voice_sessions)} session(s) (force={force})")
+            st["total"] = len(voice_sessions)
+            log.info(f"Combined tag Phase 1 (voice tag): {len(voice_sessions)} session(s) (force={force})")
 
             if voice_sessions:
                 loop = asyncio.get_running_loop()
-
-                # Force-unload Whisper once before the batch
-                async with model_manager.gpu_lock:
-                    await model_manager.force_unload()
 
                 for sess in voice_sessions:
                     if st["cancel_requested"]:
@@ -1672,9 +1606,10 @@ async def _batch_combined_tag_task(force: bool = False):
                     st["current_session"] = sess["path"]
                     try:
                         original_segments = sess["data"]["segments"]
+                        # Voice embedding model (~50MB) coexists with Whisper (~5GB)
+                        # on RTX 3060 12GB, so no need to unload Whisper.
+                        # gpu_lock blocks new WS sessions during processing.
                         async with model_manager.gpu_lock:
-                            if model_manager.loaded:
-                                await model_manager.force_unload()
                             inference = await loop.run_in_executor(
                                 None, speaker_filter._load_model
                             )
@@ -1717,7 +1652,65 @@ async def _batch_combined_tag_task(force: bool = False):
 
                     await asyncio.sleep(0)
         else:
-            log.info("Combined tag Phase 2 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
+            log.info("Combined tag Phase 1 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
+
+        # --- Phase 2: Session Tag (LLM) ---
+        # 声紋タグ済みのセグメントを使って LLM タグ付けを実行する。
+        if st["cancel_requested"]:
+            return
+
+        st["phase"] = "session_tag"
+        session_tag_sessions = _find_untagged_session_tag_sessions(force=force)
+        st["session_tag_total"] = len(session_tag_sessions)
+        st["total"] = st["voice_tag_total"] + len(session_tag_sessions)
+        st["processed"] = st["voice_tag_processed"] + st["voice_tag_failed"]
+        st["failed"] = 0  # Reset failed count for combined progress
+        log.info(f"Combined tag Phase 2 (session tag): {len(session_tag_sessions)} session(s) (force={force})")
+
+        if session_tag_sessions and session_tagger is not None:
+            loop = asyncio.get_running_loop()
+            for sess in session_tag_sessions:
+                if st["cancel_requested"]:
+                    log.info("Combined tag cancelled by user (session tag phase)")
+                    break
+
+                st["current_session"] = sess["path"]
+                try:
+                    # Re-read transcript to pick up voice tags from Phase 1
+                    with open(sess["transcript_path"], "r", encoding="utf-8") as f:
+                        fresh_data = json.load(f)
+                    segments = fresh_data.get("segments", [])
+
+                    tags = await loop.run_in_executor(
+                        None,
+                        lambda segs=segments: session_tagger.tag_session(segs),
+                    )
+
+                    if tags:
+                        bak_path = str(sess["transcript_path"]) + ".bak"
+                        shutil.copy2(sess["transcript_path"], bak_path)
+
+                        fresh_data["session"]["tags"] = tags
+                        fresh_data["session"]["session_tagged"] = True
+
+                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                            json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+
+                        st["session_tag_processed"] += 1
+                        st["processed"] += 1
+                    else:
+                        st["session_tag_failed"] += 1
+                        st["failed"] += 1
+                        st["errors"].append(f"{sess['path']}: tagger returned None")
+
+                except Exception as e:
+                    st["session_tag_failed"] += 1
+                    st["failed"] += 1
+                    err_msg = f"{sess['path']}: {e}"
+                    st["errors"].append(err_msg)
+                    log.error(f"Combined tag session-tag error: {err_msg}", exc_info=True)
+
+                await asyncio.sleep(0)
 
     except Exception as e:
         log.error(f"Combined tag task error: {e}", exc_info=True)
@@ -1806,9 +1799,9 @@ async def _nightly_scheduler():
                 log.info("Nightly scheduler: Phase 1 — diarize")
                 await _batch_diarize_task(force=False)
 
-            # Phase 2: Combined tag (session tag + voice tag)
+            # Phase 2: Combined tag (voice tag + session tag)
             _nightly_state["phase"] = "tag"
-            log.info("Nightly scheduler: Phase 2 — combined tag")
+            log.info("Nightly scheduler: Phase 2 — combined tag (voice → session)")
             await _batch_combined_tag_task(force=False)
 
             _nightly_state["last_result"] = "success"
@@ -2748,7 +2741,7 @@ async def main():
             _batch_session_tag_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
-    # --- Combined Tag バッチ API (Session Tag → Voice Tag) ---
+    # --- Combined Tag バッチ API (Voice Tag → Session Tag) ---
 
     async def handle_combined_tag_start(request):
         if _batch_combined_tag_state["running"]:
@@ -3058,7 +3051,7 @@ async def main():
                     await _batch_diarize_task(force=False)
 
                 _nightly_state["phase"] = "tag"
-                log.info("Nightly trigger: Phase 2 — combined tag")
+                log.info("Nightly trigger: Phase 2 — combined tag (voice → session)")
                 await _batch_combined_tag_task(force=False)
 
                 _nightly_state["last_result"] = "success"
@@ -3111,7 +3104,7 @@ async def main():
     mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
     mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)
     mgmt_app.router.add_post("/session-tags/cancel", handle_session_tag_cancel)
-    # Combined tag batch API (Session Tag → Voice Tag)
+    # Combined tag batch API (Voice Tag → Session Tag)
     mgmt_app.router.add_post("/tags/start", handle_combined_tag_start)
     mgmt_app.router.add_get("/tags/status", handle_combined_tag_status)
     mgmt_app.router.add_post("/tags/cancel", handle_combined_tag_cancel)

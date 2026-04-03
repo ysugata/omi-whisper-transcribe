@@ -1104,8 +1104,8 @@
     var batchLabels = {
         diarize: { running: "話者分離中...", cancelling: "キャンセル中...", done: "話者分離完了" },
         tags:    {
-            session_tag: "LLM タグ付け中...",
-            voice_tag: "声紋タグ付け中...",
+            voice_tag: "(1/2) 声紋タグ付け中...",
+            session_tag: "(2/2) LLM タグ付け中...",
             cancelling: "キャンセル中...",
             done: "タグ付け完了",
         },
