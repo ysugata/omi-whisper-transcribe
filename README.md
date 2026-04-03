@@ -36,7 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
-| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit) による比較用バッチ文字起こし + 声紋タグ付け |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -340,6 +340,8 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
+
+**実装詳細**: NF4 量子化 (~6.6 GB VRAM), `max_new_tokens=8192`, `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース。
 
 ### 外部サービス
 
@@ -769,7 +771,7 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/verify_confidence_screening.py` | 信頼度スコアベースのスクリーニング効果検証 |
 | `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
 | `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
-| `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, 4-bit) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
+| `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, NF4) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
 | `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
 
 ## GPU 共有デプロイ
@@ -849,7 +851,7 @@ omi_whisper_transcribe/
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
-├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit)
+├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, NF4 量子化)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)

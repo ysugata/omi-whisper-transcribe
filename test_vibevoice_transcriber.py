@@ -1,9 +1,10 @@
 """Tests for vibevoice_transcriber module."""
 
 import json
+import numpy as np
 import pytest
 
-from vibevoice_transcriber import _parse_output, _normalize_segments
+from vibevoice_transcriber import _parse_output, _normalize_segments, _load_audio
 
 
 class TestParseOutput:
@@ -23,12 +24,11 @@ class TestParseOutput:
         assert len(result) == 1
         assert result[0]["Content"] == "test"
 
-    def test_plain_text_fallback(self):
+    def test_plain_text_returns_empty(self):
+        """Plain text without JSON should return empty list (no corrupted segments)."""
         text = "This is just plain text"
         result = _parse_output(text)
-        assert len(result) == 1
-        assert result[0]["Content"] == text
-        assert result[0]["Start"] == 0
+        assert result == []
 
     def test_empty_string(self):
         result = _parse_output("")
@@ -38,11 +38,47 @@ class TestParseOutput:
         result = _parse_output("   \n  ")
         assert result == []
 
-    def test_malformed_json(self):
+    def test_malformed_json_returns_empty(self):
+        """Malformed JSON should return empty list (no corrupted segments)."""
         text = '[{"Start": 0, "End": 5, "Speaker": 0, "Content": "broken'
         result = _parse_output(text)
-        # Falls through to plain text fallback
+        assert result == []
+
+    def test_prompt_contaminated_output(self):
+        """Input tokens mixed into output: prompt text before JSON array."""
+        json_part = json.dumps([
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "Hello"}
+        ])
+        # Simulate prompt leaking into decoded text
+        text = (
+            "<|im_start|>system\nYou are a speech recognizer...<|im_end|>\n"
+            "<|im_start|>user\nHotwords: テスト, 会議[audio_data]<|im_end|>\n"
+            "<|im_start|>assistant\n" + json_part
+        )
+        result = _parse_output(text)
         assert len(result) == 1
+        assert result[0]["Content"] == "Hello"
+
+    def test_assistant_marker_extraction(self):
+        """JSON extraction should work after assistant\\n marker."""
+        json_part = json.dumps([
+            {"Start": 0, "End": 10.0, "Speaker": 0, "Content": "テスト"},
+            {"Start": 10.0, "End": 20.0, "Speaker": 1, "Content": "確認"},
+        ])
+        text = "Some preamble with [brackets] in it\nassistant\n" + json_part
+        result = _parse_output(text)
+        assert len(result) == 2
+        assert result[0]["Content"] == "テスト"
+        assert result[1]["Content"] == "確認"
+
+    def test_prompt_with_brackets_no_valid_json(self):
+        """Prompt containing brackets but no valid JSON array should return empty."""
+        text = (
+            "system\nYou are [a speech recognizer].\n"
+            "user\nHotwords: [test]\nassistant\nNo output"
+        )
+        result = _parse_output(text)
+        assert result == []
 
 
 class TestNormalizeSegments:
@@ -73,3 +109,68 @@ class TestNormalizeSegments:
         result = _normalize_segments(raw)
         assert result[0]["start"] == 1.5
         assert result[0]["end"] == 3.0
+
+    def test_corrupted_segment_filtered(self):
+        """Segments with End=0 and Content > 500 chars are filtered out."""
+        long_text = "あ" * 600
+        raw = [
+            {"Start": 0, "End": 0, "Speaker": 0, "Content": long_text},
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "Normal segment"},
+        ]
+        result = _normalize_segments(raw)
+        assert len(result) == 1
+        assert result[0]["text"] == "Normal segment"
+
+    def test_short_end_zero_segment_kept(self):
+        """Short segments with End=0 should be kept (not corrupted)."""
+        raw = [{"Start": 0, "End": 0, "Speaker": 0, "Content": "Short text"}]
+        result = _normalize_segments(raw)
+        assert len(result) == 1
+        assert result[0]["text"] == "Short text"
+
+    def test_long_content_with_valid_end_kept(self):
+        """Long Content is OK if End > 0 (real long segment, not corrupted)."""
+        long_text = "あ" * 600
+        raw = [{"Start": 0, "End": 120.0, "Speaker": 0, "Content": long_text}]
+        result = _normalize_segments(raw)
+        assert len(result) == 1
+        assert result[0]["text"] == long_text
+
+
+class TestLoadAudioNormalization:
+    def test_audio_normalized_to_minus16_dbfs(self, tmp_path):
+        """Audio should be normalized to approximately -16 dBFS."""
+        import soundfile as sf
+
+        # Create a quiet test signal (sine wave at -40 dBFS)
+        sr = 24000
+        duration = 1.0
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        quiet_amplitude = 10 ** (-40.0 / 20)  # -40 dBFS
+        audio = (quiet_amplitude * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+        wav_path = str(tmp_path / "test.wav")
+        sf.write(wav_path, audio, sr)
+
+        result_audio, result_sr = _load_audio(wav_path)
+
+        assert result_sr == 24000
+        result_rms = np.sqrt(np.mean(result_audio ** 2))
+        target_rms = 10 ** (-16.0 / 20)
+        # Allow 1% tolerance
+        assert abs(result_rms - target_rms) / target_rms < 0.01
+
+    def test_silent_audio_not_normalized(self, tmp_path):
+        """All-zero audio should not cause division by zero."""
+        import soundfile as sf
+
+        sr = 24000
+        audio = np.zeros(sr, dtype=np.float32)
+
+        wav_path = str(tmp_path / "silence.wav")
+        sf.write(wav_path, audio, sr)
+
+        result_audio, result_sr = _load_audio(wav_path)
+
+        assert result_sr == 24000
+        assert np.all(result_audio == 0)

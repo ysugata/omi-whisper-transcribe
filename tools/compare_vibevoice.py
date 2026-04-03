@@ -377,6 +377,7 @@ def load_vibevoice_model():
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
     )
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id,
@@ -437,6 +438,12 @@ def _load_audio_array(wav_path, target_sr=24000):
             audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data).astype(np.float32)
         sr = target_sr
 
+    # Normalize audio level to -16 dBFS
+    rms = np.sqrt(np.mean(audio_data ** 2))
+    if rms > 0:
+        target_rms = 10 ** (-16.0 / 20)  # -16 dBFS
+        audio_data = (audio_data * (target_rms / rms)).astype(np.float32)
+
     return audio_data, sr
 
 
@@ -471,11 +478,17 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
 
         inputs = {k: _move_tensor(v) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=4096)
+        input_len = inputs["input_ids"].shape[-1]
 
-        # Decode output
-        text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=8192,
+                repetition_penalty=1.2,
+            )
+
+        new_tokens = output_ids[:, input_len:]
+        text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
 
         # Parse JSON output from VibeVoice
         segments = _parse_vibevoice_output(text)
@@ -526,10 +539,17 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
             inputs = {k: _move(v)
                       for k, v in inputs.items()}
 
-            with torch.no_grad():
-                output_ids = model.generate(**inputs, max_new_tokens=4096)
+            input_len = inputs["input_ids"].shape[-1]
 
-            text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=8192,
+                    repetition_penalty=1.2,
+                )
+
+            new_tokens = output_ids[:, input_len:]
+            text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
             chunk_segs = _parse_vibevoice_output(text)
 
             # Adjust timestamps by offset
@@ -552,10 +572,15 @@ def _parse_vibevoice_output(text):
 
     VibeVoice outputs JSON array:
     [{"Start": 0, "End": 15.43, "Speaker": 0, "Content": "text"}]
+
+    When input tokens are not stripped, the decoded text may contain the
+    full prompt (system/user/assistant markers and hotwords).  We handle
+    this by looking for an ``assistant\\n`` marker and only searching for
+    JSON after it.
     """
     text = text.strip()
 
-    # Try direct JSON parse
+    # 1. Direct JSON parse
     try:
         result = json.loads(text)
         if isinstance(result, list):
@@ -563,20 +588,24 @@ def _parse_vibevoice_output(text):
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON array in text
-    start_idx = text.find("[")
-    end_idx = text.rfind("]")
+    # 2. If "assistant\n" marker present, only search after it
+    marker = text.rfind("assistant\n")
+    search_text = text[marker + 10:].strip() if marker >= 0 else text
+
+    # 3. Extract JSON array
+    start_idx = search_text.find("[")
+    end_idx = search_text.rfind("]")
     if start_idx >= 0 and end_idx > start_idx:
         try:
-            result = json.loads(text[start_idx:end_idx + 1])
+            result = json.loads(search_text[start_idx:end_idx + 1])
             if isinstance(result, list):
                 return result
         except json.JSONDecodeError:
             pass
 
-    # Fallback: treat entire text as single segment
+    # 4. Fallback: return empty list (do not create corrupted segments)
     if text:
-        return [{"Start": 0, "End": 0, "Speaker": 0, "Content": text}]
+        print(f"    {YELLOW}WARNING: VibeVoice output parse failed ({len(text)} chars){RESET}")
     return []
 
 
