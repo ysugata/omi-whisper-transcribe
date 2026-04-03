@@ -458,7 +458,8 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                 tags_confidentiality, tags_decision_required,
                 tags_decision_summary, tags_action_items, tags_outcome,
                 tags_conversation_type, tags_outcomes, tags_domains,
-                tags_decision_memo, tags_importance_v2, tags_version)
+                tags_decision_memo, tags_importance_v2, tags_version,
+                tags_external_audio)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -468,7 +469,8 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                        :tags_confidentiality, :tags_decision_required,
                        :tags_decision_summary, :tags_action_items, :tags_outcome,
                        :tags_conversation_type, :tags_outcomes, :tags_domains,
-                       :tags_decision_memo, :tags_importance_v2, :tags_version)""",
+                       :tags_decision_memo, :tags_importance_v2, :tags_version,
+                       :tags_external_audio)""",
             info,
         )
         await indexer._db.commit()

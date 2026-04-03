@@ -268,6 +268,8 @@ open http://localhost:8092
 
 タクソノミー (分類軸の項目) は `config/tag_taxonomy.json` で定義し、Viewer の Settings > Taxonomy タブから編集可能です。
 
+Voice タグ (話者識別) が利用可能な場合、各セグメントの話者情報 (自分/登録者/unknown) を LLM プロンプトに含めて分類精度を向上させます。また、unknown 話者比率 (`external_audio_ratio`) を自動計算し、80% 以上のセッションには「TV/外部音声」バッジを表示します。
+
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |

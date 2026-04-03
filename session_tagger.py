@@ -109,6 +109,15 @@ clean (明瞭で完全), partial (部分的に不明瞭), noisy (ノイズ多い
 - 中: 参考情報、進捗確認、定例的な打ち合わせ
 - 低: 雑談、移動中のメモ、個人的な話題
 
+### 話者情報の解釈
+入力テキストに [話者情報] と [名前] / [unknown] のプレフィックスがある場合:
+- [自分] = 録音者本人の発話
+- [名前(自分)] = 同上（名前付き）
+- [名前] = 登録済みの他者の発話
+- [unknown] = 未登録話者の発話（TV・ラジオ・通行人等の外部音声の可能性あり）
+- unknown比率が高い場合、会話の種類は「独り言・メモ」ではなく実際の文脈で判断
+- 全セグメントがunknownの場合、外部メディア（TV等）の音声が主体の可能性が高い
+
 ### タグ数制限
 conversation_type (1) + outcomes (1-4) + domains (0-3) の合計が5以下になるようにしてください。"""
 
@@ -210,17 +219,52 @@ class SessionTagger:
             prompt += '該当するタグ名のリストを user_tags に入れてください。該当なしなら空配列。'
         return prompt
 
+    @staticmethod
+    def _compute_speaker_stats(segments: list[dict]) -> dict:
+        """Compute speaker statistics from segments."""
+        total = len(segments)
+        if total == 0:
+            return {"total": 0, "user": 0, "unknown": 0, "unknown_ratio": 0.0, "has_voice_tags": False}
+        has_voice = any(s.get("person_name") for s in segments)
+        user = sum(1 for s in segments if s.get("is_user"))
+        unknown = sum(1 for s in segments if s.get("person_name") == "unknown")
+        return {
+            "total": total,
+            "user": user,
+            "unknown": unknown,
+            "unknown_ratio": unknown / total if total > 0 else 0.0,
+            "has_voice_tags": has_voice,
+        }
+
     def _build_input(self, segments: list[dict]) -> str:
-        """Build session text from segments."""
+        """Build session text from segments with speaker info."""
+        stats = self._compute_speaker_stats(segments)
+
         lines = []
+        # Add speaker statistics preamble if voice tags exist
+        if stats["has_voice_tags"]:
+            preamble = (
+                f"[話者情報] 全{stats['total']}発話: "
+                f"自分={stats['user']}, unknown={stats['unknown']}"
+            )
+            if stats["unknown_ratio"] >= 0.8:
+                preamble += " ※ unknown話者が大半 — TV・ラジオ等の外部音声の可能性が高い"
+            lines.append(preamble)
+            lines.append("")
+
         for seg in segments:
             text = seg.get("text", "").strip()
-            if text:
-                speaker = seg.get("person_name") or seg.get("speaker", "")
-                if speaker:
-                    lines.append(f"[{speaker}] {text}")
-                else:
-                    lines.append(text)
+            if not text:
+                continue
+            person = seg.get("person_name", "")
+            if person and person != "unknown":
+                is_user = seg.get("is_user", False)
+                label = f"{person}(自分)" if is_user else person
+                lines.append(f"[{label}] {text}")
+            elif person == "unknown":
+                lines.append(f"[unknown] {text}")
+            else:
+                lines.append(text)
         return "\n".join(lines)
 
     def _parse_response(self, raw: str) -> Optional[dict]:
@@ -366,6 +410,13 @@ class SessionTagger:
             tags["tagged_at"] = datetime.now().isoformat()
             tags["tag_version"] = 2
 
+            # Add speaker-derived metadata
+            stats = self._compute_speaker_stats(segments)
+            if stats["has_voice_tags"]:
+                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
+            else:
+                tags["external_audio_ratio"] = None
+
             log.info(
                 f"SessionTagger: type={tags['conversation_type']}, "
                 f"outcomes={tags['outcomes']}, "
@@ -389,7 +440,7 @@ class SessionTagger:
         system_prompt = self._build_system_prompt()
         return (system_prompt, session_text)
 
-    def validate_and_save_tags(self, raw_json: str) -> Optional[dict]:
+    def validate_and_save_tags(self, raw_json: str, segments: list[dict] | None = None) -> Optional[dict]:
         """Parse and validate raw JSON from Batch API response.
 
         Returns validated tags dict with tagged_at, or None on parse error.
@@ -400,4 +451,15 @@ class SessionTagger:
         tags = self._validate_tags(parsed)
         tags["tagged_at"] = datetime.now().isoformat()
         tags["tag_version"] = 2
+
+        # Add speaker-derived metadata if segments provided
+        if segments:
+            stats = self._compute_speaker_stats(segments)
+            if stats["has_voice_tags"]:
+                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
+            else:
+                tags["external_audio_ratio"] = None
+        else:
+            tags["external_audio_ratio"] = None
+
         return tags

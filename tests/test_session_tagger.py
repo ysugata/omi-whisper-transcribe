@@ -155,16 +155,67 @@ def test_tag_session_with_speaker_names(mock_openai):
     """Segments with person_name should include speaker labels in input."""
     tagger = _make_tagger(mock_openai, VALID_RESPONSE)
     segments_with_names = [
-        {"start": 0, "end": 5, "text": "Hello", "person_name": "Taro"},
-        {"start": 5, "end": 10, "text": "Hi there", "speaker": "SPEAKER_01"},
+        {"start": 0, "end": 5, "text": "Hello", "person_name": "Taro", "is_user": True},
+        {"start": 5, "end": 10, "text": "Hi there", "person_name": "unknown"},
     ]
     result = tagger.tag_session(segments_with_names)
     assert result is not None
 
     call_args = tagger._client.chat.completions.create.call_args
     user_msg = call_args[1]["messages"][1]["content"]
-    assert "[Taro]" in user_msg
-    assert "[SPEAKER_01]" in user_msg
+    assert "[Taro(自分)]" in user_msg
+    assert "[unknown]" in user_msg
+    assert "[話者情報]" in user_msg
+    # external_audio_ratio should be set
+    assert result.get("external_audio_ratio") == 0.5
+
+
+def test_speaker_stats_all_unknown(mock_openai):
+    """All unknown speakers should yield external_audio_ratio=1.0."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    segments = [
+        {"start": 0, "end": 5, "text": "Hello", "person_name": "unknown"},
+        {"start": 5, "end": 10, "text": "World", "person_name": "unknown"},
+    ]
+    result = tagger.tag_session(segments)
+    assert result["external_audio_ratio"] == 1.0
+
+
+def test_speaker_stats_no_voice_tags(mock_openai):
+    """No voice tags should yield external_audio_ratio=None."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    segments = [
+        {"start": 0, "end": 5, "text": "Hello"},
+        {"start": 5, "end": 10, "text": "World"},
+    ]
+    result = tagger.tag_session(segments)
+    assert result["external_audio_ratio"] is None
+
+
+def test_input_with_speaker_preamble():
+    """Speaker preamble should warn about external audio when ratio >= 80%."""
+    from session_tagger import SessionTagger
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = _DEFAULT_TAXONOMY
+    segments = [
+        {"text": "A", "person_name": "unknown"},
+        {"text": "B", "person_name": "unknown"},
+        {"text": "C", "person_name": "unknown"},
+        {"text": "D", "person_name": "unknown"},
+        {"text": "E", "person_name": "Taro", "is_user": True},
+    ]
+    text = tagger._build_input(segments)
+    assert "unknown=4" in text
+    assert "外部音声" in text
+
+    # Below 80% threshold: no warning
+    segments2 = [
+        {"text": "A", "person_name": "unknown"},
+        {"text": "B", "person_name": "Taro", "is_user": True},
+        {"text": "C", "person_name": "Taro", "is_user": True},
+    ]
+    text2 = tagger._build_input(segments2)
+    assert "外部音声" not in text2
 
 
 # ============================================================

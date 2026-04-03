@@ -174,6 +174,9 @@
                     var impClass = s.tags_importance_v2 === "高" ? "imp-high" : s.tags_importance_v2 === "中" ? "imp-med" : "imp-low";
                     html += '<span class="tag-badge ' + impClass + '">' + escapeHtml(s.tags_importance_v2) + '</span>';
                 }
+                if (s.tags_external_audio != null && s.tags_external_audio >= 0.8) {
+                    html += '<span class="tag-badge ext-audio" title="外部音声比率: ' + Math.round(s.tags_external_audio * 100) + '%">TV/外部音声</span>';
+                }
                 html += '</div>';
             } else if (s.tags_activity || s.tags_mood || s.tags_topics) {
                 html += '<div class="session-tags">';
@@ -323,6 +326,9 @@
             }
             if (isV2Detail && tags.decision_memo) {
                 detailHeader.innerHTML += '<div class="detail-decision-memo">&#9997; ' + escapeHtml(tags.decision_memo) + '</div>';
+            }
+            if (isV2Detail && tags.external_audio_ratio != null && tags.external_audio_ratio >= 0.5) {
+                detailHeader.innerHTML += '<div class="detail-external-audio">&#128250; 外部音声比率: ' + Math.round(tags.external_audio_ratio * 100) + '% (unknown speaker)</div>';
             }
         }
 

@@ -97,6 +97,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_decision_memo TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_importance_v2 TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_version INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_external_audio REAL",
 ]
 
 FTS_SCHEMA = """
@@ -274,6 +275,7 @@ class Indexer:
             "tags_decision_memo": tags_decision_memo,
             "tags_importance_v2": tags_importance_v2,
             "tags_version": tag_version,
+            "tags_external_audio": tags.get("external_audio_ratio"),
         }
 
     async def sync(self) -> int:
@@ -326,7 +328,8 @@ class Indexer:
                     tags_confidentiality, tags_decision_required,
                     tags_decision_summary, tags_action_items, tags_outcome,
                     tags_conversation_type, tags_outcomes, tags_domains,
-                    tags_decision_memo, tags_importance_v2, tags_version)
+                    tags_decision_memo, tags_importance_v2, tags_version,
+                    tags_external_audio)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -336,7 +339,8 @@ class Indexer:
                            :tags_confidentiality, :tags_decision_required,
                            :tags_decision_summary, :tags_action_items, :tags_outcome,
                            :tags_conversation_type, :tags_outcomes, :tags_domains,
-                           :tags_decision_memo, :tags_importance_v2, :tags_version)""",
+                           :tags_decision_memo, :tags_importance_v2, :tags_version,
+                           :tags_external_audio)""",
                 info,
             )
             count += 1
