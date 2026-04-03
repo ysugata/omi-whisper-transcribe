@@ -79,6 +79,7 @@ TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")
 AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
 AUDIO_SCENE_THRESHOLD = float(os.environ.get("AUDIO_SCENE_THRESHOLD", "0.3"))
+AUDIO_SCENE_MEDIA_THRESHOLD = float(os.environ.get("AUDIO_SCENE_MEDIA_THRESHOLD", "0.6"))
 
 # --- 深夜スケジューラ設定 ---
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
@@ -234,6 +235,7 @@ audio_scene_classifier = AudioSceneClassifier(
     enabled=AUDIO_SCENE_ENABLED,
     device=AUDIO_SCENE_DEVICE,
     threshold=AUDIO_SCENE_THRESHOLD,
+    media_threshold=AUDIO_SCENE_MEDIA_THRESHOLD,
 )
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
@@ -3063,6 +3065,7 @@ async def main():
             "enabled": AUDIO_SCENE_ENABLED,
             "device": AUDIO_SCENE_DEVICE,
             "threshold": AUDIO_SCENE_THRESHOLD,
+            "media_threshold": AUDIO_SCENE_MEDIA_THRESHOLD,
             "model": "PANNs-CNN14",
             "batch_state": {
                 "audio_scene_total": _batch_combined_tag_state.get("audio_scene_total", 0),

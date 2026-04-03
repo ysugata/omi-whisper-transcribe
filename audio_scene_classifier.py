@@ -4,6 +4,10 @@ Classifies recording sessions into scene categories (telephone, media, conversat
 silence, noise) and spatial categories (indoor, outdoor, public) using AudioSet
 pretrained CNN14 model (~80MB, MIT license).
 
+Uses Noisy OR probability combination for media detection — since PANNs uses
+sigmoid outputs (independent probabilities per class), Noisy OR is the
+theoretically correct way to combine them (Kong et al. 2020).
+
 Runs on CPU only — no GPU lock required.
 """
 
@@ -20,7 +24,7 @@ log = logging.getLogger(__name__)
 # AudioSet class index → category mapping
 # ---------------------------------------------------------------------------
 
-# Scene categories: highest-scoring category wins
+# Scene categories (used for priority-based detection, not max-score-wins)
 SCENE_CATEGORIES = {
     "telephone": {
         "indices": [389, 390, 391, 392, 393],
@@ -44,6 +48,15 @@ SCENE_CATEGORIES = {
     },
 }
 
+# Media companion indices — classes that fire high for TV/anime but low for
+# real conversation. Used with Noisy OR to detect media presence.
+# 137=Music, 524=Television, 525=Radio, 267=Background music,
+# 268=Theme music, 270=Soundtrack, 27=Singing
+MEDIA_INDICES = [137, 524, 525, 267, 268, 270, 27]
+
+# Default Noisy OR threshold for media detection
+DEFAULT_MEDIA_NOISY_OR_THRESHOLD = 0.6
+
 # Spatial categories: highest-scoring spatial wins
 SPATIAL_CATEGORIES = {
     "indoor_small": {"index": 506, "label": "室内（小）"},
@@ -64,10 +77,30 @@ def _get_audioset_labels() -> list:
         return _AUDIOSET_LABELS
     try:
         from panns_inference import labels
-        _AUDIOSET_LABELS = labels.labels if hasattr(labels, "labels") else []
+        if isinstance(labels, list):
+            _AUDIOSET_LABELS = labels
+        elif hasattr(labels, "labels"):
+            _AUDIOSET_LABELS = labels.labels
+        else:
+            _AUDIOSET_LABELS = []
     except Exception:
         _AUDIOSET_LABELS = []
     return _AUDIOSET_LABELS
+
+
+def _noisy_or(scores: np.ndarray, indices: list) -> float:
+    """Noisy OR combination of independent sigmoid probabilities.
+
+    P(any) = 1 - prod(1 - P(i))
+
+    This is the theoretically correct way to combine independent sigmoid
+    outputs from PANNs (BCE loss → each class is an independent probability).
+    """
+    prob_none = 1.0
+    for i in indices:
+        if i < len(scores):
+            prob_none *= (1.0 - float(scores[i]))
+    return 1.0 - prob_none
 
 
 class AudioSceneClassifier:
@@ -77,16 +110,18 @@ class AudioSceneClassifier:
         self,
         device: str = "cpu",
         threshold: float = 0.3,
+        media_threshold: float = DEFAULT_MEDIA_NOISY_OR_THRESHOLD,
         enabled: bool = True,
     ) -> None:
         self._device = device
         self._threshold = threshold
+        self._media_threshold = media_threshold
         self._enabled = enabled
         self._model = None
         if enabled:
             log.info(
-                "AudioSceneClassifier: initialized (device=%s, threshold=%.2f)",
-                device, threshold,
+                "AudioSceneClassifier: initialized (device=%s, threshold=%.2f, media_threshold=%.2f)",
+                device, threshold, media_threshold,
             )
         else:
             log.info("AudioSceneClassifier: disabled")
@@ -172,25 +207,65 @@ class AudioSceneClassifier:
     def _interpret_scores(self, scores: np.ndarray) -> Optional[dict]:
         """Interpret PANNs output scores into scene classification.
 
-        Args:
-            scores: numpy array of shape (527,) with class probabilities.
-
-        Returns:
-            Scene classification dict or None if all scores below threshold.
+        Priority-based detection with Noisy OR for media:
+        1. Telephone: max(telephone indices) >= threshold
+        2. Silence: silence >= threshold AND speech < threshold
+        3. Media vs Conversation (when speech >= threshold):
+           - media_prob = noisy_or(MEDIA_INDICES)
+           - media_prob >= media_threshold → TV・ラジオ
+           - otherwise → 会話
+        4. Media (speech < threshold): noisy_or >= threshold
+        5. Noise: max(noise indices) >= threshold
         """
-        # --- Scene category ---
+        threshold = self._threshold
+
+        # --- Helper: max score for a category ---
+        def _max_score(indices):
+            return max(
+                (float(scores[i]) for i in indices if i < len(scores)),
+                default=0.0,
+            )
+
+        # --- Priority-based scene detection ---
         best_scene_key = None
         best_scene_score = 0.0
 
-        for key, cat in SCENE_CATEGORIES.items():
-            cat_scores = [float(scores[i]) for i in cat["indices"] if i < len(scores)]
-            if cat_scores:
-                max_score = max(cat_scores)
-                if max_score > best_scene_score:
-                    best_scene_score = max_score
-                    best_scene_key = key
+        # 1. Telephone (highest priority)
+        tel_score = _max_score(SCENE_CATEGORIES["telephone"]["indices"])
+        if tel_score >= threshold:
+            best_scene_key = "telephone"
+            best_scene_score = tel_score
+        else:
+            speech_score = _max_score(SCENE_CATEGORIES["conversation"]["indices"])
+            silence_score = _max_score(SCENE_CATEGORIES["silence"]["indices"])
 
-        # --- Spatial category ---
+            # 2. Silence (speech must be low)
+            if silence_score >= threshold and speech_score < threshold:
+                best_scene_key = "silence"
+                best_scene_score = silence_score
+            elif speech_score >= threshold:
+                # 3. Media vs Conversation — Noisy OR decides
+                media_prob = _noisy_or(scores, MEDIA_INDICES)
+                if media_prob >= self._media_threshold:
+                    best_scene_key = "media"
+                    best_scene_score = media_prob
+                else:
+                    best_scene_key = "conversation"
+                    best_scene_score = speech_score
+            else:
+                # 4. Media without speech
+                media_prob = _noisy_or(scores, MEDIA_INDICES)
+                if media_prob >= threshold:
+                    best_scene_key = "media"
+                    best_scene_score = media_prob
+                else:
+                    # 5. Noise
+                    noise_score = _max_score(SCENE_CATEGORIES["noise"]["indices"])
+                    if noise_score >= threshold:
+                        best_scene_key = "noise"
+                        best_scene_score = noise_score
+
+        # --- Spatial category (unchanged: highest-scoring wins) ---
         best_spatial_key = None
         best_spatial_score = 0.0
 
@@ -202,11 +277,7 @@ class AudioSceneClassifier:
                     best_spatial_score = score
                     best_spatial_key = key
 
-        # If best scene score is below threshold, return unknown
-        if best_scene_score < self._threshold:
-            best_scene_key = None
-
-        if best_spatial_score < self._threshold:
+        if best_spatial_score < threshold:
             best_spatial_key = None
 
         if best_scene_key is None and best_spatial_key is None:
@@ -225,12 +296,15 @@ class AudioSceneClassifier:
                 "score": round(float(scores[idx]), 3),
             })
 
+        spatial_label = SPATIAL_CATEGORIES[best_spatial_key]["label"] if best_spatial_key else None
+
         result = {
             "model": "PANNs-CNN14",
             "scene_label": SCENE_CATEGORIES[best_scene_key]["label"] if best_scene_key else None,
             "scene_label_en": best_scene_key,
             "scene_confidence": round(best_scene_score, 3) if best_scene_key else None,
-            "spatial": SPATIAL_CATEGORIES[best_spatial_key]["label"] if best_spatial_key else None,
+            "spatial": spatial_label,
+            "spatial_label": spatial_label,  # alias for indexer.py / session_tagger.py
             "spatial_en": best_spatial_key,
             "spatial_confidence": round(best_spatial_score, 3) if best_spatial_key else None,
             "top_classes": top_classes,

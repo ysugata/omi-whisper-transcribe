@@ -324,6 +324,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `AUDIO_SCENE_ENABLED` | `true` | PANNs CNN14 音響シーン分類の有効/無効 |
 | `AUDIO_SCENE_DEVICE` | `cpu` | 推論デバイス (cpu / cuda) |
 | `AUDIO_SCENE_THRESHOLD` | `0.3` | シーン/空間分類の信頼度閾値 |
+| `AUDIO_SCENE_MEDIA_THRESHOLD` | `0.6` | Noisy OR によるメディア判定閾値 (TV/アニメ検出感度) |
 
 ### 外部サービス
 
