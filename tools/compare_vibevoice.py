@@ -401,6 +401,40 @@ def unload_vibevoice_model(model, processor):
 # VibeVoice inference
 # ---------------------------------------------------------------------------
 
+def _load_audio_array(wav_path, target_sr=24000):
+    """Load audio as numpy array at target sample rate using soundfile.
+
+    Returns (audio_array, sample_rate).
+    Uses soundfile instead of torchcodec to avoid libnvrtc dependency.
+    """
+    import soundfile as sf
+    import numpy as np
+
+    audio_data, sr = sf.read(wav_path, dtype="float32")
+
+    # Convert stereo to mono if needed
+    if len(audio_data.shape) > 1:
+        audio_data = audio_data.mean(axis=1)
+
+    # Resample if needed
+    if sr != target_sr:
+        try:
+            import torchaudio
+            import torch as _torch
+            tensor = _torch.from_numpy(audio_data).unsqueeze(0)
+            tensor = torchaudio.functional.resample(tensor, sr, target_sr)
+            audio_data = tensor.squeeze(0).numpy()
+        except ImportError:
+            # Linear interpolation fallback
+            ratio = target_sr / sr
+            new_len = int(len(audio_data) * ratio)
+            indices = np.linspace(0, len(audio_data) - 1, new_len)
+            audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data).astype(np.float32)
+        sr = target_sr
+
+    return audio_data, sr
+
+
 def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
     """Run VibeVoice-ASR inference.
 
@@ -408,18 +442,19 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
     On CUDA OOM, retries with smaller chunk_size.
     """
     import torch
-    import soundfile as sf
 
-    audio_data, sr = sf.read(wav_path)
+    audio_data, sr = _load_audio_array(wav_path)
     duration = len(audio_data) / sr
 
     if duration < 2.0:
         return []
 
     try:
+        # Pass numpy array instead of file path to avoid torchcodec dependency
         inputs = processor.apply_transcription_request(
-            audio=wav_path,
+            audio=audio_data,
             prompt=prompt if prompt else None,
+            sampling_rate=sr,
         )
         # Move inputs to model device
         inputs = {k: v.to(model.device) if hasattr(v, "to") else v
@@ -450,9 +485,8 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
 def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
     """Run VibeVoice on audio in chunks to avoid OOM."""
     import torch
-    import soundfile as sf
 
-    audio_data, sr = sf.read(wav_path)
+    audio_data, sr = _load_audio_array(wav_path)
     total_samples = len(audio_data)
     all_segments = []
     offset_s = 0.0
@@ -465,15 +499,11 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
         if chunk_duration < 1.0:
             break
 
-        # Write chunk to temp file
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.close()
         try:
-            sf.write(tmp.name, chunk, sr)
-
             inputs = processor.apply_transcription_request(
-                audio=tmp.name,
+                audio=chunk,
                 prompt=prompt if prompt else None,
+                sampling_rate=sr,
             )
             inputs = {k: v.to(model.device) if hasattr(v, "to") else v
                       for k, v in inputs.items()}
@@ -493,8 +523,6 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
         except torch.cuda.OutOfMemoryError:
             print(f"    {RED}OOM on chunk at {offset_s:.1f}s, skipping{RESET}")
             torch.cuda.empty_cache()
-        finally:
-            os.unlink(tmp.name)
 
         offset_s += chunk_duration
 
