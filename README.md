@@ -65,16 +65,30 @@ cp .env.example .env
 
 ### 2. 起動
 
+#### 単体デプロイ (GPU 専有)
+
 ```bash
+cd omi_whisper_transcribe
 docker compose up -d --build
 ```
+
+#### GPU 共有デプロイ (qwen-tts と共有)
+
+```bash
+cd gpu-shared
+docker compose up -d --build
+```
+
+> **重要**: gpu-shared 構成では、**すべてのコンテナを `gpu-shared/` ディレクトリから起動**してください。
+> `omi_whisper_transcribe/` から `docker compose up` すると Viewer が別ネットワークに配置され、
+> Bridge (管理 API) に接続できなくなります (502 エラー)。
 
 初回はモデルダウンロード (約 3GB) に数分かかります。Docker Volume `whisper-models` にキャッシュされるので 2 回目以降は高速です。
 
 ### 3. 確認
 
 ```bash
-# ログ
+# ログ (単体の場合はカレントディレクトリで実行)
 docker compose logs -f omi-whisper
 
 # 管理 API でモデル状態を確認
@@ -746,6 +760,43 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 
 qwen-tts と GPU を共有する場合は [gpu-shared](../gpu-shared/) を使用してください。
 omi-whisper 自体は GPU 共有の知識を持たず、管理 API を通じて外部から制御されます。
+
+### 起動・停止
+
+gpu-shared 構成では **必ず `gpu-shared/` ディレクトリから** Docker Compose コマンドを実行します。
+
+```bash
+cd gpu-shared
+
+# 全コンテナ起動
+docker compose up -d --build
+
+# 個別サービス再起動
+docker compose up -d --build omi-whisper          # Bridge
+docker compose up -d --build omi-recordings-viewer # Viewer
+docker compose up -d --build qwen-tts             # TTS
+
+# ログ確認
+docker compose logs -f omi-whisper
+docker compose logs -f omi-recordings-viewer
+
+# 状態確認
+docker compose ps
+```
+
+### ネットワーク構成
+
+gpu-shared は `gpu-net` ブリッジネットワークで全サービスを接続します。
+`omi_whisper_transcribe/` から個別に `docker compose up` すると別ネットワーク (`omi_whisper_transcribe_default`) に配置され、
+Bridge への接続が失敗します。
+
+```
+gpu-net (bridge)
+├── omi-whisper-transcribe   (8090/8091 internal)
+├── omi-recordings-viewer    (8092 → external)
+├── qwen-tts                 (8080 internal)
+└── gpu-shared               (8000/8090 → external, proxy)
+```
 
 ## Cloudflare Tunnel
 

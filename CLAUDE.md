@@ -32,22 +32,28 @@ docker compose build <変更したサービス>
 ### Step 3: コンテナ起動 + 結合テスト
 
 ビルド後、**必ず変更した機能を実際のコンテナで動かして検証する**。
+
+> **重要**: この環境は gpu-shared 構成のため、Docker Compose コマンドは
+> **`/home/dev/gpu-shared/` ディレクトリから実行**すること。
+> `omi_whisper_transcribe/` から実行すると Viewer が別ネットワークに配置され、
+> Bridge に接続できなくなる。
+
 変更内容に応じて以下のチェックを行う:
 
 #### Bridge (omi_whisper_bridge.py, 各 Python モジュール) を変更した場合
-1. `docker compose up -d omi-whisper` でコンテナを起動
-2. `docker compose logs omi-whisper` で起動エラーがないことを確認
+1. `cd /home/dev/gpu-shared && docker compose up -d --build omi-whisper` でコンテナを起動
+2. `cd /home/dev/gpu-shared && docker compose logs omi-whisper` で起動エラーがないことを確認
 3. 変更した管理 API エンドポイントに curl でリクエストし、期待するレスポンスを確認
 
 #### Viewer (app.py, indexer.py, templates, JS, CSS) を変更した場合
-1. `docker compose up -d omi-recordings-viewer` でコンテナを起動
-2. `docker compose logs omi-recordings-viewer` で起動エラーがないことを確認
+1. `cd /home/dev/gpu-shared && docker compose up -d --build omi-recordings-viewer` でコンテナを起動
+2. `cd /home/dev/gpu-shared && docker compose logs omi-recordings-viewer` で起動エラーがないことを確認
 3. 変更した API エンドポイントに curl でリクエストし、期待するレスポンスを確認
 4. UI を変更した場合: `curl http://localhost:8092/` で HTML を取得し、追加した要素が含まれることを確認
 
 #### Docker 設定 (docker-compose.yml, Dockerfile) を変更した場合
-1. `docker compose up -d` で全コンテナを起動
-2. `docker compose ps` で全コンテナが running であることを確認
+1. `cd /home/dev/gpu-shared && docker compose up -d` で全コンテナを起動
+2. `cd /home/dev/gpu-shared && docker compose ps` で全コンテナが running であることを確認
 3. 変更に関連するポート・ボリューム・環境変数が正しく機能することを確認
 
 #### 設定ファイル (config/*.json) のスキーマ変更や読み込みロジックを変更した場合
