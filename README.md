@@ -724,6 +724,7 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/verify_confidence_screening.py` | 信頼度スコアベースのスクリーニング効果検証 |
 | `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
 | `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
+| `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, 4-bit) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
 | `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
 
 ## GPU 共有デプロイ
