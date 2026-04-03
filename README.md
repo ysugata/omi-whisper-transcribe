@@ -36,6 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit) による比較用バッチ文字起こし + 声紋タグ付け |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -201,6 +202,14 @@ open http://localhost:8092
 |----------|------|------|
 | GET | `/audio-scene/status` | 音響シーン分類の有効/無効、モデル情報、閾値、バッチ進捗 |
 
+### VibeVoice-ASR バッチ
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/vibevoice/start` | VibeVoice-ASR バッチ文字起こし開始 (Phase 1: 文字起こし → Phase 2: 声紋タグ付け) |
+| GET | `/vibevoice/status` | 実行状態・進捗を取得 |
+| POST | `/vibevoice/cancel` | 実行中のバッチをキャンセル |
+
 ### ユーザータグ
 
 | メソッド | パス | 説明 |
@@ -325,6 +334,12 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `AUDIO_SCENE_DEVICE` | `cpu` | 推論デバイス (cpu / cuda) |
 | `AUDIO_SCENE_THRESHOLD` | `0.3` | シーン/空間分類の信頼度閾値 |
 | `AUDIO_SCENE_MEDIA_THRESHOLD` | `0.6` | Noisy OR によるメディア判定閾値 (TV/アニメ検出感度) |
+
+### VibeVoice-ASR
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
 ### 外部サービス
 
@@ -834,6 +849,7 @@ omi_whisper_transcribe/
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
+├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)

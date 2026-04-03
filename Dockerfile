@@ -34,6 +34,7 @@ COPY suggestion_learner.py .
 COPY segment_classifier.py .
 COPY segment_screener.py .
 COPY audio_scene_classifier.py .
+COPY vibevoice_transcriber.py .
 COPY correction_metrics.py .
 COPY sanitize_provider.py .
 COPY sanitize_schema.py .

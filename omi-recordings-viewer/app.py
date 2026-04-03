@@ -791,6 +791,22 @@ async def handle_combined_tag_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# VibeVoice-ASR プロキシ API (Bridge へ中継)
+# ============================================================
+
+async def handle_vibevoice_start(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/vibevoice/start")
+
+
+async def handle_vibevoice_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/vibevoice/status")
+
+
+async def handle_vibevoice_cancel(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/vibevoice/cancel")
+
+
+# ============================================================
 # Export API
 # ============================================================
 
@@ -1147,6 +1163,11 @@ def create_app() -> web.Application:
     app.router.add_post("/api/tags/start", handle_combined_tag_start)
     app.router.add_get("/api/tags/status", handle_combined_tag_status)
     app.router.add_post("/api/tags/cancel", handle_combined_tag_cancel)
+
+    # VibeVoice-ASR プロキシ API
+    app.router.add_post("/api/vibevoice/start", handle_vibevoice_start)
+    app.router.add_get("/api/vibevoice/status", handle_vibevoice_status)
+    app.router.add_post("/api/vibevoice/cancel", handle_vibevoice_cancel)
 
     # Export API
     app.router.add_get("/api/export/stats", handle_export_stats)

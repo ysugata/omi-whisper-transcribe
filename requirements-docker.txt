@@ -7,3 +7,6 @@ google-genai>=1.0.0
 whisperx
 noisereduce>=3.0.0
 panns-inference>=0.1.0
+transformers>=4.45.0
+bitsandbytes
+soundfile

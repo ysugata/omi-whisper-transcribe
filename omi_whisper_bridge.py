@@ -81,6 +81,9 @@ AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
 AUDIO_SCENE_THRESHOLD = float(os.environ.get("AUDIO_SCENE_THRESHOLD", "0.3"))
 AUDIO_SCENE_MEDIA_THRESHOLD = float(os.environ.get("AUDIO_SCENE_MEDIA_THRESHOLD", "0.6"))
 
+# --- VibeVoice-ASR 設定 ---
+VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # --- 深夜スケジューラ設定 ---
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
 
@@ -231,12 +234,16 @@ if TAGGING_ENABLED and LLM_API_KEY:
     )
 
 from audio_scene_classifier import AudioSceneClassifier
+from vibevoice_transcriber import VibeVoiceTranscriber
+
 audio_scene_classifier = AudioSceneClassifier(
     enabled=AUDIO_SCENE_ENABLED,
     device=AUDIO_SCENE_DEVICE,
     threshold=AUDIO_SCENE_THRESHOLD,
     media_threshold=AUDIO_SCENE_MEDIA_THRESHOLD,
 )
+
+vibevoice_transcriber = VibeVoiceTranscriber()
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
 # SANITIZE_MODEL supports both Gemini and OpenAI models:
@@ -1824,6 +1831,251 @@ async def _batch_combined_tag_task(force: bool = False):
 
 
 # ============================================================
+# VibeVoice-ASR バッチ文字起こし
+# ============================================================
+
+_batch_vibevoice_state = {
+    "running": False,
+    "phase": None,            # "vibevoice" | "voice_tag"
+    "total": 0,
+    "processed": 0,
+    "failed": 0,
+    "current_session": None,
+    "errors": [],
+    "cancel_requested": False,
+    "started_at": None,
+    "finished_at": None,
+    "voice_tag_total": 0,
+    "voice_tag_processed": 0,
+    "voice_tag_failed": 0,
+}
+
+
+def _find_unvibevoiced_sessions(force: bool = False) -> list[dict]:
+    """Find sessions that haven't been transcribed by VibeVoice-ASR."""
+    sessions = []
+    rec_root = Path(RECORDINGS_DIR)
+    if not rec_root.exists():
+        return sessions
+
+    for date_dir in sorted(rec_root.iterdir()):
+        if not date_dir.is_dir():
+            continue
+        for time_dir in sorted(date_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+            try:
+                data = json.loads(transcript_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            sess = data.get("session", {})
+            if not force and sess.get("vibevoice_transcribed"):
+                continue
+            # Need audio file
+            audio = time_dir / "audio.ogg"
+            if not audio.exists():
+                audio = time_dir / "audio.wav"
+            if not audio.exists():
+                continue
+            sessions.append({
+                "path": f"{date_dir.name}/{time_dir.name}",
+                "audio": audio,
+                "transcript_path": transcript_path,
+                "data": data,
+            })
+    return sessions
+
+
+def _find_vibevoice_untagged_sessions(force: bool = False) -> list[dict]:
+    """Find sessions with vibevoice_segments that need voice tagging."""
+    sessions = []
+    rec_root = Path(RECORDINGS_DIR)
+    if not rec_root.exists():
+        return sessions
+
+    for date_dir in sorted(rec_root.iterdir()):
+        if not date_dir.is_dir():
+            continue
+        for time_dir in sorted(date_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+            try:
+                data = json.loads(transcript_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            sess = data.get("session", {})
+            if not sess.get("vibevoice_transcribed"):
+                continue
+            if not force and sess.get("vibevoice_voice_tagged"):
+                continue
+            if not data.get("vibevoice_segments"):
+                continue
+            audio = time_dir / "audio.ogg"
+            if not audio.exists():
+                audio = time_dir / "audio.wav"
+            if not audio.exists():
+                continue
+            sessions.append({
+                "path": f"{date_dir.name}/{time_dir.name}",
+                "audio": audio,
+                "transcript_path": transcript_path,
+                "data": data,
+            })
+    return sessions
+
+
+async def _batch_vibevoice_task(force: bool = False):
+    """VibeVoice-ASR バッチ: Phase 1 文字起こし → Phase 2 声紋タグ付け"""
+    import shutil
+
+    st = _batch_vibevoice_state
+    st["running"] = True
+    st["phase"] = None
+    st["processed"] = 0
+    st["failed"] = 0
+    st["current_session"] = None
+    st["errors"] = []
+    st["cancel_requested"] = False
+    st["started_at"] = datetime.now().isoformat()
+    st["finished_at"] = None
+    st["voice_tag_total"] = 0
+    st["voice_tag_processed"] = 0
+    st["voice_tag_failed"] = 0
+
+    try:
+        # --- Phase 1: VibeVoice-ASR transcription ---
+        st["phase"] = "vibevoice"
+        sessions = _find_unvibevoiced_sessions(force=force)
+        st["total"] = len(sessions)
+        log.info(f"VibeVoice batch Phase 1: {len(sessions)} session(s) (force={force})")
+
+        if sessions:
+            loop = asyncio.get_running_loop()
+
+            # Acquire GPU lock, unload Whisper, load VibeVoice
+            async with model_manager.gpu_lock:
+                await model_manager.force_unload(wait_sessions=True)
+                try:
+                    await loop.run_in_executor(None, vibevoice_transcriber.load_model)
+
+                    for sess in sessions:
+                        if st["cancel_requested"]:
+                            log.info("VibeVoice batch cancelled by user (transcription phase)")
+                            break
+
+                        st["current_session"] = sess["path"]
+                        wav_path = None
+                        try:
+                            wav_path = await loop.run_in_executor(
+                                None, vibevoice_transcriber.convert_to_wav, str(sess["audio"])
+                            )
+                            segments = await loop.run_in_executor(
+                                None, vibevoice_transcriber.transcribe, wav_path
+                            )
+
+                            if segments is None:
+                                raise RuntimeError("OOM: skipped")
+
+                            # Save vibevoice_segments to transcript.json
+                            data = sess["data"]
+                            data["vibevoice_segments"] = segments
+                            data["session"]["vibevoice_transcribed"] = True
+
+                            with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
+
+                            st["processed"] += 1
+                            log.info(f"VibeVoice: {sess['path']} -> {len(segments)} segments")
+
+                        except Exception as e:
+                            st["failed"] += 1
+                            err_msg = f"{sess['path']}: {e}"
+                            st["errors"].append(err_msg)
+                            log.error(f"VibeVoice transcription error: {err_msg}", exc_info=True)
+                        finally:
+                            if wav_path:
+                                try:
+                                    os.unlink(wav_path)
+                                except OSError:
+                                    pass
+
+                        await asyncio.sleep(0)
+
+                finally:
+                    await loop.run_in_executor(None, vibevoice_transcriber.unload_model)
+
+        # --- Phase 2: Voice Tag (speaker identification on vibevoice_segments) ---
+        if st["cancel_requested"]:
+            return
+
+        st["phase"] = "voice_tag"
+        if speaker_filter is not None:
+            vt_sessions = _find_vibevoice_untagged_sessions(force=force)
+            st["voice_tag_total"] = len(vt_sessions)
+            log.info(f"VibeVoice batch Phase 2 (voice tag): {len(vt_sessions)} session(s)")
+
+            if vt_sessions:
+                loop = asyncio.get_running_loop()
+
+                for sess in vt_sessions:
+                    if st["cancel_requested"]:
+                        log.info("VibeVoice batch cancelled by user (voice tag phase)")
+                        break
+
+                    st["current_session"] = sess["path"]
+                    try:
+                        async with model_manager.gpu_lock:
+                            inference = await loop.run_in_executor(
+                                None, speaker_filter._load_model
+                            )
+                            try:
+                                updated = await loop.run_in_executor(
+                                    None,
+                                    lambda s=sess: speaker_filter.tag_segments_with_model(
+                                        inference, str(s["audio"]), s["data"]["vibevoice_segments"]
+                                    ),
+                                )
+                            finally:
+                                await loop.run_in_executor(
+                                    None, lambda: speaker_filter._unload_model(inference)
+                                )
+
+                        data = sess["data"]
+                        data["vibevoice_segments"] = updated
+                        data["session"]["vibevoice_voice_tagged"] = True
+
+                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+
+                        st["voice_tag_processed"] += 1
+
+                    except Exception as e:
+                        st["voice_tag_failed"] += 1
+                        err_msg = f"{sess['path']}: {e}"
+                        st["errors"].append(err_msg)
+                        log.error(f"VibeVoice voice-tag error: {err_msg}", exc_info=True)
+
+                    await asyncio.sleep(0)
+        else:
+            log.info("VibeVoice Phase 2 skipped: no speaker_filter")
+
+    except Exception as e:
+        log.error(f"VibeVoice batch error: {e}", exc_info=True)
+        st["errors"].append(str(e))
+    finally:
+        st["running"] = False
+        st["current_session"] = None
+        st["finished_at"] = datetime.now().isoformat()
+        log.info(f"VibeVoice batch finished: {st['processed']} processed, {st['failed']} failed")
+
+
+# ============================================================
 # 深夜スケジューラ (話者分離 + タグ付け一括実行)
 # ============================================================
 
@@ -1879,7 +2131,8 @@ async def _nightly_scheduler():
         # Check if any batch is already running
         if (_batch_state.get("running")
                 or _batch_combined_tag_state.get("running")
-                or _batch_session_tag_state.get("running")):
+                or _batch_session_tag_state.get("running")
+                or _batch_vibevoice_state.get("running")):
             log.info("Nightly scheduler: skipped (another batch is running)")
             _nightly_state["last_run"] = datetime.now().isoformat()
             _nightly_state["last_result"] = "skipped"
@@ -2311,6 +2564,7 @@ async def main():
     log.info(f"Silence: threshold={SILENCE_THRESHOLD}, timeout={SILENCE_TIMEOUT}s"
              f"{' (DISABLED)' if SILENCE_THRESHOLD <= 0 else ''}")
     log.info(f"Auth: {'TOKEN required' if AUTH_TOKEN else 'DISABLED (LAN only)'}")
+    log.info(f"VibeVoice-ASR: {'ENABLED (batch only)' if VIBEVOICE_ENABLED else 'DISABLED'}")
     log.info(f"Management API: http://0.0.0.0:{MANAGEMENT_PORT}")
     log.info("Model will be loaded on-demand (GPU not used until first connection)")
 
@@ -2883,6 +3137,46 @@ async def main():
             _batch_combined_tag_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
+    # --- VibeVoice-ASR バッチ API ---
+
+    async def handle_vibevoice_start(request):
+        if not VIBEVOICE_ENABLED:
+            return web.json_response(
+                {"error": "VibeVoice-ASR is disabled"}, status=503,
+            )
+        if _batch_vibevoice_state["running"]:
+            return web.json_response(
+                {"error": "already running"}, status=409,
+            )
+
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+
+        sessions = _find_unvibevoiced_sessions(force=force)
+        if not sessions and not force:
+            return web.json_response({
+                "status": "no_sessions",
+                "message": "All sessions already transcribed by VibeVoice",
+            })
+
+        asyncio.create_task(_batch_vibevoice_task(force=force))
+        return web.json_response({
+            "status": "started",
+            "total": len(sessions),
+        })
+
+    async def handle_vibevoice_status(request):
+        return web.json_response(_batch_vibevoice_state)
+
+    async def handle_vibevoice_cancel(request):
+        if _batch_vibevoice_state["running"]:
+            _batch_vibevoice_state["cancel_requested"] = True
+        return web.json_response({"status": "cancel_requested"})
+
     # ============================================================
     # Batch sanitize (training data anonymization)
     # ============================================================
@@ -3149,7 +3443,8 @@ async def main():
             return web.json_response({"error": "already running"}, status=409)
         if (_batch_state.get("running")
                 or _batch_combined_tag_state.get("running")
-                or _batch_session_tag_state.get("running")):
+                or _batch_session_tag_state.get("running")
+                or _batch_vibevoice_state.get("running")):
             return web.json_response({"error": "another batch is running"}, status=409)
 
         async def _run_nightly_now():
@@ -3222,6 +3517,10 @@ async def main():
     mgmt_app.router.add_post("/tags/cancel", handle_combined_tag_cancel)
     # Audio scene classification API
     mgmt_app.router.add_get("/audio-scene/status", handle_audio_scene_status)
+    # VibeVoice-ASR batch API
+    mgmt_app.router.add_post("/vibevoice/start", handle_vibevoice_start)
+    mgmt_app.router.add_get("/vibevoice/status", handle_vibevoice_status)
+    mgmt_app.router.add_post("/vibevoice/cancel", handle_vibevoice_cancel)
     # Sanitize batch API (training data anonymization)
     mgmt_app.router.add_post("/sanitize/start", handle_sanitize_start)
     mgmt_app.router.add_get("/sanitize/status", handle_sanitize_status)

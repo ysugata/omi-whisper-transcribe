@@ -1106,6 +1106,7 @@
 
     var diarizeBtn = document.getElementById("diarize-btn");
     var tagBtn = document.getElementById("tag-btn");
+    var vibevoiceBtn = document.getElementById("vibevoice-btn");
     var batchPanel = document.getElementById("batch-panel");
     var batchStatusText = document.getElementById("batch-status-text");
     var batchProgressText = document.getElementById("batch-progress-text");
@@ -1118,9 +1119,10 @@
     var activeBatchType = null; // "diarize" | "tags"
 
     var batchApiMap = {
-        diarize:  { start: "/api/diarize/start",  status: "/api/diarize/status",  cancel: "/api/diarize/cancel"  },
-        tags:     { start: "/api/tags/start",      status: "/api/tags/status",      cancel: "/api/tags/cancel"    },
-        sanitize: { start: "/api/sanitize/start",  status: "/api/sanitize/status",  cancel: "/api/sanitize/cancel" },
+        diarize:   { start: "/api/diarize/start",   status: "/api/diarize/status",   cancel: "/api/diarize/cancel"   },
+        tags:      { start: "/api/tags/start",       status: "/api/tags/status",       cancel: "/api/tags/cancel"     },
+        vibevoice: { start: "/api/vibevoice/start",  status: "/api/vibevoice/status",  cancel: "/api/vibevoice/cancel" },
+        sanitize:  { start: "/api/sanitize/start",   status: "/api/sanitize/status",   cancel: "/api/sanitize/cancel"  },
     };
 
     var batchLabels = {
@@ -1130,6 +1132,12 @@
             session_tag: "(2/2) LLM タグ付け中...",
             cancelling: "キャンセル中...",
             done: "タグ付け完了",
+        },
+        vibevoice: {
+            vibevoice: "(1/2) VibeVoice 文字起こし中...",
+            voice_tag: "(2/2) 声紋タグ付け中...",
+            cancelling: "キャンセル中...",
+            done: "VibeVoice 完了",
         },
         sanitize: { running: "LLM 匿名化処理中...", cancelling: "キャンセル中...", done: "匿名化完了" },
     };
@@ -1170,11 +1178,14 @@
                     batchStatusText.textContent = "キャンセル待ち (現在のセッション完了待ち)";
                 }
             } else {
-                // Phase-aware label for tags
-                if (type === "tags" && state.phase) {
-                    var phaseLabel = batchLabels.tags[state.phase] || "処理中...";
+                // Phase-aware label for tags and vibevoice
+                if ((type === "tags" || type === "vibevoice") && state.phase) {
+                    var phaseLabel = (batchLabels[type] || {})[state.phase] || "処理中...";
                     // Show phase-specific progress
-                    if (state.phase === "session_tag") {
+                    if (state.phase === "vibevoice") {
+                        batchStatusText.textContent = phaseLabel;
+                        // Phase 1 uses top-level total/processed
+                    } else if (state.phase === "session_tag") {
                         var stDone = (state.session_tag_processed || 0) + (state.session_tag_failed || 0);
                         batchStatusText.textContent = phaseLabel;
                         batchProgressText.textContent = stDone + " / " + (state.session_tag_total || 0);
@@ -1301,6 +1312,11 @@
     tagBtn.addEventListener("click", function () {
         if (!confirm("タグ付け (LLM + 声紋) を実行しますか？")) return;
         startBatch("tags", false);
+    });
+
+    vibevoiceBtn.addEventListener("click", function () {
+        if (!confirm("VibeVoice-ASR バッチ文字起こしを実行しますか？\n(Whisper をアンロードして VibeVoice モデルをロードします)")) return;
+        startBatch("vibevoice", false);
     });
 
     batchCancelBtn.addEventListener("click", function () {
@@ -2428,5 +2444,6 @@
     });
     checkBatchStatus("diarize");
     checkBatchStatus("tags");
+    checkBatchStatus("vibevoice");
     loadHotwordsStatus();
 })();
