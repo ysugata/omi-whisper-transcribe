@@ -373,11 +373,16 @@ def load_vibevoice_model():
 
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-    quant_config = BitsAndBytesConfig(load_in_4bit=True)
+    import torch
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id,
         quantization_config=quant_config,
         device_map="auto",
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
 
@@ -456,9 +461,15 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
             prompt=prompt if prompt else None,
             sampling_rate=sr,
         )
-        # Move inputs to model device
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v
-                  for k, v in inputs.items()}
+        # Move inputs to model device with correct dtype
+        def _move_tensor(v):
+            if not hasattr(v, "to"):
+                return v
+            if v.is_floating_point():
+                return v.to(model.device, dtype=torch.bfloat16)
+            return v.to(model.device)
+
+        inputs = {k: _move_tensor(v) for k, v in inputs.items()}
 
         with torch.no_grad():
             output_ids = model.generate(**inputs, max_new_tokens=4096)
@@ -505,7 +516,14 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
                 prompt=prompt if prompt else None,
                 sampling_rate=sr,
             )
-            inputs = {k: v.to(model.device) if hasattr(v, "to") else v
+            def _move(v):
+                if not hasattr(v, "to"):
+                    return v
+                if v.is_floating_point():
+                    return v.to(model.device, dtype=torch.bfloat16)
+                return v.to(model.device)
+
+            inputs = {k: _move(v)
                       for k, v in inputs.items()}
 
             with torch.no_grad():
