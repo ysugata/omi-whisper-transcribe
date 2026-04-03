@@ -93,6 +93,7 @@ class BatchCorrector:
         gemini_model: str = "gemini-2.5-flash-lite",
         batch_poll_interval: int = 60,
         segment_screener=None,
+        recovery_scan_days: int = 7,
     ):
         self._recordings_dir = recordings_dir
         self._config_dir = config_dir
@@ -106,6 +107,7 @@ class BatchCorrector:
         self._gemini_model = gemini_model
         self._batch_poll_interval = batch_poll_interval
         self._segment_screener = segment_screener
+        self._recovery_scan_days = recovery_scan_days
 
         self._queue_path = os.path.join(config_dir, "batch_llm_queue.json")
         self._jobs: dict[str, BatchJob] = {}  # session_id -> BatchJob
@@ -125,6 +127,7 @@ class BatchCorrector:
                 self._mode = "sync"
 
         self._load_queue()
+        self._recover_unprocessed_sessions()
 
     # ------------------------------------------------------------------
     # Queue persistence
@@ -169,6 +172,78 @@ class BatchCorrector:
             os.replace(tmp, self._queue_path)
         except OSError as e:
             log.warning("BatchCorrector: failed to save queue: %s", e)
+
+    def _recover_unprocessed_sessions(self):
+        """Scan recent recordings and enqueue sessions that were never processed.
+
+        Catches sessions that were created during container restarts
+        (enqueue() was never called) or sessions whose jobs were lost.
+        """
+        if self._recovery_scan_days <= 0:
+            return
+
+        base = Path(self._recordings_dir)
+        if not base.exists():
+            return
+
+        cutoff = datetime.now().timestamp() - (self._recovery_scan_days * 86400)
+        recovered = 0
+
+        for day_dir in sorted(base.iterdir()):
+            if not day_dir.is_dir():
+                continue
+            try:
+                day_date = datetime.strptime(day_dir.name, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if day_date.timestamp() < cutoff:
+                continue
+
+            for session_dir in sorted(day_dir.iterdir()):
+                if not session_dir.is_dir():
+                    continue
+                transcript_path = session_dir / "transcript.json"
+                if not transcript_path.exists():
+                    continue
+
+                session_id = f"{day_dir.name}/{session_dir.name}"
+
+                # Skip if already in queue and not failed
+                if session_id in self._jobs:
+                    job = self._jobs[session_id]
+                    if job.status in (
+                        JOB_STATUS_QUEUED, JOB_STATUS_RUNNING,
+                        JOB_STATUS_SUBMITTED, JOB_STATUS_SUCCEEDED,
+                    ):
+                        continue
+
+                # Check transcript for llm_corrected flag
+                try:
+                    with open(transcript_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    session_meta = data.get("session", {})
+                    segments = data.get("segments", [])
+
+                    if not segments:
+                        continue
+                    if session_meta.get("llm_corrected"):
+                        continue
+
+                    # Unprocessed session found — enqueue it
+                    job = BatchJob(session_id=session_id, mode=self._mode)
+                    self._jobs[session_id] = job
+                    recovered += 1
+
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+        if recovered:
+            self._save_queue()
+            log.info(
+                "BatchCorrector: recovered %d unprocessed session(s) "
+                "from last %d day(s)",
+                recovered, self._recovery_scan_days,
+            )
 
     # ------------------------------------------------------------------
     # Public API

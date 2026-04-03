@@ -400,6 +400,167 @@ class TestBatchProcessing:
 # Screening integration tests
 # ---------------------------------------------------------------------------
 
+class TestRecovery:
+    """Tests for _recover_unprocessed_sessions()."""
+
+    def test_recover_unprocessed_sessions(self):
+        """Unprocessed sessions (no llm_corrected) are auto-enqueued on startup."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            from datetime import datetime, timedelta
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 1.0}]
+            _create_test_session(recordings_dir, f"{today}/10-00-00", segments)
+            _create_test_session(recordings_dir, f"{today}/11-00-00", segments, llm_corrected=True)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=7,
+            )
+
+            # Only the uncorrected session should be in the queue
+            assert bc.get_status()["total"] == 1
+            jobs = bc.get_jobs()
+            assert jobs[0]["session_id"] == f"{today}/10-00-00"
+
+    def test_recovery_skips_already_queued(self):
+        """Sessions already in queue are not duplicated by recovery."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 1.0}]
+            _create_test_session(recordings_dir, f"{today}/10-00-00", segments)
+
+            # Pre-populate queue with this session
+            queue = [BatchJob(session_id=f"{today}/10-00-00").to_dict()]
+            with open(os.path.join(config_dir, "batch_llm_queue.json"), "w") as f:
+                json.dump(queue, f)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=7,
+            )
+
+            # Should NOT duplicate
+            assert bc.get_status()["total"] == 1
+
+    def test_recovery_requeues_failed(self):
+        """Failed sessions are re-enqueued by recovery scan."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 1.0}]
+            _create_test_session(recordings_dir, f"{today}/10-00-00", segments)
+
+            # Pre-populate with failed job
+            queue = [BatchJob(session_id=f"{today}/10-00-00", status=JOB_STATUS_FAILED).to_dict()]
+            with open(os.path.join(config_dir, "batch_llm_queue.json"), "w") as f:
+                json.dump(queue, f)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=7,
+            )
+
+            jobs = bc.get_jobs()
+            assert len(jobs) == 1
+            assert jobs[0]["status"] == JOB_STATUS_QUEUED
+
+    def test_recovery_skips_empty_sessions(self):
+        """Sessions with 0 segments are not recovered."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            _create_test_session(recordings_dir, f"{today}/10-00-00", [])  # empty
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=7,
+            )
+
+            assert bc.get_status()["total"] == 0
+
+    def test_recovery_skips_old_sessions(self):
+        """Sessions older than recovery_scan_days are not recovered."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 1.0}]
+            _create_test_session(recordings_dir, "2020-01-01/10-00-00", segments)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=7,
+            )
+
+            assert bc.get_status()["total"] == 0
+
+    def test_recovery_disabled_when_zero_days(self):
+        """recovery_scan_days=0 disables recovery scan."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, "config")
+            os.makedirs(config_dir)
+            recordings_dir = os.path.join(tmpdir, "recordings")
+
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            segments = [{"text": "テスト", "start": 0.0, "end": 1.0}]
+            _create_test_session(recordings_dir, f"{today}/10-00-00", segments)
+
+            pipeline = _make_mock_pipeline()
+            bc = BatchCorrector(
+                recordings_dir=recordings_dir,
+                config_dir=config_dir,
+                pipeline=pipeline,
+                known_terms=[],
+                recovery_scan_days=0,
+            )
+
+            assert bc.get_status()["total"] == 0
+
+
 class TestBatchScreening:
     @pytest.mark.asyncio
     async def test_all_clean_skips_llm(self):

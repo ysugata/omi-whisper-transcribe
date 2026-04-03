@@ -69,6 +69,7 @@ LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "B")        # Pipeli
 LLM_SCREENING_ENABLED = os.environ.get("LLM_SCREENING_ENABLED", "true").lower() in ("true", "1", "yes")
 STAGE_C_AUTO = os.environ.get("STAGE_C_AUTO", "true").lower() in ("true", "1", "yes")  # Auto-trigger 3-C
 LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "sync")              # "sync" (standard API) or "batch" (Gemini Batch API, slow)
+RECOVERY_SCAN_DAYS = int(os.environ.get("RECOVERY_SCAN_DAYS", "7"))     # Startup scan: recover unprocessed sessions from last N days (0=disabled)
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -2252,6 +2253,7 @@ async def main():
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=LLM_MODEL,
             segment_screener=segment_screener,
+            recovery_scan_days=RECOVERY_SCAN_DAYS,
         )
         await batch_corrector.start()
         log.info("Batch LLM corrector: worker started (mode=%s, screening=%s)",
