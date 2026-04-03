@@ -236,11 +236,21 @@ class SessionTagger:
             "has_voice_tags": has_voice,
         }
 
-    def _build_input(self, segments: list[dict]) -> str:
+    def _build_input(self, segments: list[dict], audio_scene: dict | None = None) -> str:
         """Build session text from segments with speaker info."""
         stats = self._compute_speaker_stats(segments)
 
         lines = []
+        # Add audio scene preamble if available
+        if audio_scene and audio_scene.get("scene_label"):
+            scene_conf = int(audio_scene.get("scene_confidence", 0) * 100)
+            scene_line = f"[音響環境 (PANNs推定)] シーン: {audio_scene['scene_label']} ({scene_conf}%)"
+            if audio_scene.get("spatial_label"):
+                spatial_conf = int(audio_scene.get("spatial_confidence", 0) * 100)
+                scene_line += f", 空間: {audio_scene['spatial_label']} ({spatial_conf}%)"
+            lines.append(scene_line)
+            lines.append("")
+
         # Add speaker statistics preamble if voice tags exist
         if stats["has_voice_tags"]:
             preamble = (
@@ -372,7 +382,7 @@ class SessionTagger:
 
         return result
 
-    def tag_session(self, segments: list[dict]) -> Optional[dict]:
+    def tag_session(self, segments: list[dict], audio_scene: dict | None = None) -> Optional[dict]:
         """Tag a session's segments and return tags dict.
 
         Returns None on error (API failure, invalid response, etc.).
@@ -383,7 +393,7 @@ class SessionTagger:
         if not segments:
             return None
 
-        session_text = self._build_input(segments)
+        session_text = self._build_input(segments, audio_scene=audio_scene)
         if not session_text or len(session_text) < 10:
             log.debug("SessionTagger: session text too short, skipping")
             return None
@@ -429,12 +439,12 @@ class SessionTagger:
             log.warning(f"SessionTagger API error: {e}")
             return None
 
-    def build_batch_input(self, segments: list[dict]) -> tuple:
+    def build_batch_input(self, segments: list[dict], audio_scene: dict | None = None) -> tuple:
         """Build (system_prompt, user_message) for Batch API submission.
 
         Returns ("", "") if input is too short.
         """
-        session_text = self._build_input(segments)
+        session_text = self._build_input(segments, audio_scene=audio_scene)
         if not session_text or len(session_text) < 10:
             return ("", "")
         system_prompt = self._build_system_prompt()

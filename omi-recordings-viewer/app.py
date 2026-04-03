@@ -114,6 +114,7 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
     outcome = request.query.get("outcome", "").strip()
     domain = request.query.get("domain", "").strip()
     importance_v2 = request.query.get("importance_v2", "").strip()
+    audio_scene = request.query.get("audio_scene", "").strip()
 
     try:
         result = await indexer.get_sessions(
@@ -123,6 +124,7 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
             source_type=source_type,
             conversation_type=conversation_type, outcome=outcome,
             domain=domain, importance_v2=importance_v2,
+            audio_scene=audio_scene,
         )
     except Exception as e:
         logger.exception("Failed to query sessions")
@@ -139,6 +141,29 @@ async def handle_api_speaker_names(request: web.Request) -> web.Response:
         logger.exception("Failed to get speaker names")
         return web.json_response({"error": str(e)}, status=500)
     return web.json_response(names)
+
+
+async def handle_audio_scene_labels(request: web.Request) -> web.Response:
+    """Get distinct audio scene labels for filter dropdown."""
+    indexer: Indexer = request.app["indexer"]
+    try:
+        labels = await indexer.get_audio_scene_labels()
+    except Exception as e:
+        logger.exception("Failed to get audio scene labels")
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response(labels)
+
+
+async def handle_audio_scene_status(request: web.Request) -> web.Response:
+    """Proxy audio scene status from bridge."""
+    bridge_url = request.app["bridge_url"]
+    try:
+        async with aiohttp.ClientSession() as cs:
+            async with cs.get(f"{bridge_url}/audio-scene/status") as resp:
+                data = await resp.json()
+                return web.json_response(data)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
 
 
 async def handle_api_session_detail(request: web.Request) -> web.Response:
@@ -459,7 +484,8 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                 tags_decision_summary, tags_action_items, tags_outcome,
                 tags_conversation_type, tags_outcomes, tags_domains,
                 tags_decision_memo, tags_importance_v2, tags_version,
-                tags_external_audio)
+                tags_external_audio,
+                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -470,7 +496,8 @@ async def handle_put_session_user_tags(request: web.Request) -> web.Response:
                        :tags_decision_summary, :tags_action_items, :tags_outcome,
                        :tags_conversation_type, :tags_outcomes, :tags_domains,
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
-                       :tags_external_audio)""",
+                       :tags_external_audio,
+                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence)""",
             info,
         )
         await indexer._db.commit()
@@ -1030,6 +1057,7 @@ async def on_startup(app: web.Application):
     app["indexer"] = indexer
     app["sync_task"] = asyncio.create_task(indexer.periodic_sync())
     app["bridge_session"] = aiohttp.ClientSession()
+    app["bridge_url"] = BRIDGE_MGMT_URL
 
 
 async def on_cleanup(app: web.Application):
@@ -1047,6 +1075,8 @@ def create_app() -> web.Application:
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/sessions", handle_api_sessions)
     app.router.add_get("/api/speaker-names", handle_api_speaker_names)
+    app.router.add_get("/api/audio-scene-labels", handle_audio_scene_labels)
+    app.router.add_get("/api/audio-scene/status", handle_audio_scene_status)
     app.router.add_get("/api/sessions/{date}/{time}", handle_api_session_detail)
     app.router.add_get("/audio/{date}/{time}/", handle_audio_auto)
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)

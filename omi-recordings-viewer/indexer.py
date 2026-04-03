@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_decision_memo TEXT,
     tags_importance_v2 TEXT,
     tags_version INTEGER DEFAULT 0,
+    tags_audio_scene TEXT,
+    tags_audio_scene_spatial TEXT,
+    tags_audio_scene_confidence REAL,
     UNIQUE(date, time)
 );
 
@@ -68,6 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_importance ON sessions(tags_importance);
 CREATE INDEX IF NOT EXISTS idx_sessions_decision_required ON sessions(tags_decision_required);
 CREATE INDEX IF NOT EXISTS idx_sessions_conversation_type ON sessions(tags_conversation_type);
 CREATE INDEX IF NOT EXISTS idx_sessions_importance_v2 ON sessions(tags_importance_v2);
+CREATE INDEX IF NOT EXISTS idx_sessions_audio_scene ON sessions(tags_audio_scene);
 """
 
 # Migration: add tag columns to existing DBs
@@ -98,6 +102,9 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_importance_v2 TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_version INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN tags_external_audio REAL",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_scene TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_scene_spatial TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_scene_confidence REAL",
 ]
 
 FTS_SCHEMA = """
@@ -276,6 +283,9 @@ class Indexer:
             "tags_importance_v2": tags_importance_v2,
             "tags_version": tag_version,
             "tags_external_audio": tags.get("external_audio_ratio"),
+            "tags_audio_scene": (session.get("audio_scene") or {}).get("scene_label"),
+            "tags_audio_scene_spatial": (session.get("audio_scene") or {}).get("spatial_label"),
+            "tags_audio_scene_confidence": (session.get("audio_scene") or {}).get("scene_confidence"),
         }
 
     async def sync(self) -> int:
@@ -329,7 +339,8 @@ class Indexer:
                     tags_decision_summary, tags_action_items, tags_outcome,
                     tags_conversation_type, tags_outcomes, tags_domains,
                     tags_decision_memo, tags_importance_v2, tags_version,
-                    tags_external_audio)
+                    tags_external_audio,
+                    tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -340,7 +351,8 @@ class Indexer:
                            :tags_decision_summary, :tags_action_items, :tags_outcome,
                            :tags_conversation_type, :tags_outcomes, :tags_domains,
                            :tags_decision_memo, :tags_importance_v2, :tags_version,
-                           :tags_external_audio)""",
+                           :tags_external_audio,
+                           :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence)""",
                 info,
             )
             count += 1
@@ -361,6 +373,7 @@ class Indexer:
         importance: str = "", source_type: str = "",
         conversation_type: str = "", outcome: str = "",
         domain: str = "", importance_v2: str = "",
+        audio_scene: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -422,6 +435,10 @@ class Indexer:
             params.append("%" + speaker + "%")
             params.append(speaker)
 
+        if audio_scene:
+            where_clauses.append("tags_audio_scene = ?")
+            params.append(audio_scene)
+
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
         count_row = await self._db.execute_fetchall(
@@ -457,6 +474,14 @@ class Indexer:
                 if name:
                     names.add(name)
         return sorted(names)
+
+    async def get_audio_scene_labels(self) -> list[str]:
+        """Get distinct audio scene labels."""
+        cursor = await self._db.execute(
+            "SELECT DISTINCT tags_audio_scene FROM sessions WHERE tags_audio_scene IS NOT NULL ORDER BY tags_audio_scene"
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
 
     async def get_session(self, date: str, time: str):
         """Get a single session by date/time."""

@@ -35,6 +35,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
+| 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -180,6 +181,12 @@ open http://localhost:8092
 | POST | `/sanitize/cancel` | 実行中のバッチをキャンセル |
 | GET | `/sanitize/download` | 生成された JSONL ファイルをダウンロード |
 
+### 音響シーン分類
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/audio-scene/status` | 音響シーン分類の有効/無効、モデル情報、閾値、バッチ進捗 |
+
 ### ユーザータグ
 
 | メソッド | パス | 説明 |
@@ -295,6 +302,14 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `DIARIZATION_ENABLED` | `false` | セッション終了時の自動話者分離 |
 | `HOTWORDS_ENABLED` | `true` | Hotwords (デコーダバイアス) |
+
+### 音響シーン分類
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `AUDIO_SCENE_ENABLED` | `true` | PANNs CNN14 音響シーン分類の有効/無効 |
+| `AUDIO_SCENE_DEVICE` | `cpu` | 推論デバイス (cpu / cuda) |
+| `AUDIO_SCENE_THRESHOLD` | `0.3` | シーン/空間分類の信頼度閾値 |
 
 ### 外部サービス
 
@@ -766,6 +781,7 @@ omi_whisper_transcribe/
 ├── sanitize_schema.py        # 匿名化 JSON Schema + KC 抽出スキーマ + 品質ゲート
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
+├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)

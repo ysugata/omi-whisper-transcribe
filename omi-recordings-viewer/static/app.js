@@ -72,6 +72,7 @@
     var filterImportanceV2 = document.getElementById("filter-importance-v2");
     var filterUserTag = document.getElementById("filter-user-tag");
     var filterSpeaker = document.getElementById("filter-speaker");
+    var filterAudioScene = document.getElementById("filter-audio-scene");
 
     // Taxonomy cache
     var taxonomyCache = null;
@@ -85,6 +86,7 @@
         if (filterImportanceV2 && filterImportanceV2.value) url += "&importance_v2=" + encodeURIComponent(filterImportanceV2.value);
         if (filterUserTag && filterUserTag.value) url += "&user_tag=" + encodeURIComponent(filterUserTag.value);
         if (filterSpeaker && filterSpeaker.value) url += "&speaker=" + encodeURIComponent(filterSpeaker.value);
+        if (filterAudioScene && filterAudioScene.value) url += "&audio_scene=" + encodeURIComponent(filterAudioScene.value);
         return fetch(url).then(function (r) { return r.json(); });
     }
 
@@ -176,6 +178,12 @@
                 }
                 if (s.tags_external_audio != null && s.tags_external_audio >= 0.8) {
                     html += '<span class="tag-badge ext-audio" title="外部音声比率: ' + Math.round(s.tags_external_audio * 100) + '%">TV/外部音声</span>';
+                }
+                if (s.tags_audio_scene) {
+                    var sceneTitle = 'PANNs CNN14: ' + s.tags_audio_scene;
+                    if (s.tags_audio_scene_spatial) sceneTitle += ' / ' + s.tags_audio_scene_spatial;
+                    if (s.tags_audio_scene_confidence) sceneTitle += ' (' + Math.round(s.tags_audio_scene_confidence * 100) + '%)';
+                    html += '<span class="tag-badge audio-scene" title="' + escapeHtml(sceneTitle) + '">' + escapeHtml(s.tags_audio_scene) + '</span>';
                 }
                 html += '</div>';
             } else if (s.tags_activity || s.tags_mood || s.tags_topics) {
@@ -330,6 +338,20 @@
             if (isV2Detail && tags.external_audio_ratio != null && tags.external_audio_ratio >= 0.5) {
                 detailHeader.innerHTML += '<div class="detail-external-audio">&#128250; 外部音声比率: ' + Math.round(tags.external_audio_ratio * 100) + '% (unknown speaker)</div>';
             }
+        }
+
+        // Audio scene section
+        if (s.tags_audio_scene) {
+            var sceneHtml = '<div class="detail-audio-scene"><div class="scene-row">';
+            sceneHtml += '<span class="scene-label">シーン:</span> ' + escapeHtml(s.tags_audio_scene);
+            if (s.tags_audio_scene_spatial) {
+                sceneHtml += ' <span class="scene-label">空間:</span> ' + escapeHtml(s.tags_audio_scene_spatial);
+            }
+            if (s.tags_audio_scene_confidence) {
+                sceneHtml += ' <span style="color:#888">(' + Math.round(s.tags_audio_scene_confidence * 100) + '%)</span>';
+            }
+            sceneHtml += '</div></div>';
+            detailHeader.innerHTML += sceneHtml;
         }
 
         // User tags section in detail modal
@@ -692,7 +714,7 @@
     var filterPanel = document.getElementById("filter-panel");
     var filterClearBtn = document.getElementById("filter-clear-btn");
     var filterCountBadge = document.getElementById("filter-count-badge");
-    var allFilterSelects = [filterConversationType, filterOutcome, filterDomain, filterImportanceV2, filterUserTag, filterSpeaker];
+    var allFilterSelects = [filterConversationType, filterOutcome, filterDomain, filterImportanceV2, filterUserTag, filterSpeaker, filterAudioScene];
 
     function updateFilterCount() {
         var count = 0;
@@ -2085,6 +2107,25 @@
         });
     }
 
+    // --- Audio scene labels for filter ---
+
+    function loadAudioSceneLabels() {
+        return fetch("/api/audio-scene-labels").then(function (r) { return r.json(); }).then(function (labels) {
+            if (!filterAudioScene || !Array.isArray(labels)) return;
+            var currentVal = filterAudioScene.value;
+            while (filterAudioScene.options.length > 1) filterAudioScene.remove(1);
+            labels.forEach(function (label) {
+                var opt = document.createElement("option");
+                opt.value = label;
+                opt.textContent = label;
+                filterAudioScene.appendChild(opt);
+            });
+            filterAudioScene.value = currentVal;
+        }).catch(function (e) {
+            console.error("Failed to load audio scene labels:", e);
+        });
+    }
+
     // --- Speaker names for session filter ---
 
     function loadSpeakerNames() {
@@ -2382,7 +2423,7 @@
     }
 
     // --- Init ---
-    Promise.all([loadUserTagsCache(), loadSpeakerNames(), loadTaxonomy()]).then(function () {
+    Promise.all([loadUserTagsCache(), loadSpeakerNames(), loadTaxonomy(), loadAudioSceneLabels()]).then(function () {
         loadPage(1);
     });
     checkBatchStatus("diarize");

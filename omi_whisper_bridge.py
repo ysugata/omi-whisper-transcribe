@@ -75,6 +75,11 @@ RECOVERY_SCAN_DAYS = int(os.environ.get("RECOVERY_SCAN_DAYS", "7"))     # Startu
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
 TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
 
+# --- 音響シーン分類設定 ---
+AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")
+AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
+AUDIO_SCENE_THRESHOLD = float(os.environ.get("AUDIO_SCENE_THRESHOLD", "0.3"))
+
 # --- 深夜スケジューラ設定 ---
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
 
@@ -223,6 +228,13 @@ if TAGGING_ENABLED and LLM_API_KEY:
         user_tags_path=_USER_TAGS_PATH,
         taxonomy_path=TAG_TAXONOMY_PATH,
     )
+
+from audio_scene_classifier import AudioSceneClassifier
+audio_scene_classifier = AudioSceneClassifier(
+    enabled=AUDIO_SCENE_ENABLED,
+    device=AUDIO_SCENE_DEVICE,
+    threshold=AUDIO_SCENE_THRESHOLD,
+)
 
 # Training data sanitizer (LLM API キーがあれば利用可能)
 # SANITIZE_MODEL supports both Gemini and OpenAI models:
@@ -1456,6 +1468,40 @@ def _find_untagged_session_tag_sessions(force: bool = False) -> list[dict]:
     return sessions
 
 
+def _find_unscene_classified_sessions(force: bool = False) -> list[tuple]:
+    """音響シーン未分類のセッションを探す。(session_dir, session_data) のリストを返す。"""
+    results = []
+    recordings = Path(RECORDINGS_DIR)
+    if not recordings.is_dir():
+        return results
+
+    for day_dir in sorted(recordings.iterdir()):
+        if not day_dir.is_dir():
+            continue
+        for time_dir in sorted(day_dir.iterdir()):
+            if not time_dir.is_dir():
+                continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+
+            session_json = time_dir / "session.json"
+            sess_data = {}
+            if session_json.exists():
+                try:
+                    with open(session_json, encoding="utf-8") as f:
+                        sess_data = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            if not force and "audio_scene" in sess_data:
+                continue
+
+            results.append((str(time_dir), sess_data))
+
+    return results
+
+
 async def _batch_session_tag_task(force: bool = False):
     """バッチセッションタグ付けタスク。"""
     import shutil
@@ -1541,7 +1587,7 @@ async def _batch_session_tag_task(force: bool = False):
 
 _batch_combined_tag_state = {
     "running": False,
-    "phase": None,            # "voice_tag" | "session_tag"
+    "phase": None,            # "voice_tag" | "audio_scene" | "session_tag"
     "total": 0,
     "processed": 0,
     "failed": 0,
@@ -1557,6 +1603,9 @@ _batch_combined_tag_state = {
     "voice_tag_total": 0,
     "voice_tag_processed": 0,
     "voice_tag_failed": 0,
+    "audio_scene_total": 0,
+    "audio_scene_processed": 0,
+    "audio_scene_failed": 0,
 }
 
 
@@ -1584,6 +1633,9 @@ async def _batch_combined_tag_task(force: bool = False):
     st["voice_tag_total"] = 0
     st["voice_tag_processed"] = 0
     st["voice_tag_failed"] = 0
+    st["audio_scene_total"] = 0
+    st["audio_scene_processed"] = 0
+    st["audio_scene_failed"] = 0
 
     try:
         # --- Phase 1: Voice Tag (Speaker) ---
@@ -1655,6 +1707,38 @@ async def _batch_combined_tag_task(force: bool = False):
         else:
             log.info("Combined tag Phase 1 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
 
+        # --- Phase 1.5: Audio Scene Classification (PANNs CNN14) ---
+        if st["cancel_requested"]:
+            return
+
+        if AUDIO_SCENE_ENABLED:
+            st["phase"] = "audio_scene"
+            scene_sessions = _find_unscene_classified_sessions(force=force)
+            st["audio_scene_total"] = len(scene_sessions)
+            log.info(f"Combined tag Phase 1.5 (audio scene): {len(scene_sessions)} session(s)")
+            for sess_dir, sess_data in scene_sessions:
+                if st["cancel_requested"]:
+                    log.info("Combined tag cancelled by user (audio scene phase)")
+                    break
+                try:
+                    wav_path = os.path.join(sess_dir, "full_audio.wav")
+                    if not os.path.exists(wav_path):
+                        log.warning("No full_audio.wav in %s, skipping scene classification", sess_dir)
+                        st["audio_scene_failed"] += 1
+                        continue
+                    result = audio_scene_classifier.classify(wav_path)
+                    if result:
+                        sess_data["audio_scene"] = result
+                        session_json = os.path.join(sess_dir, "session.json")
+                        with open(session_json, "w") as f:
+                            json.dump(sess_data, f, ensure_ascii=False, indent=2)
+                        log.info("Audio scene for %s: %s", os.path.basename(sess_dir), result.get("scene_label", "unknown"))
+                    st["audio_scene_processed"] += 1
+                except Exception as e:
+                    log.error("Audio scene classification failed for %s: %s", sess_dir, e)
+                    st["audio_scene_failed"] += 1
+                await asyncio.sleep(0)
+
         # --- Phase 2: Session Tag (LLM) ---
         # 声紋タグ済みのセグメントを使って LLM タグ付けを実行する。
         if st["cancel_requested"]:
@@ -1663,7 +1747,7 @@ async def _batch_combined_tag_task(force: bool = False):
         st["phase"] = "session_tag"
         session_tag_sessions = _find_untagged_session_tag_sessions(force=force)
         st["session_tag_total"] = len(session_tag_sessions)
-        st["total"] = st["voice_tag_total"] + len(session_tag_sessions)
+        st["total"] = st["voice_tag_total"] + st["audio_scene_total"] + len(session_tag_sessions)
         st["processed"] = st["voice_tag_processed"] + st["voice_tag_failed"]
         st["failed"] = 0  # Reset failed count for combined progress
         log.info(f"Combined tag Phase 2 (session tag): {len(session_tag_sessions)} session(s) (force={force})")
@@ -1682,9 +1766,19 @@ async def _batch_combined_tag_task(force: bool = False):
                         fresh_data = json.load(f)
                     segments = fresh_data.get("segments", [])
 
+                    # Load audio_scene from session.json if available
+                    _sess_json_path = Path(sess["transcript_path"]).parent / "session.json"
+                    _audio_scene = None
+                    if _sess_json_path.exists():
+                        try:
+                            with open(_sess_json_path, encoding="utf-8") as _sf:
+                                _audio_scene = json.load(_sf).get("audio_scene")
+                        except (json.JSONDecodeError, OSError):
+                            pass
+
                     tags = await loop.run_in_executor(
                         None,
-                        lambda segs=segments: session_tagger.tag_session(segs),
+                        lambda segs=segments, asc=_audio_scene: session_tagger.tag_session(segs, audio_scene=asc),
                     )
 
                     if tags:
@@ -2964,6 +3058,19 @@ async def main():
             "total": len(sessions),
         })
 
+    async def handle_audio_scene_status(request):
+        return web.json_response({
+            "enabled": AUDIO_SCENE_ENABLED,
+            "device": AUDIO_SCENE_DEVICE,
+            "threshold": AUDIO_SCENE_THRESHOLD,
+            "model": "PANNs-CNN14",
+            "batch_state": {
+                "audio_scene_total": _batch_combined_tag_state.get("audio_scene_total", 0),
+                "audio_scene_processed": _batch_combined_tag_state.get("audio_scene_processed", 0),
+                "audio_scene_failed": _batch_combined_tag_state.get("audio_scene_failed", 0),
+            }
+        })
+
     async def handle_sanitize_status(request):
         return web.json_response(_batch_sanitize_state)
 
@@ -3110,6 +3217,8 @@ async def main():
     mgmt_app.router.add_post("/tags/start", handle_combined_tag_start)
     mgmt_app.router.add_get("/tags/status", handle_combined_tag_status)
     mgmt_app.router.add_post("/tags/cancel", handle_combined_tag_cancel)
+    # Audio scene classification API
+    mgmt_app.router.add_get("/audio-scene/status", handle_audio_scene_status)
     # Sanitize batch API (training data anonymization)
     mgmt_app.router.add_post("/sanitize/start", handle_sanitize_start)
     mgmt_app.router.add_get("/sanitize/status", handle_sanitize_status)

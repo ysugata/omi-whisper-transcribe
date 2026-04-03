@@ -6,3 +6,4 @@ openai>=1.66.0
 google-genai>=1.0.0
 whisperx
 noisereduce>=3.0.0
+panns-inference>=0.1.0
