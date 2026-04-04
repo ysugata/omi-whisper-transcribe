@@ -1,13 +1,15 @@
 """Tests for vibevoice_transcriber module."""
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
 from vibevoice_transcriber import (
     _parse_output, _normalize_segments, load_audio,
-    _estimate_max_tokens,
+    _estimate_max_tokens, _build_gen_kwargs,
+    PROMPT_LOOKUP_TOKENS, QUANTIZATION_MODE,
 )
 
 
@@ -355,6 +357,108 @@ class TestJapanesePromptConstruction:
 
         assert vv_prompt == "日本語の会話を書き起こしてください。"
         assert "Hotwords" not in vv_prompt
+
+
+class TestEnvironmentVariables:
+    """Test environment variable defaults and reading."""
+
+    def test_prompt_lookup_default_zero(self):
+        """Default PROMPT_LOOKUP_TOKENS should be 0 (disabled)."""
+        assert PROMPT_LOOKUP_TOKENS == 0
+
+    def test_quantization_default_4bit(self):
+        """Default QUANTIZATION_MODE should be '4bit'."""
+        assert QUANTIZATION_MODE == "4bit"
+
+    def test_prompt_lookup_env_override(self):
+        """VIBEVOICE_PROMPT_LOOKUP_TOKENS env var should be parsed as int."""
+        with patch.dict("os.environ", {"VIBEVOICE_PROMPT_LOOKUP_TOKENS": "5"}):
+            import importlib
+            import vibevoice_transcriber
+            importlib.reload(vibevoice_transcriber)
+            assert vibevoice_transcriber.PROMPT_LOOKUP_TOKENS == 5
+            # Restore default
+            with patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("VIBEVOICE_PROMPT_LOOKUP_TOKENS", None)
+                importlib.reload(vibevoice_transcriber)
+
+    def test_quantization_env_override(self):
+        """VIBEVOICE_QUANTIZATION env var should be read as string."""
+        with patch.dict("os.environ", {"VIBEVOICE_QUANTIZATION": "8bit"}):
+            import importlib
+            import vibevoice_transcriber
+            importlib.reload(vibevoice_transcriber)
+            assert vibevoice_transcriber.QUANTIZATION_MODE == "8bit"
+            # Restore default
+            with patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("VIBEVOICE_QUANTIZATION", None)
+                importlib.reload(vibevoice_transcriber)
+
+
+class TestBuildGenKwargs:
+    """Test _build_gen_kwargs helper."""
+
+    def test_basic_kwargs(self):
+        """Should include core generation parameters."""
+        kwargs = _build_gen_kwargs(1000)
+        assert kwargs["max_new_tokens"] == 1000
+        assert kwargs["repetition_penalty"] == 1.2
+        assert kwargs["do_sample"] is False
+        assert kwargs["num_beams"] == 1
+        assert kwargs["use_cache"] is True
+
+    def test_no_prompt_lookup_by_default(self):
+        """prompt_lookup_num_tokens should not be in kwargs when PROMPT_LOOKUP_TOKENS=0."""
+        kwargs = _build_gen_kwargs(500)
+        assert "prompt_lookup_num_tokens" not in kwargs
+
+    def test_prompt_lookup_included_when_set(self):
+        """prompt_lookup_num_tokens should be added when PROMPT_LOOKUP_TOKENS > 0."""
+        import vibevoice_transcriber
+        original = vibevoice_transcriber.PROMPT_LOOKUP_TOKENS
+        try:
+            vibevoice_transcriber.PROMPT_LOOKUP_TOKENS = 5
+            kwargs = vibevoice_transcriber._build_gen_kwargs(1000)
+            assert kwargs["prompt_lookup_num_tokens"] == 5
+        finally:
+            vibevoice_transcriber.PROMPT_LOOKUP_TOKENS = original
+
+    def test_generate_called_with_gen_kwargs(self):
+        """model.generate() should receive gen_kwargs from _build_gen_kwargs."""
+        torch = pytest.importorskip("torch")
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+        mock_model = MagicMock()
+        mock_model.device = "cpu"
+        mock_processor = MagicMock()
+
+        transcriber.model = mock_model
+        transcriber.processor = mock_processor
+
+        mock_inputs = {
+            "input_ids": torch.zeros(1, 10, dtype=torch.long),
+            "attention_mask": torch.ones(1, 10, dtype=torch.long),
+        }
+        mock_processor.apply_transcription_request.return_value = mock_inputs
+        mock_model.generate.return_value = torch.zeros(1, 20, dtype=torch.long)
+
+        expected_parsed = [
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "テスト"},
+        ]
+        mock_processor.decode.return_value = expected_parsed
+
+        audio_data = np.random.randn(72000).astype(np.float32)  # 3s
+        transcriber._infer(audio_data, 24000, "")
+
+        # Verify generate was called with the expected kwargs
+        call_kwargs = mock_model.generate.call_args
+        assert call_kwargs.kwargs.get("max_new_tokens") is not None or \
+               "max_new_tokens" in (call_kwargs[1] if len(call_kwargs) > 1 else {})
+        # Check the merged kwargs contain our expected keys
+        all_kwargs = {**call_kwargs.kwargs} if call_kwargs.kwargs else {}
+        assert all_kwargs.get("repetition_penalty") == 1.2
+        assert all_kwargs.get("use_cache") is True
 
 
 class TestEstimateMaxTokens:

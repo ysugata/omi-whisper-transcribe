@@ -1,8 +1,9 @@
 """VibeVoice-ASR transcriber module.
 
 Provides VibeVoiceTranscriber class for batch transcription using
-microsoft/VibeVoice-ASR-HF with 4-bit quantization (~6.6 GB VRAM).
+microsoft/VibeVoice-ASR-HF with configurable quantization (4-bit NF4 or 8-bit).
 
+Supports Prompt Lookup Decoding for speed improvement on JSON output.
 Extracted from tools/compare_vibevoice.py for use in Bridge batch processing.
 """
 
@@ -18,6 +19,15 @@ log = logging.getLogger(__name__)
 
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
 
+# Prompt Lookup Decoding: n-gram match speculative decoding for JSON output.
+# Exploits repeated key names ("Start", "End", "Speaker", "Content") in output.
+# 0 = disabled (default). Try 5 or 10 for speed improvement.
+PROMPT_LOOKUP_TOKENS = int(os.environ.get("VIBEVOICE_PROMPT_LOOKUP_TOKENS", "0"))
+
+# Quantization mode: "4bit" (NF4, ~6.6GB VRAM) or "8bit" (~10.6GB VRAM).
+# 8-bit reduces dequantization loss → potentially better accuracy + speed.
+QUANTIZATION_MODE = os.environ.get("VIBEVOICE_QUANTIZATION", "4bit")
+
 
 class VibeVoiceTranscriber:
     """VibeVoice-ASR transcriber with model lifecycle management."""
@@ -31,10 +41,10 @@ class VibeVoiceTranscriber:
         return self.model is not None and self.processor is not None
 
     def load_model(self):
-        """Load VibeVoice-ASR model with 4-bit quantization.
+        """Load VibeVoice-ASR model with quantization.
 
-        Requires ~6.6 GB VRAM. Must be called from a thread (run_in_executor)
-        as model loading is blocking.
+        Supports 4-bit NF4 (~6.6 GB VRAM) or 8-bit (~10.6 GB VRAM).
+        Must be called from a thread (run_in_executor) as model loading is blocking.
         """
         if self.loaded:
             return
@@ -42,16 +52,21 @@ class VibeVoiceTranscriber:
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, BitsAndBytesConfig
 
-        log.info("Loading VibeVoice-ASR model (4-bit quantized)...")
+        quant_label = QUANTIZATION_MODE
+        log.info("Loading VibeVoice-ASR model (quant=%s, prompt_lookup=%d)...",
+                 quant_label, PROMPT_LOOKUP_TOKENS)
         t0 = time.time()
 
         self.processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        )
+        if QUANTIZATION_MODE == "8bit":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
         # Apply FA2/SDPA only to the LLM decoder (text_config = Qwen2).
         # AcousticTokenizerEncoder is pure ConvNext (no attention layers),
         # so passing a string attn_implementation fails. Dict form targets
@@ -87,7 +102,8 @@ class VibeVoiceTranscriber:
         torch.backends.cudnn.allow_tf32 = True
 
         elapsed = time.time() - t0
-        log.info("VibeVoice-ASR model loaded in %.1fs (attn=%s)", elapsed, attn_impl)
+        log.info("VibeVoice-ASR model loaded in %.1fs (quant=%s, attn=%s, prompt_lookup=%d)",
+                 elapsed, quant_label, attn_impl, PROMPT_LOOKUP_TOKENS)
 
     def unload_model(self):
         """Unload model and free VRAM."""
@@ -197,15 +213,10 @@ class VibeVoiceTranscriber:
         duration = len(audio_data) / sr
         max_tokens = _estimate_max_tokens(duration)
 
+        gen_kwargs = _build_gen_kwargs(max_tokens)
+
         with torch.inference_mode():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                repetition_penalty=1.2,
-                do_sample=False,
-                num_beams=1,
-                use_cache=True,
-            )
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         new_tokens = output_ids[:, input_len:]
 
@@ -248,16 +259,10 @@ class VibeVoiceTranscriber:
                 input_len = inputs["input_ids"].shape[-1]
 
                 max_tokens = _estimate_max_tokens(chunk_duration)
+                gen_kwargs = _build_gen_kwargs(max_tokens)
 
                 with torch.inference_mode():
-                    output_ids = self.model.generate(
-                        **inputs,
-                        max_new_tokens=max_tokens,
-                        repetition_penalty=1.2,
-                        do_sample=False,
-                        num_beams=1,
-                        use_cache=True,
-                    )
+                    output_ids = self.model.generate(**inputs, **gen_kwargs)
 
                 new_tokens = output_ids[:, input_len:]
 
@@ -399,6 +404,20 @@ def _parse_output(text: str) -> list:
     if text:
         log.warning("VibeVoice output parse failed (%d chars), returning empty", len(text))
     return []
+
+
+def _build_gen_kwargs(max_tokens: int) -> dict:
+    """Build generate() kwargs dict with optional prompt lookup decoding."""
+    kwargs = dict(
+        max_new_tokens=max_tokens,
+        repetition_penalty=1.2,
+        do_sample=False,
+        num_beams=1,
+        use_cache=True,
+    )
+    if PROMPT_LOOKUP_TOKENS > 0:
+        kwargs["prompt_lookup_num_tokens"] = PROMPT_LOOKUP_TOKENS
+    return kwargs
 
 
 def _estimate_max_tokens(duration_s: float) -> int:

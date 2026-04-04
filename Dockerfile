@@ -15,6 +15,10 @@ RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.py
 COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
 
+# qwen-asr depends on sox which needs numpy at setup time.
+# Install separately after requirements (which provides numpy).
+RUN pip3 install --no-cache-dir qwen-asr>=0.0.6
+
 # Flash Attention 2 pre-built wheel for VibeVoice-ASR LLM decoder speedup.
 # Applied via dict-form attn_implementation={"text_config": "flash_attention_2"}.
 # Wheel must match: torch version + CUDA version + CXX11 ABI + Python version.
@@ -41,6 +45,7 @@ COPY segment_classifier.py .
 COPY segment_screener.py .
 COPY audio_scene_classifier.py .
 COPY vibevoice_transcriber.py .
+COPY qwen3_transcriber.py .
 COPY correction_metrics.py .
 COPY sanitize_provider.py .
 COPY sanitize_schema.py .
