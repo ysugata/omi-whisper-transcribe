@@ -381,16 +381,34 @@ def load_vibevoice_model():
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4",
     )
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        quantization_config=quant_config,
-        device_map="auto",
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
+    # Try FA2 > SDPA > eager (forward-compatible fallback chain)
+    attn_impl = "eager"
+    for impl in ("flash_attention_2", "sdpa"):
+        try:
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_id,
+                quantization_config=quant_config,
+                device_map="auto",
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation=impl,
+            )
+            attn_impl = impl
+            break
+        except (ValueError, ImportError) as e:
+            print(f"  attn_implementation={impl} not available: {e}")
+            continue
+    else:
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            quantization_config=quant_config,
+            device_map="auto",
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
 
     elapsed = time.time() - t0
-    print(f"  Model loaded in {elapsed:.1f}s")
+    print(f"  Model loaded in {elapsed:.1f}s (attn={attn_impl})")
     return model, processor
 
 

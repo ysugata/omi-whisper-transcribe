@@ -341,7 +341,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
-**実装詳細**: NF4 量子化 (~6.6 GB VRAM), `max_new_tokens=8192`, `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化。
+**実装詳細**: NF4 量子化 (~6.6 GB VRAM), `max_new_tokens` 音声長比例制限 (ハルシネーション防止), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化。
 
 ### 外部サービス
 

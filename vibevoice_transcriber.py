@@ -52,16 +52,36 @@ class VibeVoiceTranscriber:
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL_ID,
-            quantization_config=quant_config,
-            device_map="auto",
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
+        # Try FA2 > SDPA > eager (forward-compatible fallback chain).
+        # Currently both FA2 and SDPA are blocked by VibeVoice's
+        # AcousticTokenizerEncoder, so eager is always used.
+        attn_impl = "eager"
+        for impl in ("flash_attention_2", "sdpa"):
+            try:
+                self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    MODEL_ID,
+                    quantization_config=quant_config,
+                    device_map="auto",
+                    dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                    attn_implementation=impl,
+                )
+                attn_impl = impl
+                break
+            except (ValueError, ImportError) as e:
+                log.info("attn_implementation=%s not available: %s", impl, e)
+                continue
+        else:
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                MODEL_ID,
+                quantization_config=quant_config,
+                device_map="auto",
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
 
         elapsed = time.time() - t0
-        log.info("VibeVoice-ASR model loaded in %.1fs", elapsed)
+        log.info("VibeVoice-ASR model loaded in %.1fs (attn=%s)", elapsed, attn_impl)
 
     def unload_model(self):
         """Unload model and free VRAM."""
