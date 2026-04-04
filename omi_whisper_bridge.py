@@ -1964,6 +1964,25 @@ async def _batch_vibevoice_task(force: bool = False):
                 try:
                     await loop.run_in_executor(None, vibevoice_transcriber.load_model)
 
+                    # Build Japanese context prompt with hotwords (once before loop)
+                    hotwords_str = ""
+                    if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
+                        custom = hotword_loader.get_custom_words()
+                        hw_list = hotword_loader.get_hotwords_list()
+                        words = list(custom)
+                        for w in hw_list:
+                            if w not in words:
+                                words.append(w)
+                            if len(words) >= 100:
+                                break
+                        if words:
+                            hotwords_str = ", ".join(words)
+
+                    vv_prompt = "日本語の会話を書き起こしてください。"
+                    if hotwords_str:
+                        vv_prompt += f"\nHotwords: {hotwords_str}"
+                    log.info("VibeVoice prompt: %s", vv_prompt[:100])
+
                     for sess in sessions:
                         if st["cancel_requested"]:
                             log.info("VibeVoice batch cancelled by user (transcription phase)")
@@ -1976,7 +1995,7 @@ async def _batch_vibevoice_task(force: bool = False):
                                 None, vibevoice_transcriber.convert_to_wav, str(sess["audio"])
                             )
                             segments = await loop.run_in_executor(
-                                None, vibevoice_transcriber.transcribe, wav_path
+                                None, vibevoice_transcriber.transcribe, wav_path, vv_prompt
                             )
 
                             if segments is None:

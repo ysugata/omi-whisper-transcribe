@@ -345,11 +345,13 @@ def build_hotwords_prompt(session_id=None):
             if len(prompt_words) >= 100:
                 break
 
+        prefix = "日本語の会話を書き起こしてください。"
         if prompt_words:
-            return "Hotwords: " + ", ".join(prompt_words)
+            return prefix + "\nHotwords: " + ", ".join(prompt_words)
+        return prefix
     except Exception:
         pass
-    return ""
+    return "日本語の会話を書き起こしてください。"
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +388,13 @@ def load_vibevoice_model():
         dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+
+    # torch.compile() for ~2x inference speedup (may fail with 4-bit quantization)
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        print(f"  Model compiled with torch.compile()")
+    except Exception as e:
+        print(f"  {YELLOW}torch.compile() failed (will run without): {e}{RESET}")
 
     elapsed = time.time() - t0
     print(f"  Model loaded in {elapsed:.1f}s")
@@ -488,9 +497,17 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
             )
 
         new_tokens = output_ids[:, input_len:]
-        text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
 
-        # Parse JSON output from VibeVoice
+        # Try processor.decode with parsed format (skip JSON string parse)
+        try:
+            parsed = processor.decode(new_tokens[0], return_format="parsed")
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+
+        # Fallback: batch_decode + manual JSON parse
+        text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
         segments = _parse_vibevoice_output(text)
         return segments
 
@@ -549,8 +566,19 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
                 )
 
             new_tokens = output_ids[:, input_len:]
-            text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
-            chunk_segs = _parse_vibevoice_output(text)
+
+            # Try processor.decode with parsed format
+            chunk_segs = None
+            try:
+                parsed = processor.decode(new_tokens[0], return_format="parsed")
+                if isinstance(parsed, list):
+                    chunk_segs = parsed
+            except Exception:
+                pass
+
+            if chunk_segs is None:
+                text = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
+                chunk_segs = _parse_vibevoice_output(text)
 
             # Adjust timestamps by offset
             for seg in chunk_segs:

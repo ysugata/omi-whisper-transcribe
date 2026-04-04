@@ -60,6 +60,13 @@ class VibeVoiceTranscriber:
             trust_remote_code=True,
         )
 
+        # torch.compile() for ~2x inference speedup (may fail with 4-bit quantization)
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            log.info("VibeVoice-ASR model compiled with torch.compile()")
+        except Exception as e:
+            log.warning("torch.compile() failed (will run without): %s", e)
+
         elapsed = time.time() - t0
         log.info("VibeVoice-ASR model loaded in %.1fs", elapsed)
 
@@ -135,6 +142,16 @@ class VibeVoiceTranscriber:
             )
 
         new_tokens = output_ids[:, input_len:]
+
+        # Try processor.decode with parsed format (skip JSON string parse)
+        try:
+            parsed = self.processor.decode(new_tokens[0], return_format="parsed")
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+
+        # Fallback: batch_decode + manual JSON parse
         text = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
         return _parse_output(text)
 
@@ -172,8 +189,19 @@ class VibeVoiceTranscriber:
                     )
 
                 new_tokens = output_ids[:, input_len:]
-                text = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
-                chunk_segs = _parse_output(text)
+
+                # Try processor.decode with parsed format
+                chunk_segs = None
+                try:
+                    parsed = self.processor.decode(new_tokens[0], return_format="parsed")
+                    if isinstance(parsed, list):
+                        chunk_segs = parsed
+                except Exception:
+                    pass
+
+                if chunk_segs is None:
+                    text = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
+                    chunk_segs = _parse_output(text)
 
                 for seg in chunk_segs:
                     seg["Start"] += offset_s

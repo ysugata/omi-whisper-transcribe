@@ -1,6 +1,7 @@
 """Tests for vibevoice_transcriber module."""
 
 import json
+from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
@@ -174,3 +175,108 @@ class TestLoadAudioNormalization:
 
         assert result_sr == 24000
         assert np.all(result_audio == 0)
+
+
+class TestTranscriberInferParsedDecode:
+    """Test processor.decode(return_format='parsed') path in _infer."""
+
+    def test_parsed_decode_returns_list_directly(self):
+        """When processor.decode returns a list, _infer should use it directly."""
+        torch = pytest.importorskip("torch")
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+
+        # Mock model and processor
+        mock_model = MagicMock()
+        mock_model.device = "cpu"
+        mock_processor = MagicMock()
+
+        transcriber.model = mock_model
+        transcriber.processor = mock_processor
+
+        # Simulate processor.apply_transcription_request
+        mock_inputs = {
+            "input_ids": torch.zeros(1, 10, dtype=torch.long),
+            "attention_mask": torch.ones(1, 10, dtype=torch.long),
+        }
+        mock_processor.apply_transcription_request.return_value = mock_inputs
+
+        # Simulate model.generate output
+        mock_output = torch.zeros(1, 20, dtype=torch.long)
+        mock_model.generate.return_value = mock_output
+
+        # processor.decode returns parsed list
+        expected_parsed = [
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "テスト"},
+        ]
+        mock_processor.decode.return_value = expected_parsed
+
+        audio_data = np.random.randn(24000).astype(np.float32)
+        result = transcriber._infer(audio_data, 24000, "日本語の会話を書き起こしてください。")
+
+        assert result == expected_parsed
+        mock_processor.decode.assert_called_once()
+        # batch_decode should NOT have been called
+        mock_processor.batch_decode.assert_not_called()
+
+    def test_parsed_decode_fallback_to_batch_decode(self):
+        """When processor.decode raises, _infer should fall back to batch_decode."""
+        torch = pytest.importorskip("torch")
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+
+        mock_model = MagicMock()
+        mock_model.device = "cpu"
+        mock_processor = MagicMock()
+
+        transcriber.model = mock_model
+        transcriber.processor = mock_processor
+
+        mock_inputs = {
+            "input_ids": torch.zeros(1, 10, dtype=torch.long),
+            "attention_mask": torch.ones(1, 10, dtype=torch.long),
+        }
+        mock_processor.apply_transcription_request.return_value = mock_inputs
+        mock_model.generate.return_value = torch.zeros(1, 20, dtype=torch.long)
+
+        # processor.decode raises (return_format not supported)
+        mock_processor.decode.side_effect = TypeError("unexpected keyword")
+
+        # batch_decode returns raw text
+        json_text = json.dumps([
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "fallback"},
+        ])
+        mock_processor.batch_decode.return_value = [json_text]
+
+        audio_data = np.random.randn(24000).astype(np.float32)
+        result = transcriber._infer(audio_data, 24000, "")
+
+        assert len(result) == 1
+        assert result[0]["Content"] == "fallback"
+        mock_processor.batch_decode.assert_called_once()
+
+
+class TestJapanesePromptConstruction:
+    """Test Japanese prompt construction logic (mirrors bridge behavior)."""
+
+    def test_prompt_with_hotwords(self):
+        """Prompt should include Japanese prefix and hotwords."""
+        hotwords_str = "テスト, 会議, プロジェクト"
+        vv_prompt = "日本語の会話を書き起こしてください。"
+        if hotwords_str:
+            vv_prompt += f"\nHotwords: {hotwords_str}"
+
+        assert vv_prompt.startswith("日本語の会話を書き起こしてください。")
+        assert "Hotwords: テスト, 会議, プロジェクト" in vv_prompt
+
+    def test_prompt_without_hotwords(self):
+        """Prompt should be just the Japanese prefix when no hotwords."""
+        hotwords_str = ""
+        vv_prompt = "日本語の会話を書き起こしてください。"
+        if hotwords_str:
+            vv_prompt += f"\nHotwords: {hotwords_str}"
+
+        assert vv_prompt == "日本語の会話を書き起こしてください。"
+        assert "Hotwords" not in vv_prompt
