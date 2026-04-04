@@ -56,7 +56,7 @@ class VibeVoiceTranscriber:
             MODEL_ID,
             quantization_config=quant_config,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
         )
 
