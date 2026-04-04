@@ -201,6 +201,7 @@ class VibeVoiceTranscriber:
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
+                repetition_penalty=1.2,
                 do_sample=False,
                 num_beams=1,
                 use_cache=True,
@@ -252,6 +253,7 @@ class VibeVoiceTranscriber:
                     output_ids = self.model.generate(
                         **inputs,
                         max_new_tokens=max_tokens,
+                        repetition_penalty=1.2,
                         do_sample=False,
                         num_beams=1,
                         use_cache=True,
@@ -402,10 +404,10 @@ def _parse_output(text: str) -> list:
 def _estimate_max_tokens(duration_s: float) -> int:
     """Estimate max output tokens based on audio duration.
 
-    ~50 tokens/sec is a safe upper bound for structured Japanese JSON output.
+    ~100 tokens/sec is a safe upper bound for structured Japanese JSON output.
     Cap at 8192 to ensure long audio sessions complete successfully.
     """
-    return min(8192, max(256, int(duration_s * 50)))
+    return min(8192, max(256, int(duration_s * 100)))
 
 
 def _normalize_segments(raw_segments: list) -> list:

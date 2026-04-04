@@ -361,19 +361,19 @@ class TestEstimateMaxTokens:
     """Test _estimate_max_tokens helper."""
 
     def test_short_audio_uses_minimum(self):
-        """Audio shorter than ~5s should use minimum (256 tokens)."""
+        """Audio shorter than ~2.6s should use minimum (256 tokens)."""
         assert _estimate_max_tokens(2.0) == 256
-        assert _estimate_max_tokens(5.0) == 256
+        assert _estimate_max_tokens(2.5) == 256
 
     def test_normal_duration_scales_linearly(self):
-        """Should be ~50 tokens per second of audio."""
-        assert _estimate_max_tokens(10.0) == 500
-        assert _estimate_max_tokens(30.0) == 1500
-        assert _estimate_max_tokens(60.0) == 3000
+        """Should be ~100 tokens per second of audio."""
+        assert _estimate_max_tokens(10.0) == 1000
+        assert _estimate_max_tokens(30.0) == 3000
+        assert _estimate_max_tokens(60.0) == 6000
 
     def test_long_audio_capped_at_8192(self):
-        """Audio over ~164s should cap at 8192 tokens."""
-        assert _estimate_max_tokens(100.0) == 5000
+        """Audio over ~82s should cap at 8192 tokens."""
+        assert _estimate_max_tokens(100.0) == 8192
         assert _estimate_max_tokens(200.0) == 8192
         assert _estimate_max_tokens(600.0) == 8192
 
