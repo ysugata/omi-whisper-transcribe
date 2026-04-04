@@ -234,7 +234,7 @@ if TAGGING_ENABLED and LLM_API_KEY:
     )
 
 from audio_scene_classifier import AudioSceneClassifier
-from vibevoice_transcriber import VibeVoiceTranscriber
+from vibevoice_transcriber import VibeVoiceTranscriber, load_audio as vv_load_audio
 
 audio_scene_classifier = AudioSceneClassifier(
     enabled=AUDIO_SCENE_ENABLED,
@@ -1889,6 +1889,23 @@ def _find_unvibevoiced_sessions(force: bool = False) -> list[dict]:
     return sessions
 
 
+def _prefetch_audio(audio_path: str) -> tuple:
+    """Convert audio to WAV and load into memory (CPU-only, no GPU).
+
+    Used by the prefetch pipeline to overlap I/O with GPU inference.
+    Returns (audio_data, sample_rate).
+    """
+    wav_path = VibeVoiceTranscriber.convert_to_wav(audio_path)
+    try:
+        audio_data, sr = vv_load_audio(wav_path)
+        return audio_data, sr
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
 def _find_vibevoice_untagged_sessions(force: bool = False) -> list[dict]:
     """Find sessions with vibevoice_segments that need voice tagging."""
     sessions = []
@@ -1983,20 +2000,51 @@ async def _batch_vibevoice_task(force: bool = False):
                         vv_prompt += f"\nHotwords: {hotwords_str}"
                     log.info("VibeVoice prompt: %s", vv_prompt[:100])
 
-                    for sess in sessions:
+                    # --- Prefetch pipeline: overlap CPU I/O with GPU inference ---
+                    # Pre-load first session's audio
+                    audio_data, audio_sr = None, None
+                    try:
+                        audio_data, audio_sr = await loop.run_in_executor(
+                            None, _prefetch_audio, str(sessions[0]["audio"])
+                        )
+                    except Exception as e:
+                        log.warning("Prefetch failed for first session: %s", e)
+
+                    for i, sess in enumerate(sessions):
                         if st["cancel_requested"]:
                             log.info("VibeVoice batch cancelled by user (transcription phase)")
                             break
 
                         st["current_session"] = sess["path"]
-                        wav_path = None
+
+                        # Start prefetching next session's audio (CPU) while GPU runs
+                        next_future = None
+                        if i + 1 < len(sessions):
+                            next_future = loop.run_in_executor(
+                                None, _prefetch_audio, str(sessions[i + 1]["audio"])
+                            )
+
                         try:
-                            wav_path = await loop.run_in_executor(
-                                None, vibevoice_transcriber.convert_to_wav, str(sess["audio"])
-                            )
-                            segments = await loop.run_in_executor(
-                                None, vibevoice_transcriber.transcribe, wav_path, vv_prompt
-                            )
+                            if audio_data is not None:
+                                # Use pre-loaded audio (skip file I/O)
+                                segments = await loop.run_in_executor(
+                                    None, vibevoice_transcriber.transcribe_audio,
+                                    audio_data, audio_sr, vv_prompt
+                                )
+                            else:
+                                # Fallback: prefetch failed, use original path
+                                wav_path = await loop.run_in_executor(
+                                    None, vibevoice_transcriber.convert_to_wav, str(sess["audio"])
+                                )
+                                try:
+                                    segments = await loop.run_in_executor(
+                                        None, vibevoice_transcriber.transcribe, wav_path, vv_prompt
+                                    )
+                                finally:
+                                    try:
+                                        os.unlink(wav_path)
+                                    except OSError:
+                                        pass
 
                             if segments is None:
                                 raise RuntimeError("OOM: skipped")
@@ -2017,12 +2065,14 @@ async def _batch_vibevoice_task(force: bool = False):
                             err_msg = f"{sess['path']}: {e}"
                             st["errors"].append(err_msg)
                             log.error(f"VibeVoice transcription error: {err_msg}", exc_info=True)
-                        finally:
-                            if wav_path:
-                                try:
-                                    os.unlink(wav_path)
-                                except OSError:
-                                    pass
+
+                        # Collect prefetched audio for next iteration
+                        audio_data, audio_sr = None, None
+                        if next_future is not None:
+                            try:
+                                audio_data, audio_sr = await next_future
+                            except Exception as e:
+                                log.warning("Prefetch failed for %s: %s", sessions[i + 1]["path"], e)
 
                         await asyncio.sleep(0)
 

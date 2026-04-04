@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from vibevoice_transcriber import _parse_output, _normalize_segments, _load_audio
+from vibevoice_transcriber import _parse_output, _normalize_segments, load_audio
 
 
 class TestParseOutput:
@@ -153,7 +153,7 @@ class TestLoadAudioNormalization:
         wav_path = str(tmp_path / "test.wav")
         sf.write(wav_path, audio, sr)
 
-        result_audio, result_sr = _load_audio(wav_path)
+        result_audio, result_sr = load_audio(wav_path)
 
         assert result_sr == 24000
         result_rms = np.sqrt(np.mean(result_audio ** 2))
@@ -171,7 +171,7 @@ class TestLoadAudioNormalization:
         wav_path = str(tmp_path / "silence.wav")
         sf.write(wav_path, audio, sr)
 
-        result_audio, result_sr = _load_audio(wav_path)
+        result_audio, result_sr = load_audio(wav_path)
 
         assert result_sr == 24000
         assert np.all(result_audio == 0)
@@ -256,6 +256,78 @@ class TestTranscriberInferParsedDecode:
         assert len(result) == 1
         assert result[0]["Content"] == "fallback"
         mock_processor.batch_decode.assert_called_once()
+
+
+class TestLoadAudioPublicAPI:
+    """Test that load_audio is a public module-level function."""
+
+    def test_load_audio_importable(self):
+        """load_audio should be importable from vibevoice_transcriber."""
+        from vibevoice_transcriber import load_audio as la
+        assert callable(la)
+
+    def test_load_audio_reads_wav(self, tmp_path):
+        """load_audio should read a WAV file and return (array, sr)."""
+        import soundfile as sf
+
+        sr = 24000
+        audio = np.sin(2 * np.pi * 440 * np.linspace(0, 1.0, sr, endpoint=False)).astype(np.float32)
+        wav_path = str(tmp_path / "test.wav")
+        sf.write(wav_path, audio, sr)
+
+        result_audio, result_sr = load_audio(wav_path)
+        assert result_sr == 24000
+        assert len(result_audio) == sr
+        assert result_audio.dtype == np.float32
+
+
+class TestTranscribeAudio:
+    """Test transcribe_audio() method (pre-loaded audio path)."""
+
+    def test_short_audio_returns_empty(self):
+        """Audio < 2.0s should return empty list without inference."""
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+        transcriber.model = MagicMock()
+        transcriber.processor = MagicMock()
+
+        # 1 second of audio at 24kHz
+        short_audio = np.zeros(24000, dtype=np.float32)
+        result = transcriber.transcribe_audio(short_audio, 24000)
+        assert result == []
+
+    def test_not_loaded_raises(self):
+        """Should raise RuntimeError when model is not loaded."""
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+        audio = np.zeros(48000, dtype=np.float32)  # 2s
+        with pytest.raises(RuntimeError, match="Model not loaded"):
+            transcriber.transcribe_audio(audio, 24000)
+
+    def test_calls_infer_directly(self):
+        """transcribe_audio should call _infer without loading from file."""
+        torch = pytest.importorskip("torch")
+        from vibevoice_transcriber import VibeVoiceTranscriber
+
+        transcriber = VibeVoiceTranscriber()
+        transcriber.model = MagicMock()
+        transcriber.model.device = "cpu"
+        transcriber.processor = MagicMock()
+
+        # Mock _infer to return raw segments
+        raw_segs = [{"Start": 0, "End": 5.0, "Speaker": 0, "Content": "テスト"}]
+        transcriber._infer = MagicMock(return_value=raw_segs)
+
+        audio = np.random.randn(72000).astype(np.float32)  # 3s at 24kHz
+        result = transcriber.transcribe_audio(audio, 24000, "prompt")
+
+        transcriber._infer.assert_called_once_with(audio, 24000, "prompt")
+        assert len(result) == 1
+        assert result[0]["text"] == "テスト"
+        assert result[0]["start"] == 0.0
+        assert result[0]["end"] == 5.0
 
 
 class TestJapanesePromptConstruction:

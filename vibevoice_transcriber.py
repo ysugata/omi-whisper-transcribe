@@ -119,7 +119,7 @@ class VibeVoiceTranscriber:
         if not self.loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        audio_data, sr = _load_audio(audio_path)
+        audio_data, sr = load_audio(audio_path)
         duration = len(audio_data) / sr
 
         if duration < 2.0:
@@ -139,6 +139,47 @@ class VibeVoiceTranscriber:
                 log.error("OOM: skipping (audio too large for available VRAM)")
                 torch.cuda.empty_cache()
                 return None
+
+    def transcribe_audio(self, audio_data, sr: int, prompt: str = "", chunk_size: int = 1440000):
+        """Run inference on pre-loaded audio data.
+
+        Same as transcribe() but skips file I/O (audio already loaded).
+        Used by batch pipeline to overlap I/O with GPU inference.
+
+        Args:
+            audio_data: Numpy array of audio samples (float32).
+            sr: Sample rate.
+            prompt: Optional hotwords prompt string.
+            chunk_size: Samples per chunk for OOM recovery.
+
+        Returns:
+            List of normalized segments [{"start", "end", "speaker", "text"}],
+            or None on unrecoverable OOM.
+        """
+        if not self.loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        duration = len(audio_data) / sr
+        if duration < 2.0:
+            return []
+
+        try:
+            segments = self._infer(audio_data, sr, prompt)
+            return _normalize_segments(segments)
+        except Exception as e:
+            import torch
+            if isinstance(e, torch.cuda.OutOfMemoryError):
+                if chunk_size > 480000:
+                    new_chunk = 480000
+                    log.warning("OOM: retrying with chunk_size=%d", new_chunk)
+                    torch.cuda.empty_cache()
+                    segments = self._infer_chunked(audio_data, sr, prompt, new_chunk)
+                    return _normalize_segments(segments)
+                else:
+                    log.error("OOM: skipping (audio too large for available VRAM)")
+                    torch.cuda.empty_cache()
+                    return None
+            raise
 
     def _infer(self, audio_data, sr: int, prompt: str):
         """Single-pass inference. Returns raw VibeVoice segments."""
@@ -282,7 +323,7 @@ def _move_tensor(v, device):
     return v.to(device)
 
 
-def _load_audio(wav_path: str, target_sr: int = 24000):
+def load_audio(wav_path: str, target_sr: int = 24000):
     """Load audio as numpy array at target sample rate using soundfile.
 
     Returns (audio_array, sample_rate).
