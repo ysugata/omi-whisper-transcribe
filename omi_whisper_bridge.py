@@ -162,6 +162,7 @@ from training_sanitizer import TrainingSanitizer
 from responses_sanitizer import ResponsesSanitizer
 from segment_screener import SegmentScreener
 from suggestion_learner import SuggestionLearner
+from keyword_learner import KeywordLearner
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -236,6 +237,12 @@ if TAGGING_ENABLED and LLM_API_KEY:
         prefilter_enabled=DOMAIN_PREFILTER_ENABLED,
         prefilter_min_matches=DOMAIN_PREFILTER_MIN_MATCHES,
     )
+
+keyword_learner = KeywordLearner(
+    taxonomy_path=TAG_TAXONOMY_PATH,
+    suggestions_path=os.path.join(CONFIG_DIR, "pending_keyword_suggestions.json"),
+    recordings_dir=RECORDINGS_DIR,
+)
 
 from audio_scene_classifier import AudioSceneClassifier
 from vibevoice_transcriber import VibeVoiceTranscriber, load_audio as vv_load_audio
@@ -3132,6 +3139,21 @@ async def main():
             session_tagger.reload_taxonomy()
         return web.json_response({"status": "ok"})
 
+    # --- Keyword learning API ---
+
+    async def handle_keyword_learn(request):
+        """POST /keywords/learn — extract keyword candidates from a tag correction."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        date = body.get("date", "")
+        time_str = body.get("time", "")
+        old_domains = body.get("old_domains", [])
+        new_domains = body.get("new_domains", [])
+        result = keyword_learner.learn_from_correction(date, time_str, old_domains, new_domains)
+        return web.json_response(result)
+
     # --- Session Tagging バッチ API ---
 
     async def handle_session_tag_start(request):
@@ -3583,6 +3605,8 @@ async def main():
     mgmt_app.router.add_post("/user-tags/reload", handle_user_tags_reload)
     # Taxonomy reload
     mgmt_app.router.add_post("/taxonomy/reload", handle_taxonomy_reload)
+    # Keyword learning
+    mgmt_app.router.add_post("/keywords/learn", handle_keyword_learn)
     # Session tagging batch API
     mgmt_app.router.add_post("/session-tags/start", handle_session_tag_start)
     mgmt_app.router.add_get("/session-tags/status", handle_session_tag_status)

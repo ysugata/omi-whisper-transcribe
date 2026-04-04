@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-
+from datetime import datetime
 
 from pathlib import Path
 
@@ -775,6 +775,197 @@ async def _notify_bridge_taxonomy_reload(request: web.Request) -> None:
 
 
 # ============================================================
+# Session Tag 修正 API + Keyword Suggestion API
+# ============================================================
+
+_PENDING_KW_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_keyword_suggestions.json"
+
+
+async def handle_put_session_tags(request: web.Request) -> web.Response:
+    """PUT /api/sessions/{date}/{time}/session-tags — update V2 session tags (partial)."""
+    date = request.match_info["date"]
+    time = request.match_info["time"]
+    body = await request.json()
+
+    # Load taxonomy for validation
+    taxonomy = _read_json(_TAG_TAXONOMY_PATH, None)
+    if not taxonomy:
+        return web.json_response({"error": "taxonomy not loaded"}, status=500)
+
+    valid_conv = set(taxonomy.get("conversation_type", []))
+    valid_outcomes = set(taxonomy.get("outcomes", []))
+    valid_domains = set(taxonomy.get("domains", []))
+    valid_importance = set(taxonomy.get("importance", []))
+
+    conv_type = body.get("conversation_type")
+    outcomes = body.get("outcomes", [])
+    domains = body.get("domains", [])
+    importance = body.get("importance")
+
+    if conv_type and conv_type not in valid_conv:
+        return web.json_response({"error": f"invalid conversation_type: {conv_type}"}, status=400)
+    for o in outcomes:
+        if o not in valid_outcomes:
+            return web.json_response({"error": f"invalid outcome: {o}"}, status=400)
+    for d in domains:
+        if d not in valid_domains:
+            return web.json_response({"error": f"invalid domain: {d}"}, status=400)
+    if importance and importance not in valid_importance:
+        return web.json_response({"error": f"invalid importance: {importance}"}, status=400)
+
+    transcript_path = Path(RECORDINGS_DIR) / date / time / "transcript.json"
+    if not transcript_path.exists():
+        return web.json_response({"error": "session not found"}, status=404)
+
+    try:
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return web.json_response({"error": "transcript read error"}, status=500)
+
+    session = data.setdefault("session", {})
+    tags = session.setdefault("tags", {})
+
+    # Remember old domains for keyword learning
+    old_domains = list(tags.get("domains", []))
+
+    # Partial update: only provided fields
+    if conv_type is not None:
+        tags["conversation_type"] = conv_type
+    if outcomes:
+        tags["outcomes"] = outcomes
+    if domains:
+        tags["domains"] = domains
+    if importance is not None:
+        tags["importance"] = importance
+
+    tags["manually_corrected"] = True
+    tags["corrected_at"] = datetime.now().isoformat(timespec="seconds")
+
+    transcript_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Re-index
+    indexer: Indexer = request.app["indexer"]
+    try:
+        info = indexer._parse_transcript(date, time)
+        info["last_modified"] = transcript_path.stat().st_mtime
+        await indexer._db.execute(
+            """INSERT OR REPLACE INTO sessions
+               (date, time, start_at, end_at, duration_seconds,
+                audio_size_mb, model, language, transcript_text, segment_count,
+                tags_topics, tags_activity, tags_intent, tags_mood,
+                tags_quality, tags_entities, tags_summary, session_tagged,
+                tags_user, speakers, last_modified,
+                tags_source_type, tags_business_domain, tags_importance,
+                tags_confidentiality, tags_decision_required,
+                tags_decision_summary, tags_action_items, tags_outcome,
+                tags_conversation_type, tags_outcomes, tags_domains,
+                tags_decision_memo, tags_importance_v2, tags_version,
+                tags_external_audio,
+                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence)
+               VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
+                       :audio_size_mb, :model, :language, :transcript_text, :segment_count,
+                       :tags_topics, :tags_activity, :tags_intent, :tags_mood,
+                       :tags_quality, :tags_entities, :tags_summary, :session_tagged,
+                       :tags_user, :speakers, :last_modified,
+                       :tags_source_type, :tags_business_domain, :tags_importance,
+                       :tags_confidentiality, :tags_decision_required,
+                       :tags_decision_summary, :tags_action_items, :tags_outcome,
+                       :tags_conversation_type, :tags_outcomes, :tags_domains,
+                       :tags_decision_memo, :tags_importance_v2, :tags_version,
+                       :tags_external_audio,
+                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence)""",
+            info,
+        )
+        await indexer._db.commit()
+    except Exception as e:
+        logger.warning(f"Re-index after session-tags update failed: {e}")
+
+    # Notify Bridge for keyword learning if domains changed
+    new_domains = list(tags.get("domains", []))
+    if set(new_domains) != set(old_domains) and BRIDGE_MGMT_URL:
+        try:
+            session_obj: aiohttp.ClientSession = request.app["bridge_session"]
+            timeout = aiohttp.ClientTimeout(total=5)
+            await session_obj.post(
+                f"{BRIDGE_MGMT_URL}/keywords/learn",
+                json={
+                    "date": date,
+                    "time": time,
+                    "old_domains": old_domains,
+                    "new_domains": new_domains,
+                },
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.debug(f"Keyword learn notification failed: {e}")
+
+    return web.json_response({"status": "ok", "tags": tags})
+
+
+async def handle_get_keyword_suggestions(request: web.Request) -> web.Response:
+    """GET /api/keyword-suggestions — list pending keyword suggestions."""
+    suggestions = _read_json(_PENDING_KW_SUGGESTIONS_PATH, [])
+    pending = [s for s in suggestions if s.get("status") == "pending"]
+    pending.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
+    return web.json_response({"suggestions": pending})
+
+
+async def handle_approve_keyword_suggestion(request: web.Request) -> web.Response:
+    """POST /api/keyword-suggestions/{id}/approve — approve and add to keyword_anchors."""
+    suggestion_id = request.match_info["id"]
+    suggestions = _read_json(_PENDING_KW_SUGGESTIONS_PATH, [])
+
+    target = None
+    for s in suggestions:
+        if s.get("id") == suggestion_id:
+            target = s
+            break
+    if not target:
+        return web.json_response({"error": "suggestion not found"}, status=404)
+
+    target["status"] = "approved"
+    target["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    # Add to keyword_anchors in taxonomy
+    taxonomy = _read_json(_TAG_TAXONOMY_PATH, {})
+    anchors = taxonomy.setdefault("keyword_anchors", {})
+    domain_kws = anchors.setdefault(target["domain"], [])
+    if target["keyword"] not in domain_kws:
+        domain_kws.append(target["keyword"])
+    _write_json(_TAG_TAXONOMY_PATH, taxonomy)
+
+    # Save suggestions
+    _write_json(_PENDING_KW_SUGGESTIONS_PATH, suggestions)
+
+    # Notify Bridge to reload taxonomy
+    await _notify_bridge_taxonomy_reload(request)
+
+    return web.json_response({"status": "ok", "suggestion": target})
+
+
+async def handle_reject_keyword_suggestion(request: web.Request) -> web.Response:
+    """POST /api/keyword-suggestions/{id}/reject — reject a keyword suggestion."""
+    suggestion_id = request.match_info["id"]
+    suggestions = _read_json(_PENDING_KW_SUGGESTIONS_PATH, [])
+
+    target = None
+    for s in suggestions:
+        if s.get("id") == suggestion_id:
+            target = s
+            break
+    if not target:
+        return web.json_response({"error": "suggestion not found"}, status=404)
+
+    target["status"] = "rejected"
+    target["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_json(_PENDING_KW_SUGGESTIONS_PATH, suggestions)
+
+    return web.json_response({"status": "ok", "suggestion": target})
+
+
+# ============================================================
 # Combined Tag プロキシ API (Voice Tag → Session Tag)
 # ============================================================
 
@@ -1158,6 +1349,12 @@ def create_app() -> web.Application:
     # Tag taxonomy API
     app.router.add_get("/api/tag-taxonomy", handle_get_tag_taxonomy)
     app.router.add_put("/api/tag-taxonomy", handle_put_tag_taxonomy)
+
+    # Session tag correction + keyword suggestion API
+    app.router.add_put("/api/sessions/{date}/{time}/session-tags", handle_put_session_tags)
+    app.router.add_get("/api/keyword-suggestions", handle_get_keyword_suggestions)
+    app.router.add_post("/api/keyword-suggestions/{id}/approve", handle_approve_keyword_suggestion)
+    app.router.add_post("/api/keyword-suggestions/{id}/reject", handle_reject_keyword_suggestion)
 
     # Combined tag プロキシ API (Voice Tag → Session Tag)
     app.router.add_post("/api/tags/start", handle_combined_tag_start)

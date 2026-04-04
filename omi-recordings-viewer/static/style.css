@@ -1327,6 +1327,24 @@ main {
            background: var(--bg-secondary, var(--surface2)); padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
 .kw-chip-del { cursor: pointer; color: var(--text-dim); font-size: 0.65rem; }
 .kw-chip-del:hover { color: #e74c3c; }
+.kw-suggestions-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.kw-suggestion { border: 1px dashed var(--accent-dim); }
+.kw-approve-btn { cursor: pointer; color: #2ecc71; font-size: 0.75rem; font-weight: bold; }
+.kw-approve-btn:hover { color: #27ae60; }
+.kw-reject-btn { cursor: pointer; color: var(--text-dim); font-size: 0.75rem; font-weight: bold; }
+.kw-reject-btn:hover { color: #e74c3c; }
+
+/* Tag Editor (detail view) */
+.tag-editor { background: var(--surface2); border-radius: 8px; padding: 12px; margin: 8px 0; }
+.tag-editor-row { margin-bottom: 8px; }
+.tag-editor-row label { display: block; font-size: 0.8rem; color: var(--text-dim); margin-bottom: 2px; }
+.tag-editor-row select { padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+                          background: var(--bg-primary); color: var(--text); font-size: 0.8rem; }
+.te-checks { display: flex; flex-wrap: wrap; gap: 6px; }
+.te-check { font-size: 0.8rem; display: inline-flex; align-items: center; gap: 2px; }
+.te-check input { margin: 0; }
+.tag-editor-actions { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+.tag-edit-btn { vertical-align: middle; margin-left: 4px; }
 .kw-add-row { display: flex; gap: 4px; }
 .kw-add-row input { flex: 1; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
                      background: var(--surface2); color: var(--text); font-size: 0.8rem; }

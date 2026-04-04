@@ -162,6 +162,7 @@ open http://localhost:8092
 | GET | `/session-tags/status` | タグ付け進捗を返す |
 | POST | `/session-tags/cancel` | タグ付けをキャンセル |
 | POST | `/taxonomy/reload` | タクソノミー定義を再読み込み |
+| POST | `/keywords/learn` | タグ修正からキーワード候補を抽出 |
 
 ### 一括タグ付け (セッション + 話者)
 
@@ -300,6 +301,8 @@ open http://localhost:8092
 タクソノミー (分類軸の項目) は `config/tag_taxonomy.json` で定義し、Viewer の Settings > Taxonomy タブから編集可能です。`domain_descriptions` でドメインごとの説明文を定義すると、LLM プロンプトに説明付きで提示され分類精度が向上します。さらに `keyword_anchors` で各ドメインに関連キーワードのリストを定義すると、LLM がキーワードレベルでドメインの境界を判断でき、分類精度がさらに向上します。`keyword_anchors` は Viewer の Taxonomy タブ内のキーワードエディタからも追加・削除できます。
 
 **ドメイン事前フィルタ**: LLM コール前にセッションテキストを `keyword_anchors` で走査し、ヒットしたキーワード数に基づいて候補ドメインを特定します。候補一覧をユーザーメッセージに注入することで LLM のラベル空間を縮小し、分類精度を向上させます。候補外のドメインも正当な理由があれば LLM が選択可能です。
+
+**Correction-driven Learning**: Viewer でセッションのドメインタグを手動修正すると、そのセッションの文字起こしテキストと entities から新しいキーワード候補を自動抽出し `config/pending_keyword_suggestions.json` に蓄積します。同じキーワードが複数セッションで検出されると occurrences がインクリメントされます。候補は Settings > Taxonomy の「キーワード候補」セクションで一覧表示され、承認すると `keyword_anchors` に即座に追加、拒否すると非表示になります。
 
 Voice タグ (話者識別) が利用可能な場合、各セグメントの話者情報 (自分/登録者/unknown) を LLM プロンプトに含めて分類精度を向上させます。また、unknown 話者比率 (`external_audio_ratio`) を自動計算し、80% 以上のセッションには「TV/外部音声」バッジを表示し、ドメイン分類を空配列に強制します (TV/ラジオの事業キーワード誤タグ防止)。
 
@@ -847,6 +850,7 @@ omi_whisper_transcribe/
 ├── suggestion_learner.py     # LLM 提案からの自動学習パターン抽出
 ├── correction_metrics.py     # スクリーニング統計メトリクス
 ├── session_tagger.py         # Gemini によるセッションタグ付け
+├── keyword_learner.py        # タグ修正ドリブンのキーワード候補学習
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
 ├── responses_sanitizer.py    # OpenAI Responses API 匿名化 (2-step pipeline)

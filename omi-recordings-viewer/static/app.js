@@ -327,8 +327,14 @@
                     tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.entities[tei]) + '</span>';
                 }
             }
+            if (isV2Detail) {
+                tagsHtml += ' <button class="btn-sm tag-edit-btn" id="tag-edit-trigger">&#9998; 編集</button>';
+            }
             tagsHtml += '</div>';
             detailHeader.innerHTML += tagsHtml;
+            if (isV2Detail) {
+                detailHeader.innerHTML += '<div id="tag-editor-container" style="display:none"></div>';
+            }
             if (tags.summary) {
                 detailHeader.innerHTML += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
             }
@@ -337,6 +343,13 @@
             }
             if (isV2Detail && tags.external_audio_ratio != null && tags.external_audio_ratio >= 0.5) {
                 detailHeader.innerHTML += '<div class="detail-external-audio">&#128250; 外部音声比率: ' + Math.round(tags.external_audio_ratio * 100) + '% (unknown speaker)</div>';
+            }
+            // Wire up tag edit button
+            var editBtn = document.getElementById("tag-edit-trigger");
+            if (editBtn) {
+                editBtn.addEventListener("click", function () {
+                    showTagEditor(s.date, s.time, tags);
+                });
             }
         }
 
@@ -2298,6 +2311,7 @@
             if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
             if (taxonomyEditorEl) taxonomyEditorEl.classList.remove("hidden");
             renderTaxonomySettings();
+            renderKeywordSuggestions();
         }).catch(function (err) {
             if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
             if (taxonomyErrorEl) {
@@ -2350,6 +2364,146 @@
             }
         });
         renderKeywordAnchors();
+    }
+
+    // --- Tag Editor (detail view) ---
+    function showTagEditor(date, time, currentTags) {
+        var container = document.getElementById("tag-editor-container");
+        if (!container) return;
+        if (container.style.display !== "none") {
+            container.style.display = "none";
+            return;
+        }
+        if (!taxonomyCache) { container.innerHTML = '<p class="text-dim">Taxonomy not loaded</p>'; container.style.display = "block"; return; }
+
+        var html = '<div class="tag-editor">';
+        // conversation_type select
+        html += '<div class="tag-editor-row"><label>会話の種類</label><select id="te-conv-type">';
+        (taxonomyCache.conversation_type || []).forEach(function (v) {
+            html += '<option value="' + escapeHtml(v) + '"' + (currentTags.conversation_type === v ? ' selected' : '') + '>' + escapeHtml(v) + '</option>';
+        });
+        html += '</select></div>';
+        // outcomes checkboxes
+        html += '<div class="tag-editor-row"><label>成果物</label><div class="te-checks">';
+        var curOutcomes = currentTags.outcomes || [];
+        (taxonomyCache.outcomes || []).forEach(function (v) {
+            var checked = curOutcomes.indexOf(v) !== -1 ? ' checked' : '';
+            html += '<label class="te-check"><input type="checkbox" value="' + escapeHtml(v) + '"' + checked + ' class="te-outcome-cb"> ' + escapeHtml(v) + '</label>';
+        });
+        html += '</div></div>';
+        // domains checkboxes
+        html += '<div class="tag-editor-row"><label>事業領域</label><div class="te-checks">';
+        var curDomains = currentTags.domains || [];
+        (taxonomyCache.domains || []).forEach(function (v) {
+            var checked = curDomains.indexOf(v) !== -1 ? ' checked' : '';
+            html += '<label class="te-check"><input type="checkbox" value="' + escapeHtml(v) + '"' + checked + ' class="te-domain-cb"> ' + escapeHtml(v) + '</label>';
+        });
+        html += '</div></div>';
+        // importance select
+        html += '<div class="tag-editor-row"><label>重要度</label><select id="te-importance">';
+        (taxonomyCache.importance || []).forEach(function (v) {
+            html += '<option value="' + escapeHtml(v) + '"' + (currentTags.importance === v ? ' selected' : '') + '>' + escapeHtml(v) + '</option>';
+        });
+        html += '</select></div>';
+        html += '<div class="tag-editor-actions"><button class="btn-primary" id="te-save">保存</button> <button class="btn-sm" id="te-cancel">キャンセル</button> <span id="te-status"></span></div>';
+        html += '</div>';
+        container.innerHTML = html;
+        container.style.display = "block";
+
+        document.getElementById("te-cancel").addEventListener("click", function () {
+            container.style.display = "none";
+        });
+        document.getElementById("te-save").addEventListener("click", function () {
+            var convType = document.getElementById("te-conv-type").value;
+            var importance = document.getElementById("te-importance").value;
+            var outcomes = [];
+            var outCbs = container.querySelectorAll(".te-outcome-cb:checked");
+            for (var i = 0; i < outCbs.length; i++) outcomes.push(outCbs[i].value);
+            var domains = [];
+            var domCbs = container.querySelectorAll(".te-domain-cb:checked");
+            for (var j = 0; j < domCbs.length; j++) domains.push(domCbs[j].value);
+
+            var statusEl = document.getElementById("te-status");
+            statusEl.textContent = "Saving...";
+            fetch("/api/sessions/" + encodeURIComponent(date) + "/" + encodeURIComponent(time) + "/session-tags", {
+                method: "PUT",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({conversation_type: convType, outcomes: outcomes, domains: domains, importance: importance}),
+            }).then(function (r) { return r.json(); }).then(function (data) {
+                if (data.error) { statusEl.textContent = "Error: " + data.error; statusEl.style.color = "#e74c3c"; return; }
+                statusEl.textContent = "Saved!";
+                statusEl.style.color = "#2ecc71";
+                // Refresh detail view
+                setTimeout(function () {
+                    container.style.display = "none";
+                    loadPage(currentPage);
+                    showDetail(date, time);
+                }, 500);
+            }).catch(function (err) {
+                statusEl.textContent = "Error: " + err.message;
+                statusEl.style.color = "#e74c3c";
+            });
+        });
+    }
+
+    // --- Keyword Suggestions (Settings > Taxonomy) ---
+    function renderKeywordSuggestions() {
+        var container = document.getElementById("keyword-suggestions-list");
+        var countEl = document.getElementById("keyword-suggestions-count");
+        if (!container) return;
+        fetch("/api/keyword-suggestions").then(function (r) { return r.json(); }).then(function (data) {
+            var suggestions = data.suggestions || [];
+            if (countEl) countEl.textContent = suggestions.length;
+            if (suggestions.length === 0) {
+                container.innerHTML = '<div class="text-dim">候補なし</div>';
+                return;
+            }
+            // Group by domain
+            var groups = {};
+            suggestions.forEach(function (s) {
+                if (!groups[s.domain]) groups[s.domain] = [];
+                groups[s.domain].push(s);
+            });
+            var html = '';
+            Object.keys(groups).forEach(function (domain) {
+                html += '<div class="kw-domain-group">';
+                html += '<div class="kw-domain-name">' + escapeHtml(domain) + '</div>';
+                html += '<div class="kw-suggestions-chips">';
+                groups[domain].forEach(function (s) {
+                    html += '<span class="kw-chip kw-suggestion" data-id="' + escapeHtml(s.id) + '">';
+                    html += escapeHtml(s.keyword);
+                    html += ' <span class="badge">' + s.occurrences + '</span>';
+                    html += ' <span class="kw-approve-btn" data-id="' + escapeHtml(s.id) + '" title="承認">&#10003;</span>';
+                    html += ' <span class="kw-reject-btn" data-id="' + escapeHtml(s.id) + '" title="拒否">&times;</span>';
+                    html += '</span>';
+                });
+                html += '</div></div>';
+            });
+            container.innerHTML = html;
+
+            // Approve handlers
+            var approveBtns = container.querySelectorAll(".kw-approve-btn");
+            for (var i = 0; i < approveBtns.length; i++) {
+                approveBtns[i].addEventListener("click", function () {
+                    var id = this.getAttribute("data-id");
+                    fetch("/api/keyword-suggestions/" + encodeURIComponent(id) + "/approve", {method: "POST"})
+                        .then(function (r) { return r.json(); })
+                        .then(function () { renderKeywordSuggestions(); renderKeywordAnchors(); });
+                });
+            }
+            // Reject handlers
+            var rejectBtns = container.querySelectorAll(".kw-reject-btn");
+            for (var j = 0; j < rejectBtns.length; j++) {
+                rejectBtns[j].addEventListener("click", function () {
+                    var id = this.getAttribute("data-id");
+                    fetch("/api/keyword-suggestions/" + encodeURIComponent(id) + "/reject", {method: "POST"})
+                        .then(function (r) { return r.json(); })
+                        .then(function () { renderKeywordSuggestions(); });
+                });
+            }
+        }).catch(function () {
+            container.innerHTML = '<div class="text-dim">読み込みエラー</div>';
+        });
     }
 
     function renderKeywordAnchors() {
