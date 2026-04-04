@@ -192,6 +192,50 @@ def test_speaker_stats_no_voice_tags(mock_openai):
     assert result["external_audio_ratio"] is None
 
 
+def test_external_audio_domains_forced_empty(mock_openai):
+    """Domains should be forced empty when external_audio_ratio >= 0.8."""
+    response = json.dumps({
+        "conversation_type": "その他",
+        "outcomes": ["情報共有のみ"],
+        "domains": ["経営", "物販"],
+        "entities": [],
+        "summary": "TV audio about business",
+        "decision_memo": None,
+        "quality": "noisy",
+        "importance": "低",
+    })
+    tagger = _make_tagger(mock_openai, response)
+    # 9 unknown + 1 user = 90% unknown
+    segments = [{"start": i, "end": i+1, "text": f"Segment {i}", "person_name": "unknown"} for i in range(9)]
+    segments.append({"start": 9, "end": 10, "text": "My comment", "person_name": "Taro", "is_user": True})
+    result = tagger.tag_session(segments)
+    assert result is not None
+    assert result["domains"] == []
+    assert result["external_audio_ratio"] == 0.9
+
+
+def test_external_audio_domains_kept_below_threshold(mock_openai):
+    """Domains should be preserved when unknown ratio < 0.8."""
+    response = json.dumps({
+        "conversation_type": "商談",
+        "outcomes": ["意思決定あり"],
+        "domains": ["水中超音波"],
+        "entities": [],
+        "summary": "Business meeting",
+        "decision_memo": None,
+        "quality": "clean",
+        "importance": "高",
+    })
+    tagger = _make_tagger(mock_openai, response)
+    # 3 unknown + 7 user = 30% unknown
+    segments = [{"start": i, "end": i+1, "text": f"Segment {i}", "person_name": "unknown"} for i in range(3)]
+    segments += [{"start": i, "end": i+1, "text": f"My seg {i}", "person_name": "Taro", "is_user": True} for i in range(3, 10)]
+    result = tagger.tag_session(segments)
+    assert result is not None
+    assert result["domains"] == ["水中超音波"]
+    assert result["external_audio_ratio"] == 0.3
+
+
 def test_input_with_speaker_preamble():
     """Speaker preamble should warn about external audio when ratio >= 80%."""
     from session_tagger import SessionTagger
@@ -514,6 +558,42 @@ def test_build_system_prompt_includes_taxonomy():
     assert "conversation_type" in prompt
 
 
+def test_build_system_prompt_with_domain_descriptions():
+    """System prompt should include domain descriptions when available."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    taxonomy = dict(_DEFAULT_TAXONOMY)
+    taxonomy["domain_descriptions"] = {
+        "水中超音波": "水中超音波技術の研究開発・製品化",
+        "物販": "物販ビジネスの仕入れ・販売・在庫管理",
+        "経営": "特定事業に属さない全社横断の意思決定・財務・組織",
+    }
+    tagger._taxonomy = taxonomy
+    prompt = tagger._build_system_prompt()
+    # Descriptions should appear alongside domain names
+    assert '"水中超音波": 水中超音波技術の研究開発・製品化' in prompt
+    assert '"物販": 物販ビジネスの仕入れ・販売・在庫管理' in prompt
+    assert '"経営": 特定事業に属さない全社横断の意思決定・財務・組織' in prompt
+    # Domains without descriptions should appear name-only
+    assert '"SNS集客"' in prompt
+
+
+def test_build_system_prompt_without_domain_descriptions():
+    """System prompt should use comma-separated list when no descriptions."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
+    prompt = tagger._build_system_prompt()
+    # Without descriptions, should be comma-separated format
+    assert '"水中超音波", "物販"' in prompt
+
+
 def test_build_system_prompt_with_user_tags():
     """System prompt should include user tag definitions."""
     tagger = SessionTagger.__new__(SessionTagger)
@@ -594,3 +674,23 @@ def test_validate_and_save_tags_invalid_json(mock_openai):
     tagger = _make_tagger(mock_openai, VALID_RESPONSE)
     result = tagger.validate_and_save_tags("not json")
     assert result is None
+
+
+def test_validate_and_save_tags_external_audio_domains_cleared(mock_openai):
+    """validate_and_save_tags should clear domains for external audio sessions."""
+    response_with_domains = json.dumps({
+        "conversation_type": "その他",
+        "outcomes": ["情報共有のみ"],
+        "domains": ["経営"],
+        "entities": [],
+        "summary": "TV audio",
+        "decision_memo": None,
+        "quality": "noisy",
+        "importance": "低",
+    })
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE)
+    segments = [{"start": i, "end": i+1, "text": f"Seg {i}", "person_name": "unknown"} for i in range(10)]
+    result = tagger.validate_and_save_tags(response_with_domains, segments=segments)
+    assert result is not None
+    assert result["domains"] == []
+    assert result["external_audio_ratio"] == 1.0

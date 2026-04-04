@@ -84,10 +84,16 @@ SYSTEM_PROMPT_TEMPLATE = """あなたは音声文字起こしテキストの分�
 {domains_list}
 
 #### domains 選択ルール:
+- 録音者自身の事業活動に関連する話題のみ選択する
+- TV・ラジオ・店舗BGM等の外部音声は、たまたま事業キーワードが含まれていてもドメインに含めない
+- unknown話者が大半の場合、外部メディアの音声である可能性が高いため、ドメイン選択は慎重に（確信がなければ空配列）
+- 文字起こし品質が低い（noisy/fragmented）場合も、キーワードだけでドメインを推定しない
+- 短い発話（3セグメント以下）で文脈が不十分な場合、ドメインは空配列を推奨
 - 「経営」: 特定事業に属さない全社横断の意思決定・財務・組織の話題のみ
 - 「AI」: AI技術そのものが主題の話題のみ。既存事業のAI活用は事業ラインを選択
 - 「個人」: 業務外の個人的な話題（家族、健康、趣味等）
 - 複数事業にまたがる場合は該当する全事業を選択（最大3つ）
+- 該当するドメインがない場合は空配列 [] を返す
 
 ### entities
 テキスト中に登場する固有名詞 (人名、地名、サービス名、技術名など) をそのまま抽出。なければ空配列。
@@ -202,10 +208,25 @@ class SessionTagger:
     def _build_system_prompt(self) -> str:
         """Build the system prompt with taxonomy values injected."""
         t = self._taxonomy
+        # Build domains list with descriptions if available
+        descriptions = t.get("domain_descriptions", {})
+        domains = t.get("domains", [])
+        if descriptions:
+            domain_lines = []
+            for d in domains:
+                desc = descriptions.get(d, "")
+                if desc:
+                    domain_lines.append(f'- "{d}": {desc}')
+                else:
+                    domain_lines.append(f'- "{d}"')
+            domains_list = "\n".join(domain_lines)
+        else:
+            domains_list = ", ".join(f'"{v}"' for v in domains)
+
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             conversation_type_list=", ".join(f'"{v}"' for v in t.get("conversation_type", [])),
             outcomes_list=", ".join(f'"{v}"' for v in t.get("outcomes", [])),
-            domains_list=", ".join(f'"{v}"' for v in t.get("domains", [])),
+            domains_list=domains_list,
             importance_list=", ".join(f'"{v}"' for v in t.get("importance", ["高", "中", "低"])),
         )
         if self._user_tags:
@@ -424,6 +445,9 @@ class SessionTagger:
             stats = self._compute_speaker_stats(segments)
             if stats["has_voice_tags"]:
                 tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
+                # Force empty domains for external audio sessions
+                if stats["unknown_ratio"] >= 0.8:
+                    tags["domains"] = []
             else:
                 tags["external_audio_ratio"] = None
 
@@ -467,6 +491,9 @@ class SessionTagger:
             stats = self._compute_speaker_stats(segments)
             if stats["has_voice_tags"]:
                 tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
+                # Force empty domains for external audio sessions
+                if stats["unknown_ratio"] >= 0.8:
+                    tags["domains"] = []
             else:
                 tags["external_audio_ratio"] = None
         else:
