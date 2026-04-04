@@ -1319,6 +1319,19 @@ main {
 .taxonomy-actions { margin-top: 16px; display: flex; gap: 8px; align-items: center; }
 .btn-xs { font-size: 0.65rem; padding: 1px 6px; }
 
+/* Keyword anchors editor */
+.kw-domain-group { margin-bottom: 12px; }
+.kw-domain-name { font-size: 0.8rem; font-weight: 600; margin-bottom: 4px; }
+.kw-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.kw-chip { display: inline-flex; align-items: center; gap: 2px;
+           background: var(--bg-secondary, var(--surface2)); padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
+.kw-chip-del { cursor: pointer; color: var(--text-dim); font-size: 0.65rem; }
+.kw-chip-del:hover { color: #e74c3c; }
+.kw-add-row { display: flex; gap: 4px; }
+.kw-add-row input { flex: 1; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+                     background: var(--surface2); color: var(--text); font-size: 0.8rem; }
+.kw-add-row input:focus { outline: none; border-color: var(--accent); }
+
 /* User Tags */
 .user-tag-add-row {
     display: flex;

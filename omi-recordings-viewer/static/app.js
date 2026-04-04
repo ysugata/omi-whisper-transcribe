@@ -2338,10 +2338,92 @@
                     var ak = this.getAttribute("data-axis");
                     var ai = parseInt(this.getAttribute("data-idx"), 10);
                     taxonomyEditCache[ak].splice(ai, 1);
+                    // If a domain was removed, also remove its keyword_anchors entry
+                    if (ak === "domains" && taxonomyEditCache.keyword_anchors) {
+                        var removedDomain = Object.keys(taxonomyEditCache.keyword_anchors).filter(function (d) {
+                            return (taxonomyEditCache.domains || []).indexOf(d) === -1;
+                        });
+                        removedDomain.forEach(function (d) { delete taxonomyEditCache.keyword_anchors[d]; });
+                    }
                     renderTaxonomySettings();
                 });
             }
         });
+        renderKeywordAnchors();
+    }
+
+    function renderKeywordAnchors() {
+        var container = document.getElementById("taxonomy-keywords-editor");
+        if (!container || !taxonomyEditCache) return;
+        var domains = taxonomyEditCache.domains || [];
+        if (!taxonomyEditCache.keyword_anchors) taxonomyEditCache.keyword_anchors = {};
+        var anchors = taxonomyEditCache.keyword_anchors;
+        if (domains.length === 0) {
+            container.innerHTML = '<div class="text-dim">事業領域が未登録です</div>';
+            return;
+        }
+        var html = "";
+        domains.forEach(function (domain) {
+            var kws = anchors[domain] || [];
+            html += '<div class="kw-domain-group">';
+            html += '<div class="kw-domain-name">' + escapeHtml(domain) + '</div>';
+            html += '<div class="kw-chips">';
+            kws.forEach(function (kw, ki) {
+                html += '<span class="kw-chip">' + escapeHtml(kw);
+                html += ' <span class="kw-chip-del" data-domain="' + escapeHtml(domain) + '" data-idx="' + ki + '">&times;</span>';
+                html += '</span>';
+            });
+            html += '</div>';
+            html += '<div class="kw-add-row">';
+            html += '<input type="text" class="kw-add-input" data-domain="' + escapeHtml(domain) + '" placeholder="キーワードを追加">';
+            html += '<button class="btn-sm kw-add-btn" data-domain="' + escapeHtml(domain) + '">Add</button>';
+            html += '</div>';
+            html += '</div>';
+        });
+        container.innerHTML = html;
+
+        // Delete handlers
+        var delBtns = container.querySelectorAll(".kw-chip-del");
+        for (var i = 0; i < delBtns.length; i++) {
+            delBtns[i].addEventListener("click", function () {
+                var d = this.getAttribute("data-domain");
+                var idx = parseInt(this.getAttribute("data-idx"), 10);
+                if (taxonomyEditCache.keyword_anchors[d]) {
+                    taxonomyEditCache.keyword_anchors[d].splice(idx, 1);
+                }
+                renderKeywordAnchors();
+            });
+        }
+
+        // Add handlers
+        var addBtns = container.querySelectorAll(".kw-add-btn");
+        for (var j = 0; j < addBtns.length; j++) {
+            addBtns[j].addEventListener("click", function () {
+                var d = this.getAttribute("data-domain");
+                var input = container.querySelector('.kw-add-input[data-domain="' + d + '"]');
+                if (!input) return;
+                var val = input.value.trim();
+                if (!val) return;
+                if (!taxonomyEditCache.keyword_anchors[d]) taxonomyEditCache.keyword_anchors[d] = [];
+                if (taxonomyEditCache.keyword_anchors[d].indexOf(val) === -1) {
+                    taxonomyEditCache.keyword_anchors[d].push(val);
+                }
+                input.value = "";
+                renderKeywordAnchors();
+            });
+        }
+
+        // Enter key support for add inputs
+        var addInputs = container.querySelectorAll(".kw-add-input");
+        for (var k = 0; k < addInputs.length; k++) {
+            addInputs[k].addEventListener("keydown", function (e) {
+                if (e.key === "Enter") {
+                    var d = this.getAttribute("data-domain");
+                    var btn = container.querySelector('.kw-add-btn[data-domain="' + d + '"]');
+                    if (btn) btn.click();
+                }
+            });
+        }
     }
 
     // Add buttons
