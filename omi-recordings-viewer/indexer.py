@@ -216,7 +216,7 @@ class Indexer:
         tags = session.get("tags", {})
         tags_topics = ",".join(tags.get("topics", [])) if tags.get("topics") else None
         tags_entities = ",".join(tags.get("entities", [])) if tags.get("entities") else None
-        tags_user = ",".join(tags.get("user_tags", [])) if tags.get("user_tags") else None
+        tags_user = None  # user_tags feature removed
 
         # Extract unique speaker names from segments
         speaker_names = set()
@@ -368,7 +368,7 @@ class Indexer:
 
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
-        activity: str = "", mood: str = "", user_tag: str = "",
+        activity: str = "", mood: str = "",
         speaker: str = "", business_domain: str = "",
         importance: str = "", source_type: str = "",
         conversation_type: str = "", outcome: str = "",
@@ -424,11 +424,6 @@ class Indexer:
         if importance_v2:
             where_clauses.append("tags_importance_v2 = ?")
             params.append(importance_v2)
-
-        if user_tag:
-            where_clauses.append("(tags_user LIKE ? OR tags_user = ?)")
-            params.append("%" + user_tag + "%")
-            params.append(user_tag)
 
         if speaker:
             where_clauses.append("(speakers LIKE ? OR speakers = ?)")

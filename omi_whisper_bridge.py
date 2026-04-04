@@ -223,7 +223,6 @@ if HF_AUTH_TOKEN:
     )
 
 # セッションタグ付け (LLM API キーがあれば利用可能)
-_USER_TAGS_PATH = os.path.join(CONFIG_DIR, "user_tags.json")
 TAG_TAXONOMY_PATH = os.path.join(CONFIG_DIR, "tag_taxonomy.json")
 
 session_tagger: SessionTagger | None = None
@@ -232,7 +231,6 @@ if TAGGING_ENABLED and LLM_API_KEY:
         api_key=LLM_API_KEY,
         base_url=LLM_BASE_URL,
         model=TAGGING_MODEL,
-        user_tags_path=_USER_TAGS_PATH,
         taxonomy_path=TAG_TAXONOMY_PATH,
         prefilter_enabled=DOMAIN_PREFILTER_ENABLED,
         prefilter_min_matches=DOMAIN_PREFILTER_MIN_MATCHES,
@@ -3125,13 +3123,6 @@ async def main():
         speaker_filter.delete_all()
         return web.json_response({"status": "ok"})
 
-    # --- User Tags reload API ---
-
-    async def handle_user_tags_reload(request):
-        if session_tagger is not None:
-            session_tagger.reload_user_tags()
-        return web.json_response({"status": "ok"})
-
     # --- Taxonomy reload API ---
 
     async def handle_taxonomy_reload(request):
@@ -3601,8 +3592,6 @@ async def main():
     mgmt_app.router.add_delete("/speakers/{id}", handle_speakers_delete)
     mgmt_app.router.add_post("/speakers/{id}/voiceprint", handle_speakers_add_voiceprint)
     mgmt_app.router.add_delete("/speakers/{id}/voiceprint/{sample_id}", handle_speakers_remove_voiceprint)
-    # User tags reload
-    mgmt_app.router.add_post("/user-tags/reload", handle_user_tags_reload)
     # Taxonomy reload
     mgmt_app.router.add_post("/taxonomy/reload", handle_taxonomy_reload)
     # Keyword learning

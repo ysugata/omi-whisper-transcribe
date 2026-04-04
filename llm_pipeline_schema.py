@@ -185,15 +185,11 @@ TAGGING_OBJECT_SCHEMA = {
             "enum": ["clean", "partial", "noisy", "fragmented"],
         },
         "importance": {"type": "string"},
-        "user_tags": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
     },
     "required": [
         "conversation_type", "outcomes", "domains",
         "entities", "summary", "decision_memo",
-        "quality", "importance", "user_tags",
+        "quality", "importance",
     ],
     "additionalProperties": False,
 }

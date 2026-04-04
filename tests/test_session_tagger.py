@@ -33,8 +33,6 @@ def _make_tagger(mock_openai, response_content, taxonomy=None):
     tagger._temperature = 0
     tagger._max_tokens = 768
     tagger._client = mock_client
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = taxonomy or dict(_DEFAULT_TAXONOMY)
     tagger._prefilter_enabled = True
@@ -145,8 +143,6 @@ def test_tag_session_disabled():
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = False
     tagger._client = None
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     result = tagger.tag_session(SEGMENTS)
@@ -380,8 +376,6 @@ def test_reload_taxonomy(tmp_path):
     tagger._enabled = True
     tagger._taxonomy_path = str(path)
     tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
 
     # Write updated taxonomy
     taxonomy_v2 = dict(_DEFAULT_TAXONOMY)
@@ -483,74 +477,10 @@ def test_domains_capped_at_3(mock_openai):
 # User Tags tests
 # ============================================================
 
-USER_TAGS = [
-    {"id": "ut_abc123", "name": "仕事", "color": "#4CAF50", "description": "仕事関連"},
-    {"id": "ut_def456", "name": "重要", "color": "#FF5722", "description": "重要な内容"},
-]
-
-RESPONSE_WITH_USER_TAGS = json.dumps({
-    "conversation_type": "社内ミーティング",
-    "outcomes": ["情報共有のみ"],
-    "domains": [],
-    "entities": [],
-    "summary": "仕事の打ち合わせ",
-    "decision_memo": None,
-    "quality": "clean",
-    "importance": "中",
-    "user_tags": ["仕事", "重要"],
-})
-
-
-def _make_tagger_with_user_tags(mock_openai, response_content, user_tags):
-    """Create a SessionTagger with user tags and mocked API response."""
-    tagger = _make_tagger(mock_openai, response_content)
-    tagger._user_tags = user_tags
-    return tagger
-
-
-def test_user_tags_resolved_to_ids(mock_openai):
-    """user_tags names should be resolved to IDs."""
-    tagger = _make_tagger_with_user_tags(mock_openai, RESPONSE_WITH_USER_TAGS, USER_TAGS)
-    result = tagger.tag_session(SEGMENTS)
-    assert result is not None
-    assert "user_tags" in result
-    assert "ut_abc123" in result["user_tags"]
-    assert "ut_def456" in result["user_tags"]
-
-
-def test_user_tags_unknown_name_ignored(mock_openai):
-    """Unknown tag names from LLM should be silently ignored."""
-    response = json.dumps({
-        "conversation_type": "社内ミーティング",
-        "outcomes": ["情報共有のみ"],
-        "domains": [],
-        "entities": [],
-        "summary": "テスト",
-        "decision_memo": None,
-        "quality": "clean",
-        "importance": "中",
-        "user_tags": ["仕事", "未定義タグ"],
-    })
-    tagger = _make_tagger_with_user_tags(mock_openai, response, USER_TAGS)
-    result = tagger.tag_session(SEGMENTS)
-    assert result is not None
-    assert result["user_tags"] == ["ut_abc123"]
-
-
-def test_user_tags_empty_when_no_definitions(mock_openai):
-    """user_tags should be empty when no user tag definitions exist."""
-    tagger = _make_tagger(mock_openai, RESPONSE_WITH_USER_TAGS)
-    result = tagger.tag_session(SEGMENTS)
-    assert result is not None
-    assert result["user_tags"] == []
-
-
 def test_build_system_prompt_includes_taxonomy():
     """System prompt should include taxonomy values."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     prompt = tagger._build_system_prompt()
@@ -564,8 +494,6 @@ def test_build_system_prompt_with_domain_descriptions():
     """System prompt should include domain descriptions when available."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     taxonomy = dict(_DEFAULT_TAXONOMY)
     taxonomy["domain_descriptions"] = {
@@ -587,8 +515,6 @@ def test_build_system_prompt_with_keyword_anchors():
     """System prompt should include keyword anchors under domain descriptions."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     taxonomy = dict(_DEFAULT_TAXONOMY)
     taxonomy["domain_descriptions"] = {
@@ -614,8 +540,6 @@ def test_build_system_prompt_without_keyword_anchors():
     """System prompt should work normally when keyword_anchors is absent."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     taxonomy = dict(_DEFAULT_TAXONOMY)
     taxonomy["domain_descriptions"] = {
@@ -632,57 +556,11 @@ def test_build_system_prompt_without_domain_descriptions():
     """System prompt should use comma-separated list when no descriptions."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     prompt = tagger._build_system_prompt()
     # Without descriptions, should be comma-separated format
     assert '"水中超音波", "物販"' in prompt
-
-
-def test_build_system_prompt_with_user_tags():
-    """System prompt should include user tag definitions."""
-    tagger = SessionTagger.__new__(SessionTagger)
-    tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = USER_TAGS
-    tagger._taxonomy_path = ""
-    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
-    prompt = tagger._build_system_prompt()
-    assert "user_tags" in prompt
-    assert "仕事" in prompt
-    assert "仕事関連" in prompt
-
-
-def test_build_system_prompt_without_user_tags():
-    """System prompt should not include user_tags section when none defined."""
-    tagger = SessionTagger.__new__(SessionTagger)
-    tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
-    tagger._taxonomy_path = ""
-    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
-    prompt = tagger._build_system_prompt()
-    assert "user_tags" not in prompt
-
-
-def test_reload_user_tags(tmp_path):
-    """reload_user_tags() should re-read the file."""
-    tags_file = tmp_path / "user_tags.json"
-    tags_file.write_text("[]", encoding="utf-8")
-
-    tagger = SessionTagger.__new__(SessionTagger)
-    tagger._enabled = True
-    tagger._user_tags_path = str(tags_file)
-    tagger._user_tags = []
-    tagger._taxonomy_path = ""
-    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
-
-    tags_file.write_text(json.dumps(USER_TAGS), encoding="utf-8")
-    tagger.reload_user_tags()
-    assert len(tagger._user_tags) == 2
-    assert tagger._user_tags[0]["name"] == "仕事"
 
 
 # ============================================================
@@ -919,8 +797,6 @@ def test_prefilter_system_prompt_guidance():
     """System prompt should include the prefilter guidance rule."""
     tagger = SessionTagger.__new__(SessionTagger)
     tagger._enabled = True
-    tagger._user_tags_path = ""
-    tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
     prompt = tagger._build_system_prompt()
