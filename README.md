@@ -341,7 +341,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
-**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 8192), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク���減)。
+**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 8192), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
 
 ### 外部サービス
 
