@@ -37,6 +37,8 @@ def _make_tagger(mock_openai, response_content, taxonomy=None):
     tagger._user_tags = []
     tagger._taxonomy_path = ""
     tagger._taxonomy = taxonomy or dict(_DEFAULT_TAXONOMY)
+    tagger._prefilter_enabled = True
+    tagger._prefilter_min_matches = 1
     return tagger
 
 
@@ -739,3 +741,218 @@ def test_validate_and_save_tags_external_audio_domains_cleared(mock_openai):
     assert result is not None
     assert result["domains"] == []
     assert result["external_audio_ratio"] == 1.0
+
+
+# ============================================================
+# Domain prefilter tests
+# ============================================================
+
+TAXONOMY_WITH_ANCHORS = {
+    **_DEFAULT_TAXONOMY,
+    "domain_descriptions": {
+        "水中超音波": "水中超音波技術の研究開発・製品化",
+        "物販": "物販ビジネスの仕入れ・販売・在庫管理",
+        "AI": "AI技術そのものが主題の研究・開発",
+    },
+    "keyword_anchors": {
+        "水中超音波": ["超音波", "トランスデューサ", "音響"],
+        "物販": ["Amazon", "仕入れ", "在庫", "FBA"],
+        "AI": ["Claude", "ChatGPT", "LLM"],
+        "個人": ["家族", "趣味", "健康"],
+    },
+}
+
+
+def test_scan_domain_keywords_basic():
+    """Basic keyword matching should find candidates."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 1
+
+    result = tagger._scan_domain_keywords("超音波の実験を行いました。トランスデューサを使います。")
+    assert len(result["candidates"]) >= 1
+    cand_domains = [c["domain"] for c in result["candidates"]]
+    assert "水中超音波" in cand_domains
+    # Check hits count
+    for c in result["candidates"]:
+        if c["domain"] == "水中超音波":
+            assert c["hits"] == 2
+            assert c["total"] == 3
+
+
+def test_scan_domain_keywords_no_matches():
+    """Text with no matching keywords should return empty candidates."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 1
+
+    result = tagger._scan_domain_keywords("今日はいい天気ですね。散歩に行きましょう。")
+    assert len(result["candidates"]) == 0
+    assert len(result["non_candidates"]) > 0
+
+
+def test_scan_domain_keywords_case_insensitive():
+    """Keyword matching should be case-insensitive."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 1
+
+    result = tagger._scan_domain_keywords("amazonで在庫を確認しました。fbaの設定もしました。")
+    cand_domains = [c["domain"] for c in result["candidates"]]
+    assert "物販" in cand_domains
+    for c in result["candidates"]:
+        if c["domain"] == "物販":
+            assert c["hits"] == 3  # amazon, 在庫, fba
+
+
+def test_scan_domain_keywords_no_anchors():
+    """Taxonomy without keyword_anchors should return empty candidates."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)  # no keyword_anchors
+    tagger._prefilter_min_matches = 1
+
+    result = tagger._scan_domain_keywords("超音波の実験")
+    assert result["candidates"] == []
+    assert len(result["non_candidates"]) == len(_DEFAULT_TAXONOMY["domains"])
+
+
+def test_scan_domain_keywords_min_matches_filter():
+    """min_matches=2 should filter out domains with only 1 hit."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 2
+
+    # "超音波" = 1 hit for 水中超音波, should be excluded
+    result = tagger._scan_domain_keywords("超音波について調べています。Claudeも使っています。")
+    cand_domains = [c["domain"] for c in result["candidates"]]
+    assert "水中超音波" not in cand_domains  # only 1 hit < min_matches=2
+    assert "AI" not in cand_domains  # only 1 hit < min_matches=2
+
+
+def test_format_prefilter_hint_with_candidates():
+    """Hint should list candidates with hit counts."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 1
+
+    scan_result = {
+        "candidates": [
+            {"domain": "AI", "hits": 3, "total": 3, "score": 1.0},
+            {"domain": "物販", "hits": 2, "total": 4, "score": 0.5},
+        ],
+        "non_candidates": ["個人", "経営"],
+    }
+    hint = tagger._format_prefilter_hint(scan_result)
+    assert "[キーワード走査結果]" in hint
+    assert "AI(3hit)" in hint
+    assert "物販(2hit)" in hint
+    assert "個人" in hint
+    assert "経営" in hint
+
+
+def test_format_prefilter_hint_no_candidates():
+    """No candidates should produce fallback message."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._taxonomy = TAXONOMY_WITH_ANCHORS
+    tagger._prefilter_min_matches = 1
+
+    scan_result = {"candidates": [], "non_candidates": ["水中超音波", "物販"]}
+    hint = tagger._format_prefilter_hint(scan_result)
+    assert "候補なし" in hint
+    assert "全ドメインから判定してください" in hint
+
+
+def test_prefilter_injected_in_tag_session(mock_openai):
+    """tag_session should inject prefilter hint into user message."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE, TAXONOMY_WITH_ANCHORS)
+    tagger._prefilter_enabled = True
+    tagger._prefilter_min_matches = 1
+
+    segments = [
+        {"start": 0, "end": 5, "text": "超音波のトランスデューサを使って音響テストを実施します"},
+        {"start": 5, "end": 10, "text": "周波数の調整が必要です"},
+    ]
+    result = tagger.tag_session(segments)
+    assert result is not None
+
+    # Check that the API was called with the prefilter hint in user message
+    call_args = tagger._client.chat.completions.create.call_args
+    user_msg = call_args[1]["messages"][1]["content"]
+    assert "[キーワード走査結果]" in user_msg
+    assert "水中超音波" in user_msg
+
+
+def test_prefilter_disabled(mock_openai):
+    """Disabled prefilter should not inject hint."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE, TAXONOMY_WITH_ANCHORS)
+    tagger._prefilter_enabled = False
+
+    segments = [
+        {"start": 0, "end": 5, "text": "超音波のトランスデューサを使って音響テストを実施します"},
+        {"start": 5, "end": 10, "text": "周波数の調整が必要です"},
+    ]
+    result = tagger.tag_session(segments)
+    assert result is not None
+
+    call_args = tagger._client.chat.completions.create.call_args
+    user_msg = call_args[1]["messages"][1]["content"]
+    assert "[キーワード走査結果]" not in user_msg
+
+
+def test_prefilter_in_build_batch_input(mock_openai):
+    """build_batch_input should also inject prefilter hint."""
+    tagger = _make_tagger(mock_openai, VALID_RESPONSE, TAXONOMY_WITH_ANCHORS)
+    tagger._prefilter_enabled = True
+    tagger._prefilter_min_matches = 1
+
+    segments = [
+        {"start": 0, "end": 5, "text": "Amazonで仕入れた商品のFBA在庫を確認する"},
+        {"start": 5, "end": 10, "text": "物販の売上レポートを作成します"},
+    ]
+    system, user = tagger.build_batch_input(segments)
+    assert system != ""
+    assert "[キーワード走査結果]" in user
+    assert "物販" in user
+
+
+def test_prefilter_system_prompt_guidance():
+    """System prompt should include the prefilter guidance rule."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    tagger._taxonomy = dict(_DEFAULT_TAXONOMY)
+    prompt = tagger._build_system_prompt()
+    assert "キーワード走査結果が提示された場合" in prompt
+    assert "候補ドメインを優先的に検討" in prompt
+
+
+def test_prefilter_ext_audio_skip(mock_openai):
+    """External audio sessions (ext>=0.8) should still have domains cleared."""
+    response = json.dumps({
+        "conversation_type": "その他",
+        "outcomes": ["情報共有のみ"],
+        "domains": ["物販"],
+        "entities": [],
+        "summary": "TV audio with business keywords",
+        "decision_memo": None,
+        "quality": "noisy",
+        "importance": "低",
+    })
+    tagger = _make_tagger(mock_openai, response, TAXONOMY_WITH_ANCHORS)
+    tagger._prefilter_enabled = True
+    tagger._prefilter_min_matches = 1
+
+    # 9 unknown + 1 user = 90% unknown → ext_audio >= 0.8
+    segments = [
+        {"start": i, "end": i+1, "text": f"Amazonで仕入れ {i}", "person_name": "unknown"}
+        for i in range(9)
+    ]
+    segments.append({"start": 9, "end": 10, "text": "My comment", "person_name": "Taro", "is_user": True})
+
+    result = tagger.tag_session(segments)
+    assert result is not None
+    # Prefilter may suggest 物販, but ext_audio should override and clear domains
+    assert result["domains"] == []
+    assert result["external_audio_ratio"] == 0.9

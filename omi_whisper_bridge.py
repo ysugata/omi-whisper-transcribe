@@ -74,6 +74,8 @@ RECOVERY_SCAN_DAYS = int(os.environ.get("RECOVERY_SCAN_DAYS", "7"))     # Startu
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
 TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
+DOMAIN_PREFILTER_ENABLED = os.environ.get("DOMAIN_PREFILTER_ENABLED", "true").lower() in ("true", "1", "yes")
+DOMAIN_PREFILTER_MIN_MATCHES = int(os.environ.get("DOMAIN_PREFILTER_MIN_MATCHES", "1"))
 
 # --- 音響シーン分類設定 ---
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -231,6 +233,8 @@ if TAGGING_ENABLED and LLM_API_KEY:
         model=TAGGING_MODEL,
         user_tags_path=_USER_TAGS_PATH,
         taxonomy_path=TAG_TAXONOMY_PATH,
+        prefilter_enabled=DOMAIN_PREFILTER_ENABLED,
+        prefilter_min_matches=DOMAIN_PREFILTER_MIN_MATCHES,
     )
 
 from audio_scene_classifier import AudioSceneClassifier
@@ -2623,7 +2627,7 @@ async def main():
     else:
         log.info("Speaker filter: UNAVAILABLE (no HF_AUTH_TOKEN)")
     if session_tagger and session_tagger.enabled:
-        log.info(f"Session tagger: ON (model={TAGGING_MODEL})")
+        log.info(f"Session tagger: ON (model={TAGGING_MODEL}, prefilter={DOMAIN_PREFILTER_ENABLED})")
     else:
         reason = "DISABLED" if not TAGGING_ENABLED else "no GEMINI_API_KEY"
         log.info(f"Session tagger: {reason}")

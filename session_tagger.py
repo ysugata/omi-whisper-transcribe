@@ -94,6 +94,7 @@ SYSTEM_PROMPT_TEMPLATE = """あなたは音声文字起こしテキストの分�
 - 「個人」: 業務外の個人的な話題（家族、健康、趣味等）
 - 複数事業にまたがる場合は該当する全事業を選択（最大3つ）
 - 該当するドメインがない場合は空配列 [] を返す
+- キーワード走査結果が提示された場合、候補ドメインを優先的に検討してください。ただし候補外のドメインも正当な理由があれば選択可能です
 
 ### entities
 テキスト中に登場する固有名詞 (人名、地名、サービス名、技術名など) をそのまま抽出。なければ空配列。
@@ -141,6 +142,8 @@ class SessionTagger:
         timeout: int = 15,
         user_tags_path: str = "",
         taxonomy_path: str = "",
+        prefilter_enabled: bool = True,
+        prefilter_min_matches: int = 1,
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
@@ -151,6 +154,8 @@ class SessionTagger:
         self._user_tags: list[dict] = []
         self._taxonomy_path = taxonomy_path
         self._taxonomy = _load_taxonomy(taxonomy_path)
+        self._prefilter_enabled = prefilter_enabled
+        self._prefilter_min_matches = max(1, prefilter_min_matches)
 
         if user_tags_path:
             self._load_user_tags()
@@ -302,6 +307,54 @@ class SessionTagger:
                 lines.append(text)
         return "\n".join(lines)
 
+    def _scan_domain_keywords(self, text: str) -> dict:
+        """Scan text for keyword_anchors and return candidate domains.
+
+        Returns {"candidates": [{"domain": str, "hits": int, "total": int, "score": float}],
+                 "non_candidates": [str]}
+        """
+        anchors = self._taxonomy.get("keyword_anchors", {})
+        domains = self._taxonomy.get("domains", [])
+        if not anchors:
+            return {"candidates": [], "non_candidates": list(domains)}
+
+        text_lower = text.lower()
+        candidates = []
+        non_candidates = []
+
+        for domain in domains:
+            kw_list = anchors.get(domain)
+            if not kw_list:
+                non_candidates.append(domain)
+                continue
+            hits = sum(1 for kw in kw_list if kw.lower() in text_lower)
+            if hits >= self._prefilter_min_matches:
+                candidates.append({
+                    "domain": domain,
+                    "hits": hits,
+                    "total": len(kw_list),
+                    "score": round(hits / len(kw_list), 2),
+                })
+            else:
+                non_candidates.append(domain)
+
+        candidates.sort(key=lambda c: c["hits"], reverse=True)
+        return {"candidates": candidates, "non_candidates": non_candidates}
+
+    def _format_prefilter_hint(self, scan_result: dict) -> str:
+        """Format keyword scan result as a hint string for the user message."""
+        candidates = scan_result.get("candidates", [])
+        non_candidates = scan_result.get("non_candidates", [])
+
+        if candidates:
+            cand_parts = [f"{c['domain']}({c['hits']}hit)" for c in candidates]
+            hint = f"\n\n[キーワード走査結果] 候補: {', '.join(cand_parts)}"
+            if non_candidates:
+                hint += f" / 非候補: {', '.join(non_candidates)}"
+            return hint
+        else:
+            return "\n\n[キーワード走査結果] 候補なし — 全ドメインから判定してください"
+
     def _parse_response(self, raw: str) -> Optional[dict]:
         """Parse JSON response from LLM."""
         raw = raw.strip()
@@ -423,13 +476,22 @@ class SessionTagger:
             log.debug("SessionTagger: session text too short, skipping")
             return None
 
+        # Domain prefilter: scan keywords and inject hint into user message
+        prefilter_hint = ""
+        if self._prefilter_enabled:
+            scan_result = self._scan_domain_keywords(session_text)
+            prefilter_hint = self._format_prefilter_hint(scan_result)
+            if scan_result["candidates"]:
+                log.debug("SessionTagger prefilter: %s",
+                          ", ".join(c["domain"] for c in scan_result["candidates"]))
+
         try:
             system_prompt = self._build_system_prompt()
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": session_text},
+                    {"role": "user", "content": session_text + prefilter_hint},
                 ],
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
@@ -475,6 +537,12 @@ class SessionTagger:
         session_text = self._build_input(segments, audio_scene=audio_scene)
         if not session_text or len(session_text) < 10:
             return ("", "")
+
+        # Domain prefilter: scan keywords and inject hint
+        if self._prefilter_enabled:
+            scan_result = self._scan_domain_keywords(session_text)
+            session_text += self._format_prefilter_hint(scan_result)
+
         system_prompt = self._build_system_prompt()
         return (system_prompt, session_text)
 

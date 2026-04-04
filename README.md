@@ -299,12 +299,16 @@ open http://localhost:8092
 
 タクソノミー (分類軸の項目) は `config/tag_taxonomy.json` で定義し、Viewer の Settings > Taxonomy タブから編集可能です。`domain_descriptions` でドメインごとの説明文を定義すると、LLM プロンプトに説明付きで提示され分類精度が向上します。さらに `keyword_anchors` で各ドメインに関連キーワードのリストを定義すると、LLM がキーワードレベルでドメインの境界を判断でき、分類精度がさらに向上します。`keyword_anchors` は Viewer の Taxonomy タブ内のキーワードエディタからも追加・削除できます。
 
+**ドメイン事前フィルタ**: LLM コール前にセッションテキストを `keyword_anchors` で走査し、ヒットしたキーワード数に基づいて候補ドメインを特定します。候補一覧をユーザーメッセージに注入することで LLM のラベル空間を縮小し、分類精度を向上させます。候補外のドメインも正当な理由があれば LLM が選択可能です。
+
 Voice タグ (話者識別) が利用可能な場合、各セグメントの話者情報 (自分/登録者/unknown) を LLM プロンプトに含めて分類精度を向上させます。また、unknown 話者比率 (`external_audio_ratio`) を自動計算し、80% 以上のセッションには「TV/外部音声」バッジを表示し、ドメイン分類を空配列に強制します (TV/ラジオの事業キーワード誤タグ防止)。
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
 | `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
+| `DOMAIN_PREFILTER_ENABLED` | `true` | ドメイン事前フィルタ (keyword_anchors によるキーワード走査) |
+| `DOMAIN_PREFILTER_MIN_MATCHES` | `1` | 候補ドメインとなる最小キーワードヒット数 |
 
 ### 深夜スケジューラ
 
