@@ -400,7 +400,7 @@ def _build_gen_kwargs(max_tokens: int, chunk_size: int = 1440000) -> dict:
     """
     return dict(
         max_new_tokens=max_tokens,
-        repetition_penalty=1.0,  # Official default; 1.2 penalises JSON keys
+        repetition_penalty=1.05,  # Compromise: lighter than 1.2, avoids runaway
         do_sample=False,
         num_beams=1,
         use_cache=True,

@@ -369,7 +369,7 @@ class TestBuildGenKwargs:
         """Should include core generation parameters."""
         kwargs = _build_gen_kwargs(1000)
         assert kwargs["max_new_tokens"] == 1000
-        assert kwargs["repetition_penalty"] == 1.0
+        assert kwargs["repetition_penalty"] == 1.05
         assert kwargs["do_sample"] is False
         assert kwargs["num_beams"] == 1
         assert kwargs["use_cache"] is True
@@ -414,7 +414,7 @@ class TestBuildGenKwargs:
                "max_new_tokens" in (call_kwargs[1] if len(call_kwargs) > 1 else {})
         # Check the merged kwargs contain our expected keys
         all_kwargs = {**call_kwargs.kwargs} if call_kwargs.kwargs else {}
-        assert all_kwargs.get("repetition_penalty") == 1.0
+        assert all_kwargs.get("repetition_penalty") == 1.05
         assert all_kwargs.get("use_cache") is True
         assert all_kwargs.get("acoustic_tokenizer_chunk_size") == 1440000
 

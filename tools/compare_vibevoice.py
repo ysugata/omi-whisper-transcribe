@@ -505,16 +505,17 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
         input_len = inputs["input_ids"].shape[-1]
 
         # Scale max_new_tokens by audio duration to prevent hallucination
-        max_tokens = min(8192, max(256, int(duration * 100)))
+        max_tokens = min(16384, max(256, int(duration * 100)))
 
         with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
-                repetition_penalty=1.2,
+                repetition_penalty=1.05,
                 do_sample=False,
                 num_beams=1,
                 use_cache=True,
+                acoustic_tokenizer_chunk_size=1440000,
             )
 
         new_tokens = output_ids[:, input_len:]
@@ -580,16 +581,17 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
             input_len = inputs["input_ids"].shape[-1]
 
             # Scale max_new_tokens by chunk duration
-            max_tokens = min(8192, max(256, int(chunk_duration * 100)))
+            max_tokens = min(16384, max(256, int(chunk_duration * 100)))
 
             with torch.inference_mode():
                 output_ids = model.generate(
                     **inputs,
                     max_new_tokens=max_tokens,
-                    repetition_penalty=1.2,
+                    repetition_penalty=1.05,
                     do_sample=False,
                     num_beams=1,
                     use_cache=True,
+                    acoustic_tokenizer_chunk_size=1440000,
                 )
 
             new_tokens = output_ids[:, input_len:]
@@ -1057,6 +1059,10 @@ def main():
             if vibe_segs is None:
                 print(f"{RED}failed (OOM){RESET}")
                 continue
+
+            # Filter non-textual event tags
+            from vibevoice_transcriber import _is_nontextual_tag
+            vibe_segs = [s for s in vibe_segs if not _is_nontextual_tag(s.get("Content", ""))]
 
             print(f"done ({elapsed:.1f}s, {len(vibe_segs)} segments)")
 

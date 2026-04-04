@@ -341,7 +341,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
-**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 16384), `repetition_penalty=1.0` (公式デフォルト), `acoustic_tokenizer_chunk_size` による内部チャンキング制御, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **非言語タグ除去** ([Unintelligible Speech], [Silence] 等の公式6タグ + [Hard Speech] をフィルタ), **15秒セグメント分割** (文境界で分割し Whisper 互換の細粒度出力に変換), **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
+**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 16384), `repetition_penalty=1.05` (1.2→軽減、JSON キーペナルティ抑制), `acoustic_tokenizer_chunk_size` による内部チャンキング制御, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **非言語タグ除去** ([Unintelligible Speech], [Silence] 等の公式6タグ + [Hard Speech] をフィルタ), **15秒セグメント分割** (文境界で分割し Whisper 互換の細粒度出力に変換), **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
 
 ### 外部サービス
 
