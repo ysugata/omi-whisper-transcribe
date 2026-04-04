@@ -82,7 +82,7 @@ AUDIO_SCENE_THRESHOLD = float(os.environ.get("AUDIO_SCENE_THRESHOLD", "0.3"))
 AUDIO_SCENE_MEDIA_THRESHOLD = float(os.environ.get("AUDIO_SCENE_MEDIA_THRESHOLD", "0.6"))
 
 # --- VibeVoice-ASR 設定 ---
-VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "true").lower() in ("true", "1", "yes")
+VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "false").lower() in ("true", "1", "yes")
 
 # --- 深夜スケジューラ設定 ---
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻

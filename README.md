@@ -36,7 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
-| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプライン、セッション長ソート、非言語タグ除去、15秒セグメント分割で高品質化 |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし (デフォルト無効、API のみ。Viewer UI ボタンは削除済み) |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -202,7 +202,7 @@ open http://localhost:8092
 |----------|------|------|
 | GET | `/audio-scene/status` | 音響シーン分類の有効/無効、モデル情報、閾値、バッチ進捗 |
 
-### VibeVoice-ASR バッチ
+### VibeVoice-ASR バッチ (API のみ、Viewer UI ボタンは削除済み)
 
 | メソッド | パス | 説明 |
 |----------|------|------|
@@ -339,7 +339,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
-| `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
+| `VIBEVOICE_ENABLED` | `false` | VibeVoice-ASR バッチ文字起こしの有効/無効 (実験的機能。有効にするとモデルのダウンロードが行われます) |
 
 **実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 16384), `repetition_penalty=1.05` (1.2→軽減、JSON キーペナルティ抑制), `acoustic_tokenizer_chunk_size` による内部チャンキング制御, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **非言語タグ除去** ([Unintelligible Speech], [Silence] 等の公式6タグ + [Hard Speech] をフィルタ), **15秒セグメント分割** (文境界で分割し Whisper 互換の細粒度出力に変換), **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
 
