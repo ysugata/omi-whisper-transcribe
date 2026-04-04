@@ -7,7 +7,7 @@ import pytest
 
 from vibevoice_transcriber import (
     _parse_output, _normalize_segments, load_audio,
-    _estimate_max_tokens, _JsonArrayStoppingCriteria, _JSON_CLOSE_BRACKET_ID,
+    _estimate_max_tokens,
 )
 
 
@@ -371,34 +371,12 @@ class TestEstimateMaxTokens:
         assert _estimate_max_tokens(30.0) == 1500
         assert _estimate_max_tokens(60.0) == 3000
 
-    def test_long_audio_capped_at_4096(self):
-        """Audio over ~82s should cap at 4096 tokens."""
-        assert _estimate_max_tokens(100.0) == 4096
-        assert _estimate_max_tokens(600.0) == 4096
+    def test_long_audio_capped_at_8192(self):
+        """Audio over ~164s should cap at 8192 tokens."""
+        assert _estimate_max_tokens(100.0) == 5000
+        assert _estimate_max_tokens(200.0) == 8192
+        assert _estimate_max_tokens(600.0) == 8192
 
     def test_zero_duration(self):
         """Edge case: zero duration should return minimum."""
         assert _estimate_max_tokens(0.0) == 256
-
-
-class TestJsonArrayStoppingCriteria:
-    """Test _JsonArrayStoppingCriteria."""
-
-    def test_stops_on_close_bracket(self):
-        """Should return True when last token is `]`."""
-        torch = pytest.importorskip("torch")
-        criteria = _JsonArrayStoppingCriteria()
-        # input_ids with ] (token 60) as last token
-        input_ids = torch.tensor([[1, 2, 3, _JSON_CLOSE_BRACKET_ID]])
-        assert criteria(input_ids, None) is True
-
-    def test_continues_on_other_token(self):
-        """Should return False when last token is NOT `]`."""
-        torch = pytest.importorskip("torch")
-        criteria = _JsonArrayStoppingCriteria()
-        input_ids = torch.tensor([[1, 2, 3, 100]])
-        assert criteria(input_ids, None) is False
-
-    def test_bracket_token_id_is_60(self):
-        """Verify the expected token ID constant."""
-        assert _JSON_CLOSE_BRACKET_ID == 60

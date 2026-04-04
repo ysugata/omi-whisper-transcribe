@@ -184,7 +184,6 @@ class VibeVoiceTranscriber:
     def _infer(self, audio_data, sr: int, prompt: str):
         """Single-pass inference. Returns raw VibeVoice segments."""
         import torch
-        from transformers import StoppingCriteriaList
 
         inputs = self.processor.apply_transcription_request(
             audio=audio_data,
@@ -202,13 +201,9 @@ class VibeVoiceTranscriber:
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
-                repetition_penalty=1.2,
                 do_sample=False,
                 num_beams=1,
                 use_cache=True,
-                stopping_criteria=StoppingCriteriaList([
-                    _JsonArrayStoppingCriteria()
-                ]),
             )
 
         new_tokens = output_ids[:, input_len:]
@@ -228,7 +223,6 @@ class VibeVoiceTranscriber:
     def _infer_chunked(self, audio_data, sr: int, prompt: str, chunk_size: int):
         """Chunked inference for OOM recovery."""
         import torch
-        from transformers import StoppingCriteriaList
 
         total_samples = len(audio_data)
         all_segments = []
@@ -258,13 +252,9 @@ class VibeVoiceTranscriber:
                     output_ids = self.model.generate(
                         **inputs,
                         max_new_tokens=max_tokens,
-                        repetition_penalty=1.2,
                         do_sample=False,
                         num_beams=1,
                         use_cache=True,
-                        stopping_criteria=StoppingCriteriaList([
-                            _JsonArrayStoppingCriteria()
-                        ]),
                     )
 
                 new_tokens = output_ids[:, input_len:]
@@ -409,30 +399,13 @@ def _parse_output(text: str) -> list:
     return []
 
 
-# Token ID for `]` in Qwen2 tokenizer (JSON array close bracket).
-# Verified via: processor.tokenizer.encode("]", add_special_tokens=False) -> [60]
-_JSON_CLOSE_BRACKET_ID = 60
-
-
 def _estimate_max_tokens(duration_s: float) -> int:
     """Estimate max output tokens based on audio duration.
 
     ~50 tokens/sec is a safe upper bound for structured Japanese JSON output.
-    Previous value of 100 tokens/sec wasted ~44% of allocated budget.
+    Cap at 8192 to ensure long audio sessions complete successfully.
     """
-    return min(4096, max(256, int(duration_s * 50)))
-
-
-class _JsonArrayStoppingCriteria:
-    """Stop generation when JSON array closing bracket `]` is produced.
-
-    VibeVoice-ASR outputs a single JSON array. Once `]` is generated,
-    all subsequent tokens are padding/EOS. Early stopping avoids generating
-    these unnecessary tokens (~30-50% speedup on short audio).
-    """
-
-    def __call__(self, input_ids, scores, **kwargs):
-        return input_ids[0, -1].item() == _JSON_CLOSE_BRACKET_ID
+    return min(8192, max(256, int(duration_s * 50)))
 
 
 def _normalize_segments(raw_segments: list) -> list:
