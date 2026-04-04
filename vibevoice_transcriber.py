@@ -60,13 +60,6 @@ class VibeVoiceTranscriber:
             trust_remote_code=True,
         )
 
-        # torch.compile() for ~2x inference speedup (may fail with 4-bit quantization)
-        try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
-            log.info("VibeVoice-ASR model compiled with torch.compile()")
-        except Exception as e:
-            log.warning("torch.compile() failed (will run without): %s", e)
-
         elapsed = time.time() - t0
         log.info("VibeVoice-ASR model loaded in %.1fs", elapsed)
 
@@ -134,10 +127,15 @@ class VibeVoiceTranscriber:
 
         input_len = inputs["input_ids"].shape[-1]
 
+        # Scale max_new_tokens by audio duration to prevent hallucination on short audio
+        # ~100 tokens/sec of speech is a generous upper bound for Japanese
+        duration = len(audio_data) / sr
+        max_tokens = min(8192, max(256, int(duration * 100)))
+
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=8192,
+                max_new_tokens=max_tokens,
                 repetition_penalty=1.2,
             )
 
@@ -181,10 +179,13 @@ class VibeVoiceTranscriber:
 
                 input_len = inputs["input_ids"].shape[-1]
 
+                # Scale max_new_tokens by chunk duration
+                max_tokens = min(8192, max(256, int(chunk_duration * 100)))
+
                 with torch.no_grad():
                     output_ids = self.model.generate(
                         **inputs,
-                        max_new_tokens=8192,
+                        max_new_tokens=max_tokens,
                         repetition_penalty=1.2,
                     )
 

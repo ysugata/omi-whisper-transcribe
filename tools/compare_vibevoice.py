@@ -389,13 +389,6 @@ def load_vibevoice_model():
         trust_remote_code=True,
     )
 
-    # torch.compile() for ~2x inference speedup (may fail with 4-bit quantization)
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        print(f"  Model compiled with torch.compile()")
-    except Exception as e:
-        print(f"  {YELLOW}torch.compile() failed (will run without): {e}{RESET}")
-
     elapsed = time.time() - t0
     print(f"  Model loaded in {elapsed:.1f}s")
     return model, processor
@@ -489,10 +482,13 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
 
         input_len = inputs["input_ids"].shape[-1]
 
+        # Scale max_new_tokens by audio duration to prevent hallucination
+        max_tokens = min(8192, max(256, int(duration * 100)))
+
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=8192,
+                max_new_tokens=max_tokens,
                 repetition_penalty=1.2,
             )
 
@@ -558,10 +554,13 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
 
             input_len = inputs["input_ids"].shape[-1]
 
+            # Scale max_new_tokens by chunk duration
+            max_tokens = min(8192, max(256, int(chunk_duration * 100)))
+
             with torch.no_grad():
                 output_ids = model.generate(
                     **inputs,
-                    max_new_tokens=8192,
+                    max_new_tokens=max_tokens,
                     repetition_penalty=1.2,
                 )
 
