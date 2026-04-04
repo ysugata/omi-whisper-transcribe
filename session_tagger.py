@@ -208,8 +208,9 @@ class SessionTagger:
     def _build_system_prompt(self) -> str:
         """Build the system prompt with taxonomy values injected."""
         t = self._taxonomy
-        # Build domains list with descriptions if available
+        # Build domains list with descriptions and keyword anchors if available
         descriptions = t.get("domain_descriptions", {})
+        anchors = t.get("keyword_anchors", {})
         domains = t.get("domains", [])
         if descriptions:
             domain_lines = []
@@ -219,6 +220,9 @@ class SessionTagger:
                     domain_lines.append(f'- "{d}": {desc}')
                 else:
                     domain_lines.append(f'- "{d}"')
+                kw = anchors.get(d)
+                if kw:
+                    domain_lines.append(f'  関連キーワード: {", ".join(kw)}')
             domains_list = "\n".join(domain_lines)
         else:
             domains_list = ", ".join(f'"{v}"' for v in domains)

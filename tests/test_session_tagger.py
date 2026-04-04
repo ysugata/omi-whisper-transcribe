@@ -581,6 +581,51 @@ def test_build_system_prompt_with_domain_descriptions():
     assert '"SNS集客"' in prompt
 
 
+def test_build_system_prompt_with_keyword_anchors():
+    """System prompt should include keyword anchors under domain descriptions."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    taxonomy = dict(_DEFAULT_TAXONOMY)
+    taxonomy["domain_descriptions"] = {
+        "水中超音波": "水中超音波技術の研究開発・製品化",
+        "AI": "AI技術そのものが主題の研究・開発",
+    }
+    taxonomy["keyword_anchors"] = {
+        "水中超音波": ["超音波", "トランスデューサ", "音響"],
+        "AI": ["Claude", "ChatGPT", "GPT", "LLM"],
+    }
+    tagger._taxonomy = taxonomy
+    prompt = tagger._build_system_prompt()
+    # Keyword anchors should appear as indented lines after domain descriptions
+    assert "関連キーワード: 超音波, トランスデューサ, 音響" in prompt
+    assert "関連キーワード: Claude, ChatGPT, GPT, LLM" in prompt
+    # Domains without anchors should NOT have keyword line
+    assert "関連キーワード:" in prompt
+    # Count occurrences - only 2 domains have anchors
+    assert prompt.count("関連キーワード:") == 2
+
+
+def test_build_system_prompt_without_keyword_anchors():
+    """System prompt should work normally when keyword_anchors is absent."""
+    tagger = SessionTagger.__new__(SessionTagger)
+    tagger._enabled = True
+    tagger._user_tags_path = ""
+    tagger._user_tags = []
+    tagger._taxonomy_path = ""
+    taxonomy = dict(_DEFAULT_TAXONOMY)
+    taxonomy["domain_descriptions"] = {
+        "水中超音波": "水中超音波技術の研究開発・製品化",
+    }
+    # No keyword_anchors key at all
+    tagger._taxonomy = taxonomy
+    prompt = tagger._build_system_prompt()
+    assert '"水中超音波": 水中超音波技術の研究開発・製品化' in prompt
+    assert "関連キーワード:" not in prompt
+
+
 def test_build_system_prompt_without_domain_descriptions():
     """System prompt should use comma-separated list when no descriptions."""
     tagger = SessionTagger.__new__(SessionTagger)
