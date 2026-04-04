@@ -1969,6 +1969,9 @@ async def _batch_vibevoice_task(force: bool = False):
         # --- Phase 1: VibeVoice-ASR transcription ---
         st["phase"] = "vibevoice"
         sessions = _find_unvibevoiced_sessions(force=force)
+        # Sort by audio file size (ascending) — short sessions first for
+        # better GPU utilization (less OOM risk, KV cache warmup).
+        sessions.sort(key=lambda s: s["audio"].stat().st_size)
         st["total"] = len(sessions)
         log.info(f"VibeVoice batch Phase 1: {len(sessions)} session(s) (force={force})")
 

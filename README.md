@@ -36,7 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
-| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプラインで CPU I/O と GPU 推論をオーバーラップ |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプライン、JSON `]` 早期停止、max_new_tokens 最適化、セッション長ソートで高速化 |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -341,7 +341,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
-**実装詳細**: NF4 量子化 (~6.6 GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (ハルシネーション防止), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外���よる安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行)。
+**実装詳細**: NF4 量子化 (~6.6 GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (50 tokens/秒, 上限 4096), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **JSON `]` 早期停止** (StoppingCriteria で `]` トークン検出時に即座に生成を終了し不要なパディングを回避), **セッション長ソート** (短い音声から順に処理して OOM リスク軽減)。
 
 ### 外部サービス
 
@@ -851,7 +851,7 @@ omi_whisper_transcribe/
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
-├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, NF4 量子化, Prefetch パイプライン)
+├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, NF4 量子化, Prefetch + 早期停止)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
