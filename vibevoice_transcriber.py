@@ -9,6 +9,7 @@ import gc
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -388,14 +389,22 @@ def _parse_output(text: str) -> list:
     return []
 
 
-def _build_gen_kwargs(max_tokens: int) -> dict:
-    """Build generate() kwargs dict."""
+def _build_gen_kwargs(max_tokens: int, chunk_size: int = 1440000) -> dict:
+    """Build generate() kwargs dict.
+
+    Args:
+        max_tokens: Maximum new tokens to generate.
+        chunk_size: acoustic_tokenizer_chunk_size for internal chunking
+            (default 1440000 = 60s at 24kHz). Controls VibeVoice's internal
+            convolution state caching — preferable to physical audio splitting.
+    """
     return dict(
         max_new_tokens=max_tokens,
-        repetition_penalty=1.2,
+        repetition_penalty=1.0,  # Official default; 1.2 penalises JSON keys
         do_sample=False,
         num_beams=1,
         use_cache=True,
+        acoustic_tokenizer_chunk_size=chunk_size,
     )
 
 
@@ -403,9 +412,99 @@ def _estimate_max_tokens(duration_s: float) -> int:
     """Estimate max output tokens based on audio duration.
 
     ~100 tokens/sec is a safe upper bound for structured Japanese JSON output.
-    Cap at 8192 to ensure long audio sessions complete successfully.
+    Cap at 16384 to avoid mid-session truncation on longer recordings while
+    staying within VRAM budget (RTX 3060 12 GB with NF4 quantization).
     """
-    return min(8192, max(256, int(duration_s * 100)))
+    return min(16384, max(256, int(duration_s * 100)))
+
+
+# Official VibeVoice non-speech event tags (arXiv:2601.18184) plus
+# empirically observed [Hard Speech].  Segments consisting entirely of
+# one of these tags carry no useful transcription content.
+_NONTEXTUAL_TAGS = {
+    "Unintelligible Speech", "Hard Speech", "Silence",
+    "Environmental Sounds", "Music", "Human Sounds", "Noise",
+}
+
+# Sentence-boundary regex for segment splitting (mirrors Bridge logic).
+_VV_SPLIT_RE = re.compile(
+    r'(?<=[。.!?？！])|'
+    r'(?<=けど\s)|'
+    r'(?<=から\s)|'
+    r'(?<=のに\s)|'
+    r'(?<=ので\s)|'
+    r'(?<=けれど\s)'
+)
+
+VV_SEGMENT_MAX_DURATION = 15.0
+
+
+def _is_nontextual_tag(text: str) -> bool:
+    """Return True if *text* is a bracketed non-speech event tag."""
+    stripped = text.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        return stripped[1:-1].strip() in _NONTEXTUAL_TAGS
+    return False
+
+
+def _split_vv_segment(seg: dict, max_duration: float) -> list[dict]:
+    """Split a long segment at sentence boundaries (Whisper-compatible).
+
+    Timestamps are proportionally distributed by character count.
+    Fragments shorter than 5 characters are merged into neighbours.
+    """
+    text = seg["text"]
+    start = seg["start"]
+    end = seg["end"]
+    duration = end - start
+
+    if duration <= max_duration:
+        return [seg]
+
+    parts = _VV_SPLIT_RE.split(text)
+    parts = [p for p in parts if p]
+
+    if len(parts) <= 1:
+        return [seg]
+
+    # Merge short fragments (< 5 chars) into neighbours
+    merged: list[str] = []
+    for p in parts:
+        if merged and len(p.strip()) < 5:
+            merged[-1] += p
+        else:
+            merged.append(p)
+
+    if len(merged) > 1 and len(merged[-1].strip()) < 5:
+        merged[-2] += merged[-1]
+        merged.pop()
+
+    if len(merged) <= 1:
+        return [seg]
+
+    total_chars = sum(len(p) for p in merged)
+    if total_chars == 0:
+        return [seg]
+
+    result = []
+    cur_start = start
+    for i, part in enumerate(merged):
+        ratio = len(part) / total_chars
+        part_dur = duration * ratio
+        part_end = cur_start + part_dur
+        if i == len(merged) - 1:
+            part_end = end
+
+        new_seg = dict(seg)
+        new_seg["text"] = part.strip()
+        new_seg["start"] = round(cur_start, 2)
+        new_seg["end"] = round(part_end, 2)
+        if new_seg["text"]:
+            result.append(new_seg)
+
+        cur_start = part_end
+
+    return result if result else [seg]
 
 
 def _normalize_segments(raw_segments: list) -> list:
@@ -415,7 +514,10 @@ def _normalize_segments(raw_segments: list) -> list:
     This is needed for compatibility with speaker_filter.tag_segments_with_model()
     which expects "start"/"end" fields.
 
-    Filters out corrupted segments (End=0 with excessively long Content).
+    Pipeline:
+      1. Filter corrupted segments (End=0 with excessively long Content)
+      2. Filter non-textual event tags ([Unintelligible Speech] etc.)
+      3. Split segments longer than VV_SEGMENT_MAX_DURATION at sentence boundaries
     """
     normalized = []
     for seg in raw_segments:
@@ -423,10 +525,21 @@ def _normalize_segments(raw_segments: list) -> list:
         end = float(seg.get("End", 0))
         if end <= 0 and len(text) > 500:
             continue  # Skip corrupted segments
+        if _is_nontextual_tag(text):
+            continue  # Skip non-speech event tags
         normalized.append({
             "start": float(seg.get("Start", 0)),
             "end": end,
             "speaker": seg.get("Speaker", 0),
             "text": text,
         })
-    return normalized
+
+    # Split long segments for Whisper-compatible granularity
+    final: list[dict] = []
+    for seg in normalized:
+        dur = seg["end"] - seg["start"]
+        if dur > VV_SEGMENT_MAX_DURATION:
+            final.extend(_split_vv_segment(seg, VV_SEGMENT_MAX_DURATION))
+        else:
+            final.append(seg)
+    return final

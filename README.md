@@ -36,7 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
-| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプライン、セッション長ソートで高速化 |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプライン、セッション長ソート、非言語タグ除去、15秒セグメント分割で高品質化 |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -341,7 +341,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
 
-**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 8192), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
+**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 16384), `repetition_penalty=1.0` (公式デフォルト), `acoustic_tokenizer_chunk_size` による内部チャンキング制御, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **非言語タグ除去** ([Unintelligible Speech], [Silence] 等の公式6タグ + [Hard Speech] をフィルタ), **15秒セグメント分割** (文境界で分割し Whisper 互換の細粒度出力に変換), **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク低減)。
 
 ### 外部サービス
 

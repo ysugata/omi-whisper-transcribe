@@ -8,6 +8,7 @@ import pytest
 from vibevoice_transcriber import (
     _parse_output, _normalize_segments, load_audio,
     _estimate_max_tokens, _build_gen_kwargs,
+    _is_nontextual_tag, _split_vv_segment, VV_SEGMENT_MAX_DURATION,
 )
 
 
@@ -133,7 +134,11 @@ class TestNormalizeSegments:
         assert result[0]["text"] == "Short text"
 
     def test_long_content_with_valid_end_kept(self):
-        """Long Content is OK if End > 0 (real long segment, not corrupted)."""
+        """Long Content is OK if End > 0 (real long segment, not corrupted).
+
+        Note: 120s segment has no sentence boundaries in 'あ'*600, so it
+        cannot be split and is returned as-is.
+        """
         long_text = "あ" * 600
         raw = [{"Start": 0, "End": 120.0, "Speaker": 0, "Content": long_text}]
         result = _normalize_segments(raw)
@@ -364,10 +369,16 @@ class TestBuildGenKwargs:
         """Should include core generation parameters."""
         kwargs = _build_gen_kwargs(1000)
         assert kwargs["max_new_tokens"] == 1000
-        assert kwargs["repetition_penalty"] == 1.2
+        assert kwargs["repetition_penalty"] == 1.0
         assert kwargs["do_sample"] is False
         assert kwargs["num_beams"] == 1
         assert kwargs["use_cache"] is True
+        assert kwargs["acoustic_tokenizer_chunk_size"] == 1440000
+
+    def test_custom_chunk_size(self):
+        """Should accept custom acoustic_tokenizer_chunk_size."""
+        kwargs = _build_gen_kwargs(1000, chunk_size=720000)
+        assert kwargs["acoustic_tokenizer_chunk_size"] == 720000
 
     def test_generate_called_with_gen_kwargs(self):
         """model.generate() should receive gen_kwargs from _build_gen_kwargs."""
@@ -403,8 +414,9 @@ class TestBuildGenKwargs:
                "max_new_tokens" in (call_kwargs[1] if len(call_kwargs) > 1 else {})
         # Check the merged kwargs contain our expected keys
         all_kwargs = {**call_kwargs.kwargs} if call_kwargs.kwargs else {}
-        assert all_kwargs.get("repetition_penalty") == 1.2
+        assert all_kwargs.get("repetition_penalty") == 1.0
         assert all_kwargs.get("use_cache") is True
+        assert all_kwargs.get("acoustic_tokenizer_chunk_size") == 1440000
 
 
 class TestEstimateMaxTokens:
@@ -421,12 +433,130 @@ class TestEstimateMaxTokens:
         assert _estimate_max_tokens(30.0) == 3000
         assert _estimate_max_tokens(60.0) == 6000
 
-    def test_long_audio_capped_at_8192(self):
-        """Audio over ~82s should cap at 8192 tokens."""
-        assert _estimate_max_tokens(100.0) == 8192
-        assert _estimate_max_tokens(200.0) == 8192
-        assert _estimate_max_tokens(600.0) == 8192
+    def test_long_audio_capped_at_16384(self):
+        """Audio over ~164s should cap at 16384 tokens."""
+        assert _estimate_max_tokens(200.0) == 16384
+        assert _estimate_max_tokens(600.0) == 16384
+
+    def test_medium_duration_not_capped(self):
+        """100s audio should scale linearly (10000 < 16384)."""
+        assert _estimate_max_tokens(100.0) == 10000
 
     def test_zero_duration(self):
         """Edge case: zero duration should return minimum."""
         assert _estimate_max_tokens(0.0) == 256
+
+
+class TestNontextualTagFilter:
+    """Test non-textual event tag detection and filtering."""
+
+    def test_official_tags_detected(self):
+        """All official VibeVoice non-speech tags should be detected."""
+        for tag in [
+            "[Unintelligible Speech]", "[Silence]", "[Music]",
+            "[Human Sounds]", "[Environmental Sounds]", "[Noise]",
+            "[Hard Speech]",
+        ]:
+            assert _is_nontextual_tag(tag), f"{tag} should be nontextual"
+
+    def test_padded_brackets_detected(self):
+        """Tags with whitespace inside brackets should be detected."""
+        assert _is_nontextual_tag("[ Silence ]")
+        assert _is_nontextual_tag("  [Music]  ")
+
+    def test_normal_text_not_flagged(self):
+        """Normal transcription text should not be flagged."""
+        assert not _is_nontextual_tag("こんにちは")
+        assert not _is_nontextual_tag("Hello world")
+        assert not _is_nontextual_tag("[Custom Tag]")
+        assert not _is_nontextual_tag("")
+
+    def test_mixed_text_not_flagged(self):
+        """Text containing a tag but also other content is not a pure tag."""
+        assert not _is_nontextual_tag("[Silence] and some text")
+        assert not _is_nontextual_tag("before [Music]")
+
+    def test_normalize_filters_nontextual(self):
+        """_normalize_segments should drop non-textual tag segments."""
+        raw = [
+            {"Start": 0, "End": 5.0, "Speaker": 0, "Content": "[Unintelligible Speech]"},
+            {"Start": 5.0, "End": 10.0, "Speaker": 0, "Content": "実際の発話"},
+            {"Start": 10.0, "End": 15.0, "Speaker": 0, "Content": "[Silence]"},
+            {"Start": 15.0, "End": 20.0, "Speaker": 1, "Content": "[Music]"},
+            {"Start": 20.0, "End": 25.0, "Speaker": 1, "Content": "二人目の発話"},
+        ]
+        result = _normalize_segments(raw)
+        assert len(result) == 2
+        assert result[0]["text"] == "実際の発話"
+        assert result[1]["text"] == "二人目の発話"
+
+
+class TestSegmentSplitting:
+    """Test long segment splitting at sentence boundaries."""
+
+    def test_short_segment_not_split(self):
+        """Segments within VV_SEGMENT_MAX_DURATION should not be split."""
+        seg = {"start": 0.0, "end": 10.0, "speaker": 0, "text": "短いセグメント。"}
+        result = _split_vv_segment(seg, VV_SEGMENT_MAX_DURATION)
+        assert len(result) == 1
+        assert result[0] is seg
+
+    def test_split_at_sentence_boundary(self):
+        """Long segment should be split at Japanese sentence boundaries."""
+        seg = {
+            "start": 0.0, "end": 30.0, "speaker": 0,
+            "text": "最初の文です。次の文です。三番目の文です。",
+        }
+        result = _split_vv_segment(seg, VV_SEGMENT_MAX_DURATION)
+        assert len(result) == 3
+        assert result[0]["text"] == "最初の文です。"
+        assert result[1]["text"] == "次の文です。"
+        assert result[2]["text"] == "三番目の文です。"
+        # Timestamps should be proportionally distributed
+        assert result[0]["start"] == 0.0
+        assert result[-1]["end"] == 30.0
+        # All sub-segments should have the same speaker
+        for r in result:
+            assert r["speaker"] == 0
+
+    def test_no_boundary_returns_original(self):
+        """Segment with no sentence boundaries should not be split."""
+        seg = {
+            "start": 0.0, "end": 30.0, "speaker": 0,
+            "text": "境界のないとても長いテキストがここにあります",
+        }
+        result = _split_vv_segment(seg, VV_SEGMENT_MAX_DURATION)
+        assert len(result) == 1
+        assert result[0] is seg
+
+    def test_short_fragments_merged(self):
+        """Fragments under 5 chars should merge into neighbours."""
+        seg = {
+            "start": 0.0, "end": 30.0, "speaker": 0,
+            "text": "長い文です。え。もう一つの長い文です。",
+        }
+        result = _split_vv_segment(seg, VV_SEGMENT_MAX_DURATION)
+        # "え。" is < 5 chars and should be merged
+        texts = [r["text"] for r in result]
+        assert not any(len(t) < 5 for t in texts)
+
+    def test_normalize_splits_long_segments(self):
+        """_normalize_segments should split segments exceeding VV_SEGMENT_MAX_DURATION."""
+        raw = [
+            {
+                "Start": 0, "End": 60.0, "Speaker": 0,
+                "Content": "最初の文です。二番目の文。三番目の文です。四番目。",
+            },
+            {
+                "Start": 60.0, "End": 65.0, "Speaker": 1,
+                "Content": "短い文。",
+            },
+        ]
+        result = _normalize_segments(raw)
+        # First segment should be split (60s >> 15s), second should remain
+        assert len(result) > 2
+        assert result[-1]["text"] == "短い文。"
+        assert result[-1]["start"] == 60.0
+        # All sub-segments from the first raw segment should have speaker 0
+        for r in result[:-1]:
+            assert r["speaker"] == 0
