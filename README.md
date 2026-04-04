@@ -36,8 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
 | 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
-| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit/8-bit 量子化選択) による比較用バッチ文字起こし + 声紋タグ付け。Prompt Lookup Decoding、Prefetch パイプライン、セッション長ソートで高速化 |
-| Qwen3-ASR 評価 | Qwen/Qwen3-ASR-1.7B + ForcedAligner-0.6B による文字起こし品質評価 (ベンチマークツールのみ、bf16 ~4GB VRAM) |
+| VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし + 声紋タグ付け。Prefetch パイプライン、セッション長ソートで高速化 |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
@@ -341,14 +340,8 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `VIBEVOICE_ENABLED` | `true` | VibeVoice-ASR バッチ文字起こしの有効/無効 |
-| `VIBEVOICE_QUANTIZATION` | `4bit` | 量子化モード (`4bit`=NF4 ~6.6GB, `8bit` ~10.6GB) |
-| `VIBEVOICE_PROMPT_LOOKUP_TOKENS` | `0` | Prompt Lookup Decoding の n-gram トークン数 (0=無効, 5-10 推奨) |
 
-**実装詳細**: 量子化選択 (4-bit NF4 / 8-bit), **Prompt Lookup Decoding** (JSON 出力の繰り返しキー名で n-gram マッチ高速化), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 8192), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク���減)。
-
-### Qwen3-ASR (評価用)
-
-Qwen/Qwen3-ASR-1.7B + Qwen3-ForcedAligner-0.6B による評価用文字起こしモジュール。Bridge には統合せず、ベンチマークツールからのみ使用。bf16 (~4GB VRAM) で RTX 3060 に余裕で収まる。
+**実装詳細**: 4-bit NF4 量子化 (~6.6GB VRAM), Flash Attention 2 (LLM デコーダのみ dict 形式適用), TF32 テンソルコア有効化, `max_new_tokens` 音声長比例制限 (100 tokens/秒, 上限 8192), `repetition_penalty=1.2`, 音声正規化 (-16 dBFS), 入力トークン除外による安定した JSON パース, 日本語コンテキストプロンプト + Hotwords 連携, `processor.decode(return_format="parsed")` 最適化, **Prefetch パイプライン** (次セッションの ffmpeg 変換 + 音声ロードを GPU 推論と並行実行), **セッション長ソート** (短い音声から順に処理して OOM リスク���減)。
 
 ### 外部サービス
 
@@ -779,8 +772,6 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
 | `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
 | `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, NF4) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
-| `tools/benchmark_vibevoice_configs.py` | VibeVoice-ASR 複数設定 (4-bit/8-bit/Prompt Lookup) 統合ベンチマーク |
-| `tools/benchmark_qwen3_vs_vibevoice.py` | Whisper vs VibeVoice vs Qwen3-ASR 3者比較 |
 | `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
 
 ## GPU 共有デプロイ
@@ -860,8 +851,7 @@ omi_whisper_transcribe/
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
-├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit/8-bit 量子化, Prompt Lookup, Prefetch)
-├── qwen3_transcriber.py      # Qwen3-ASR 評価用モジュール (1.7B + ForcedAligner, bf16)
+├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit NF4, Prefetch)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
@@ -903,7 +893,5 @@ omi_whisper_transcribe/
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 音声区間検出 | MIT |
 | [noisereduce](https://github.com/timsainb/noisereduce) | ノイズ除去 | MIT |
 | [microsoft/VibeVoice-ASR-HF](https://huggingface.co/microsoft/VibeVoice-ASR-HF) | バッチ文字起こし (9B) | MIT |
-| [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | 評価用文字起こし | Apache-2.0 |
-| [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | タイムスタンプアライナー | Apache-2.0 |
 | [Gemini API](https://ai.google.dev/) | LLM 後処理・セッションタグ・匿名化 | Google ToS |
 | [OpenAI Responses API](https://platform.openai.com/) | 匿名化・KC 抽出 (GPT-5 nano) | OpenAI ToS |

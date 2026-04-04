@@ -1,15 +1,13 @@
 """Tests for vibevoice_transcriber module."""
 
 import json
-import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
 from vibevoice_transcriber import (
     _parse_output, _normalize_segments, load_audio,
     _estimate_max_tokens, _build_gen_kwargs,
-    PROMPT_LOOKUP_TOKENS, QUANTIZATION_MODE,
 )
 
 
@@ -359,42 +357,6 @@ class TestJapanesePromptConstruction:
         assert "Hotwords" not in vv_prompt
 
 
-class TestEnvironmentVariables:
-    """Test environment variable defaults and reading."""
-
-    def test_prompt_lookup_default_zero(self):
-        """Default PROMPT_LOOKUP_TOKENS should be 0 (disabled)."""
-        assert PROMPT_LOOKUP_TOKENS == 0
-
-    def test_quantization_default_4bit(self):
-        """Default QUANTIZATION_MODE should be '4bit'."""
-        assert QUANTIZATION_MODE == "4bit"
-
-    def test_prompt_lookup_env_override(self):
-        """VIBEVOICE_PROMPT_LOOKUP_TOKENS env var should be parsed as int."""
-        with patch.dict("os.environ", {"VIBEVOICE_PROMPT_LOOKUP_TOKENS": "5"}):
-            import importlib
-            import vibevoice_transcriber
-            importlib.reload(vibevoice_transcriber)
-            assert vibevoice_transcriber.PROMPT_LOOKUP_TOKENS == 5
-            # Restore default
-            with patch.dict("os.environ", {}, clear=False):
-                os.environ.pop("VIBEVOICE_PROMPT_LOOKUP_TOKENS", None)
-                importlib.reload(vibevoice_transcriber)
-
-    def test_quantization_env_override(self):
-        """VIBEVOICE_QUANTIZATION env var should be read as string."""
-        with patch.dict("os.environ", {"VIBEVOICE_QUANTIZATION": "8bit"}):
-            import importlib
-            import vibevoice_transcriber
-            importlib.reload(vibevoice_transcriber)
-            assert vibevoice_transcriber.QUANTIZATION_MODE == "8bit"
-            # Restore default
-            with patch.dict("os.environ", {}, clear=False):
-                os.environ.pop("VIBEVOICE_QUANTIZATION", None)
-                importlib.reload(vibevoice_transcriber)
-
-
 class TestBuildGenKwargs:
     """Test _build_gen_kwargs helper."""
 
@@ -406,22 +368,6 @@ class TestBuildGenKwargs:
         assert kwargs["do_sample"] is False
         assert kwargs["num_beams"] == 1
         assert kwargs["use_cache"] is True
-
-    def test_no_prompt_lookup_by_default(self):
-        """prompt_lookup_num_tokens should not be in kwargs when PROMPT_LOOKUP_TOKENS=0."""
-        kwargs = _build_gen_kwargs(500)
-        assert "prompt_lookup_num_tokens" not in kwargs
-
-    def test_prompt_lookup_included_when_set(self):
-        """prompt_lookup_num_tokens should be added when PROMPT_LOOKUP_TOKENS > 0."""
-        import vibevoice_transcriber
-        original = vibevoice_transcriber.PROMPT_LOOKUP_TOKENS
-        try:
-            vibevoice_transcriber.PROMPT_LOOKUP_TOKENS = 5
-            kwargs = vibevoice_transcriber._build_gen_kwargs(1000)
-            assert kwargs["prompt_lookup_num_tokens"] == 5
-        finally:
-            vibevoice_transcriber.PROMPT_LOOKUP_TOKENS = original
 
     def test_generate_called_with_gen_kwargs(self):
         """model.generate() should receive gen_kwargs from _build_gen_kwargs."""
