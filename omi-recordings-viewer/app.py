@@ -828,12 +828,12 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     # Remember old domains for keyword learning
     old_domains = list(tags.get("domains", []))
 
-    # Partial update: only provided fields
+    # Partial update: only provided fields (empty lists are valid)
     if conv_type is not None:
         tags["conversation_type"] = conv_type
-    if outcomes:
+    if "outcomes" in body:
         tags["outcomes"] = outcomes
-    if domains:
+    if "domains" in body:
         tags["domains"] = domains
     if importance is not None:
         tags["importance"] = importance

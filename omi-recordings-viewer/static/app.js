@@ -2437,7 +2437,7 @@
                 setTimeout(function () {
                     container.style.display = "none";
                     loadPage(currentPage);
-                    showDetail(date, time);
+                    openDetail(date, time);
                 }, 500);
             }).catch(function (err) {
                 statusEl.textContent = "Error: " + err.message;
