@@ -248,6 +248,51 @@ class TestIndexPersistence:
         assert results[0]["session_id"] == "s1"
 
 
+class TestMonologueHeuristic:
+    def test_chitchat_to_monologue(self):
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "雑談・移動中メモ", "importance": "低"}
+        stats = {"has_voice_tags": True, "total": 10, "user": 9, "unknown": 1, "unknown_ratio": 0.1}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "独り言・メモ"
+
+    def test_monologue_to_chitchat(self):
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "独り言・メモ", "importance": "低"}
+        stats = {"has_voice_tags": True, "total": 10, "user": 2, "unknown": 5, "unknown_ratio": 0.5}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "雑談・移動中メモ"
+
+    def test_no_override_mid_ratio(self):
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "雑談・移動中メモ", "importance": "低"}
+        stats = {"has_voice_tags": True, "total": 10, "user": 5, "unknown": 3, "unknown_ratio": 0.3}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "雑談・移動中メモ"
+
+    def test_no_voice_tags(self):
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "雑談・移動中メモ", "importance": "低"}
+        stats = {"has_voice_tags": False, "total": 10, "user": 0, "unknown": 0, "unknown_ratio": 0.0}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "雑談・移動中メモ"
+
+    def test_unrelated_type_unchanged(self):
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "商談", "importance": "高"}
+        stats = {"has_voice_tags": True, "total": 10, "user": 9, "unknown": 1, "unknown_ratio": 0.1}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "商談"
+
+    def test_no_user_segments_skipped(self):
+        """When user=0 (voice tags present but no user match), skip heuristic."""
+        from session_tagger import SessionTagger
+        tags = {"conversation_type": "独り言・メモ", "importance": "低"}
+        stats = {"has_voice_tags": True, "total": 10, "user": 0, "unknown": 10, "unknown_ratio": 1.0}
+        result = SessionTagger._apply_monologue_heuristic(tags, stats)
+        assert result["conversation_type"] == "独り言・メモ"
+
+
 class TestGetStatus:
     def test_status(self):
         tmpdir = tempfile.mkdtemp()

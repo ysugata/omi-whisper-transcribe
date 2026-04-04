@@ -233,6 +233,29 @@ class SessionTagger:
             "has_voice_tags": has_voice,
         }
 
+    @staticmethod
+    def _apply_monologue_heuristic(tags: dict, stats: dict) -> dict:
+        """Override conversation_type based on speaker ratio.
+
+        If voice tags show user_ratio >= 0.8 (mostly self),
+        override '雑談・移動中メモ' → '独り言・メモ'.
+        If user_ratio < 0.4 AND user > 0, override '独り言・メモ' → '雑談・移動中メモ'.
+        Requires user > 0 to ensure voice tagging is actually working.
+        """
+        if not stats["has_voice_tags"] or stats["total"] == 0:
+            return tags
+        if stats["user"] == 0:
+            return tags
+        user_ratio = stats["user"] / stats["total"]
+        ct = tags.get("conversation_type", "")
+        if ct == "雑談・移動中メモ" and user_ratio >= 0.8:
+            tags["conversation_type"] = "独り言・メモ"
+            log.debug("Monologue heuristic: 雑談→独り言 (user_ratio=%.2f)", user_ratio)
+        elif ct == "独り言・メモ" and user_ratio < 0.4:
+            tags["conversation_type"] = "雑談・移動中メモ"
+            log.debug("Monologue heuristic: 独り言→雑談 (user_ratio=%.2f)", user_ratio)
+        return tags
+
     def _build_input(self, segments: list[dict], audio_scene: dict | None = None) -> str:
         """Build session text from segments with speaker info."""
         stats = self._compute_speaker_stats(segments)
@@ -454,6 +477,8 @@ class SessionTagger:
                 tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
                 if stats["unknown_ratio"] >= 0.8:
                     tags["domains"] = []
+                # Monologue heuristic: user_ratio >= 0.8 → 独り言・メモ
+                tags = self._apply_monologue_heuristic(tags, stats)
             else:
                 tags["external_audio_ratio"] = None
             # RAG does not produce summary/entities/decision_memo
