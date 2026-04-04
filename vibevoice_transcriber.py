@@ -52,9 +52,10 @@ class VibeVoiceTranscriber:
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
-        # Try FA2 > SDPA > eager (forward-compatible fallback chain).
-        # Currently both FA2 and SDPA are blocked by VibeVoice's
-        # AcousticTokenizerEncoder, so eager is always used.
+        # Apply FA2/SDPA only to the LLM decoder (text_config = Qwen2).
+        # AcousticTokenizerEncoder is pure ConvNext (no attention layers),
+        # so passing a string attn_implementation fails. Dict form targets
+        # only the sub-model that actually uses attention.
         attn_impl = "eager"
         for impl in ("flash_attention_2", "sdpa"):
             try:
@@ -64,7 +65,7 @@ class VibeVoiceTranscriber:
                     device_map="auto",
                     dtype=torch.bfloat16,
                     trust_remote_code=True,
-                    attn_implementation=impl,
+                    attn_implementation={"text_config": impl},
                 )
                 attn_impl = impl
                 break
@@ -79,6 +80,11 @@ class VibeVoiceTranscriber:
                 dtype=torch.bfloat16,
                 trust_remote_code=True,
             )
+
+        # Enable TF32 for Ampere+ GPUs (RTX 30xx/40xx) — minimal precision
+        # impact on bfloat16 compute, ~10-30% faster matmul/conv ops.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
         elapsed = time.time() - t0
         log.info("VibeVoice-ASR model loaded in %.1fs (attn=%s)", elapsed, attn_impl)
@@ -152,11 +158,14 @@ class VibeVoiceTranscriber:
         duration = len(audio_data) / sr
         max_tokens = min(8192, max(256, int(duration * 100)))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 repetition_penalty=1.2,
+                do_sample=False,
+                num_beams=1,
+                use_cache=True,
             )
 
         new_tokens = output_ids[:, input_len:]
@@ -202,11 +211,14 @@ class VibeVoiceTranscriber:
                 # Scale max_new_tokens by chunk duration
                 max_tokens = min(8192, max(256, int(chunk_duration * 100)))
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     output_ids = self.model.generate(
                         **inputs,
                         max_new_tokens=max_tokens,
                         repetition_penalty=1.2,
+                        do_sample=False,
+                        num_beams=1,
+                        use_cache=True,
                     )
 
                 new_tokens = output_ids[:, input_len:]

@@ -15,6 +15,12 @@ RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.py
 COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
 
+# Flash Attention 2 pre-built wheel for VibeVoice-ASR LLM decoder speedup.
+# Applied via dict-form attn_implementation={"text_config": "flash_attention_2"}.
+# Wheel must match: torch version + CUDA version + CXX11 ABI + Python version.
+RUN pip3 install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl"
+
 COPY omi_whisper_bridge.py .
 COPY model_manager.py .
 COPY term_corrector.py .

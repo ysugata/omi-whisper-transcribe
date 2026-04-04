@@ -381,7 +381,8 @@ def load_vibevoice_model():
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4",
     )
-    # Try FA2 > SDPA > eager (forward-compatible fallback chain)
+    # Apply FA2/SDPA only to the LLM decoder (text_config = Qwen2).
+    # AcousticTokenizerEncoder is pure ConvNext (no attention layers).
     attn_impl = "eager"
     for impl in ("flash_attention_2", "sdpa"):
         try:
@@ -391,7 +392,7 @@ def load_vibevoice_model():
                 device_map="auto",
                 dtype=torch.bfloat16,
                 trust_remote_code=True,
-                attn_implementation=impl,
+                attn_implementation={"text_config": impl},
             )
             attn_impl = impl
             break
@@ -406,6 +407,9 @@ def load_vibevoice_model():
             dtype=torch.bfloat16,
             trust_remote_code=True,
         )
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     elapsed = time.time() - t0
     print(f"  Model loaded in {elapsed:.1f}s (attn={attn_impl})")
@@ -503,11 +507,14 @@ def run_vibevoice(model, processor, wav_path, prompt="", chunk_size=1440000):
         # Scale max_new_tokens by audio duration to prevent hallucination
         max_tokens = min(8192, max(256, int(duration * 100)))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 repetition_penalty=1.2,
+                do_sample=False,
+                num_beams=1,
+                use_cache=True,
             )
 
         new_tokens = output_ids[:, input_len:]
@@ -575,11 +582,14 @@ def _run_vibevoice_chunked(model, processor, wav_path, prompt, chunk_size):
             # Scale max_new_tokens by chunk duration
             max_tokens = min(8192, max(256, int(chunk_duration * 100)))
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 output_ids = model.generate(
                     **inputs,
                     max_new_tokens=max_tokens,
                     repetition_penalty=1.2,
+                    do_sample=False,
+                    num_beams=1,
+                    use_cache=True,
                 )
 
             new_tokens = output_ids[:, input_len:]
