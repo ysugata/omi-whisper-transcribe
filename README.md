@@ -30,6 +30,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | LLM 後処理 (3段階パイプライン) | 用語候補抽出 → 表記補正 → 品質監査の3段階で文字起こし精度を向上 |
 | LLM スクリーニング | 辞書補正 + 信頼度スコアで LLM 不要なセグメントを自動スキップ (API call 60-80% 削減) |
 | セッションタグ (3軸分類) | LLM による日本語3軸タグ付け (会話種類・成果物・事業領域 + 要約・判断メモ) |
+| RAG 分類 | 過去セッションの埋め込みベクトルによる k-NN 加重投票分類 (LLM コスト 80-90% 削減) |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
@@ -162,6 +163,13 @@ open http://localhost:8092
 | POST | `/session-tags/cancel` | タグ付けをキャンセル |
 | POST | `/taxonomy/reload` | タクソノミー定義を再読み込み |
 | POST | `/keywords/learn` | タグ修正からキーワード候補を抽出 |
+
+### RAG 分類
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/rag/status` | RAG インデックス状態 (セッション数・モデル・ready) |
+| POST | `/rag/rebuild` | RAG インデックスを削除して再構築 |
 
 ### 一括タグ付け (セッション + 話者)
 
@@ -305,6 +313,10 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
 | `DOMAIN_PREFILTER_ENABLED` | `true` | ドメイン事前フィルタ (keyword_anchors によるキーワード走査) |
 | `DOMAIN_PREFILTER_MIN_MATCHES` | `1` | 候補ドメインとなる最小キーワードヒット数 |
+| `RAG_ENABLED` | `true` | RAG 分類 (過去セッション埋め込みベースの k-NN 加重投票) |
+| `RAG_K` | `7` | k-NN 検索時の近傍数 |
+| `RAG_CONFIDENCE_THRESHOLD` | `0.5` | RAG 確信度閾値 (top 投票比率がこれ以上で LLM スキップ) |
+| `RAG_MIN_SESSIONS` | `20` | RAG 有効化に必要な最小インデックスセッション数 |
 
 ### 深夜スケジューラ
 
@@ -606,6 +618,20 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 - Viewer の「Tag」ボタンからバッチ実行も可能
 - `tools/tag_all.py` で CLI からも実行可能
 
+### RAG 分類 (Phase 4)
+
+過去のタグ付き済みセッションの埋め込みベクトル (Gemini `text-embedding-004`) を使い、
+新セッションを k-NN 加重投票で分類します。LLM を呼ばずに 8-9 割の分類を完結し、
+曖昧なケースのみ LLM にフォールバックします。
+
+- **コスト削減**: Embedding API は LLM 推論の ~1/100。LLM 呼び出しが 1-2 割に減少
+- **精度向上**: 過去事例の正解ラベルを活用した類似度ベース分類
+- **自動学習**: 新セッションのタグ付け完了時にインデックスへ自動追加
+- **起動時自動構築**: インデックスが存在しない場合、起動時にバックグラウンドで自動構築
+- RAG のみの場合: `conversation_type`, `outcomes`, `domains`, `importance`, `quality` を返却 (summary/entities/decision_memo は空)
+- LLM フォールバック時: 全フィールドを含む完全タグを返却
+- Viewer の Settings > RAG タブでインデックス状態確認・再構築が可能
+
 ## 録音 Viewer
 
 `omi-recordings-viewer/` に録音閲覧用の Web アプリを同梱 (ポート 8092):
@@ -829,6 +855,7 @@ omi_whisper_transcribe/
 ├── suggestion_learner.py     # LLM 提案からの自動学習パターン抽出
 ├── correction_metrics.py     # スクリーニング統計メトリクス
 ├── session_tagger.py         # Gemini によるセッションタグ付け
+├── rag_classifier.py         # RAG 分類 (Embedding + k-NN 加重投票)
 ├── keyword_learner.py        # タグ修正ドリブンのキーワード候補学習
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
@@ -844,6 +871,8 @@ omi_whisper_transcribe/
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
 ├── config/                   # 設定ファイル (JSON)
 │   ├── tag_taxonomy.json     # セッションタグ3軸分類 (会話種類・成果物・事業領域)
+│   ├── rag_embeddings.npz   # RAG 埋め込みベクトルインデックス (自動生成)
+│   ├── rag_metadata.json    # RAG セッションメタデータ (自動生成)
 ├── tools/                    # 運用・検証スクリプト
 ├── tests/                    # ユニットテスト (pytest)
 ├── omi-recordings-viewer/    # Viewer Web アプリ

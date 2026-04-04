@@ -845,6 +845,18 @@ async def handle_vibevoice_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# RAG Classifier プロキシ API
+# ============================================================
+
+async def handle_rag_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/rag/status")
+
+
+async def handle_rag_rebuild(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/rag/rebuild", timeout_sec=10)
+
+
+# ============================================================
 # Export API
 # ============================================================
 
@@ -1203,6 +1215,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/vibevoice/start", handle_vibevoice_start)
     app.router.add_get("/api/vibevoice/status", handle_vibevoice_status)
     app.router.add_post("/api/vibevoice/cancel", handle_vibevoice_cancel)
+
+    # RAG classifier プロキシ API
+    app.router.add_get("/api/rag/status", handle_rag_status)
+    app.router.add_post("/api/rag/rebuild", handle_rag_rebuild)
 
     # Export API
     app.router.add_get("/api/export/stats", handle_export_stats)

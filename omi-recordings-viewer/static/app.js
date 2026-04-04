@@ -760,6 +760,7 @@
         loadHotwordsSettings();
         loadVoiceSettings();
         loadTaxonomySettings();
+        loadRagSettings();
     }
 
     function closeSettings() {
@@ -2450,6 +2451,78 @@
                 taxonomyStatusEl.style.color = "#e74c3c";
             }).finally(function () {
                 taxonomySaveBtn.disabled = false;
+            });
+        });
+    }
+
+    // ============================================================
+    // RAG Settings tab
+    // ============================================================
+
+    function loadRagSettings() {
+        var loadingEl = document.getElementById("rag-loading");
+        var infoEl = document.getElementById("rag-info");
+        if (loadingEl) loadingEl.classList.remove("hidden");
+        if (infoEl) infoEl.classList.add("hidden");
+
+        fetch("/api/rag/status").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            if (loadingEl) loadingEl.classList.add("hidden");
+            if (infoEl) infoEl.classList.remove("hidden");
+
+            var readyEl = document.getElementById("rag-ready-badge");
+            if (readyEl) {
+                if (!data.enabled) {
+                    readyEl.innerHTML = '<span style="color:#95a5a6;">DISABLED</span>';
+                } else if (data.ready) {
+                    readyEl.innerHTML = '<span style="color:#2ecc71;">READY</span>';
+                } else {
+                    readyEl.innerHTML = '<span style="color:#f39c12;">NOT READY (' + (data.total_sessions || 0) + '/' + (data.min_sessions || 20) + ')</span>';
+                }
+            }
+            var countEl = document.getElementById("rag-session-count");
+            if (countEl) countEl.textContent = data.total_sessions || 0;
+            var minEl = document.getElementById("rag-min-sessions");
+            if (minEl) minEl.textContent = data.min_sessions || 20;
+            var modelEl = document.getElementById("rag-model");
+            if (modelEl) modelEl.textContent = data.model || "-";
+            var kEl = document.getElementById("rag-k");
+            if (kEl) kEl.textContent = data.k || "-";
+            var confEl = document.getElementById("rag-confidence");
+            if (confEl) confEl.textContent = data.confidence_threshold || "-";
+        }).catch(function (err) {
+            if (loadingEl) loadingEl.classList.add("hidden");
+            if (infoEl) {
+                infoEl.classList.remove("hidden");
+                infoEl.innerHTML = '<div class="text-dim" style="color:#e74c3c;">RAG status unavailable: ' + escapeHtml(err.message) + '</div>';
+            }
+        });
+    }
+
+    var ragRebuildBtn = document.getElementById("rag-rebuild-btn");
+    if (ragRebuildBtn) {
+        ragRebuildBtn.addEventListener("click", function () {
+            if (!confirm("RAG インデックスを再構築しますか？")) return;
+            var statusMsg = document.getElementById("rag-status-msg");
+            ragRebuildBtn.disabled = true;
+            if (statusMsg) { statusMsg.textContent = "再構築中..."; statusMsg.style.color = "#f39c12"; }
+            fetch("/api/rag/rebuild", { method: "POST" }).then(function (r) {
+                return r.json();
+            }).then(function (data) {
+                if (data.error) {
+                    if (statusMsg) { statusMsg.textContent = "Error: " + data.error; statusMsg.style.color = "#e74c3c"; }
+                } else {
+                    if (statusMsg) { statusMsg.textContent = "再構築開始しました"; statusMsg.style.color = "#2ecc71"; }
+                    // Poll for completion
+                    setTimeout(function () { loadRagSettings(); }, 5000);
+                }
+            }).catch(function (err) {
+                if (statusMsg) { statusMsg.textContent = "Error: " + err.message; statusMsg.style.color = "#e74c3c"; }
+            }).finally(function () {
+                ragRebuildBtn.disabled = false;
+                setTimeout(function () { if (statusMsg) statusMsg.textContent = ""; }, 5000);
             });
         });
     }

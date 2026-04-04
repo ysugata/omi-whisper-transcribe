@@ -77,6 +77,12 @@ TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
 DOMAIN_PREFILTER_ENABLED = os.environ.get("DOMAIN_PREFILTER_ENABLED", "true").lower() in ("true", "1", "yes")
 DOMAIN_PREFILTER_MIN_MATCHES = int(os.environ.get("DOMAIN_PREFILTER_MIN_MATCHES", "1"))
 
+# --- RAG 分類設定 ---
+RAG_ENABLED = os.environ.get("RAG_ENABLED", "true").lower() in ("true", "1", "yes")
+RAG_K = int(os.environ.get("RAG_K", "7"))
+RAG_CONFIDENCE_THRESHOLD = float(os.environ.get("RAG_CONFIDENCE_THRESHOLD", "0.5"))
+RAG_MIN_SESSIONS = int(os.environ.get("RAG_MIN_SESSIONS", "20"))
+
 # --- 音響シーン分類設定 ---
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")
 AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
@@ -158,6 +164,7 @@ from audio_preprocessor import AudioPreprocessor
 from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
 from session_tagger import SessionTagger
+from rag_classifier import RagClassifier
 from training_sanitizer import TrainingSanitizer
 from responses_sanitizer import ResponsesSanitizer
 from segment_screener import SegmentScreener
@@ -222,6 +229,18 @@ if HF_AUTH_TOKEN:
         hf_token=HF_AUTH_TOKEN,
     )
 
+# RAG 分類器 (Embedding ベース k-NN)
+rag_classifier: RagClassifier | None = None
+if RAG_ENABLED and GEMINI_API_KEY:
+    rag_classifier = RagClassifier(
+        api_key=GEMINI_API_KEY,
+        recordings_dir=RECORDINGS_DIR,
+        index_dir=CONFIG_DIR,
+        k=RAG_K,
+        confidence_threshold=RAG_CONFIDENCE_THRESHOLD,
+        min_sessions=RAG_MIN_SESSIONS,
+    )
+
 # セッションタグ付け (LLM API キーがあれば利用可能)
 TAG_TAXONOMY_PATH = os.path.join(CONFIG_DIR, "tag_taxonomy.json")
 
@@ -234,6 +253,7 @@ if TAGGING_ENABLED and LLM_API_KEY:
         taxonomy_path=TAG_TAXONOMY_PATH,
         prefilter_enabled=DOMAIN_PREFILTER_ENABLED,
         prefilter_min_matches=DOMAIN_PREFILTER_MIN_MATCHES,
+        rag_classifier=rag_classifier,
     )
 
 keyword_learner = KeywordLearner(
@@ -1570,6 +1590,9 @@ async def _batch_session_tag_task(force: bool = False):
                     with open(sess["transcript_path"], "w", encoding="utf-8") as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
 
+                    # Update RAG index
+                    _update_rag_index(sess["path"], segments, tags)
+
                     _batch_session_tag_state["processed"] += 1
                     log.info(f"Batch session tag done: {sess['path']} "
                              f"({tags.get('activity', '?')}, {tags.get('mood', '?')})")
@@ -1808,6 +1831,9 @@ async def _batch_combined_tag_task(force: bool = False):
 
                         with open(sess["transcript_path"], "w", encoding="utf-8") as f:
                             json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+
+                        # Update RAG index
+                        _update_rag_index(sess["path"], segments, tags)
 
                         st["session_tag_processed"] += 1
                         st["processed"] += 1
@@ -2252,6 +2278,43 @@ async def _nightly_scheduler():
 
 
 # ============================================================
+# RAG インデックス自動構築
+# ============================================================
+
+async def _auto_build_rag_index():
+    """Startup hook: build RAG index in background if not present."""
+    if not rag_classifier:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, rag_classifier.build_index)
+        log.info("RAG index built: %d sessions (embedded=%d, errors=%d)",
+                 result.get("total", 0), result.get("embedded", 0), result.get("errors", 0))
+    except Exception as e:
+        log.error("RAG auto-build failed: %s", e)
+
+
+def _update_rag_index(session_id: str, segments: list[dict], tags: dict) -> None:
+    """Add a newly tagged session to the RAG index (called after tag_session)."""
+    if not rag_classifier:
+        return
+    try:
+        plain_text = RagClassifier._extract_plain_text(segments)
+        if len(plain_text) < 10:
+            return
+        embedding = rag_classifier.embed_text(plain_text)
+        rag_classifier.add_session(session_id, embedding, {
+            "conversation_type": tags.get("conversation_type", ""),
+            "outcomes": tags.get("outcomes", []),
+            "domains": tags.get("domains", []),
+            "importance": tags.get("importance", "低"),
+            "quality": tags.get("quality", "clean"),
+        })
+    except Exception as e:
+        log.debug("RAG index update failed for %s: %s", session_id, e)
+
+
+# ============================================================
 # WebSocket ハンドラ
 # ============================================================
 
@@ -2636,6 +2699,10 @@ async def main():
     else:
         reason = "DISABLED" if not TAGGING_ENABLED else "no GEMINI_API_KEY"
         log.info(f"Session tagger: {reason}")
+    if rag_classifier:
+        log.info(f"RAG classifier: ON (k={RAG_K}, threshold={RAG_CONFIDENCE_THRESHOLD}, min={RAG_MIN_SESSIONS})")
+    else:
+        log.info("RAG classifier: DISABLED")
     if VAD_SEG_ENABLED:
         log.info(f"VAD segmentation: ON (check={VAD_CHECK_INTERVAL}s, "
                  f"silence_trigger={VAD_SILENCE_TRIGGER}s, max_buffer={VAD_MAX_BUFFER}s)")
@@ -2651,6 +2718,15 @@ async def main():
 
     # 起動時に古い録音を削除
     cleanup_old_recordings()
+
+    # RAG index: load or build in background
+    if rag_classifier:
+        if rag_classifier.has_index():
+            rag_classifier.load_index()
+            log.info("RAG index loaded: %d sessions", rag_classifier.session_count())
+        else:
+            log.info("RAG index not found, building in background...")
+            asyncio.create_task(_auto_build_rag_index())
 
     # Batch corrector initialization (needs known_terms which depend on term_corrector + hotword_loader)
     if llm_pipeline:
@@ -3522,6 +3598,31 @@ async def main():
         job = batch_corrector.process_now(session_id)
         return web.json_response(job.to_dict())
 
+    # --- RAG classifier API ---
+
+    async def handle_rag_status(request):
+        if not rag_classifier:
+            return web.json_response({"ready": False, "enabled": False, "total_sessions": 0})
+        status = rag_classifier.get_status()
+        status["enabled"] = True
+        return web.json_response(status)
+
+    async def handle_rag_rebuild(request):
+        if not rag_classifier:
+            return web.json_response({"error": "RAG classifier not enabled"}, status=503)
+        # Delete existing index files and rebuild
+        import os as _os
+        npz = os.path.join(CONFIG_DIR, "rag_embeddings.npz")
+        meta = os.path.join(CONFIG_DIR, "rag_metadata.json")
+        for p in (npz, meta):
+            if _os.path.exists(p):
+                _os.remove(p)
+        # Reset in-memory index
+        rag_classifier._embeddings = None
+        rag_classifier._metadata = []
+        asyncio.create_task(_auto_build_rag_index())
+        return web.json_response({"status": "rebuild_started"})
+
     # --- Nightly scheduler API ---
 
     async def handle_nightly_status(request):
@@ -3620,6 +3721,9 @@ async def main():
     mgmt_app.router.add_get("/batch/jobs", handle_batch_llm_jobs)
     mgmt_app.router.add_post("/batch/retry", handle_batch_llm_retry)
     mgmt_app.router.add_post("/batch/process", handle_batch_llm_process)
+    # RAG classifier API
+    mgmt_app.router.add_get("/rag/status", handle_rag_status)
+    mgmt_app.router.add_post("/rag/rebuild", handle_rag_rebuild)
     # Nightly scheduler API
     mgmt_app.router.add_get("/nightly/status", handle_nightly_status)
     mgmt_app.router.add_post("/nightly/trigger", handle_nightly_trigger)

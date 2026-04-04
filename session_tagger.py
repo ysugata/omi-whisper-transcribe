@@ -143,6 +143,7 @@ class SessionTagger:
         taxonomy_path: str = "",
         prefilter_enabled: bool = True,
         prefilter_min_matches: int = 1,
+        rag_classifier=None,
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
@@ -153,6 +154,8 @@ class SessionTagger:
         self._taxonomy = _load_taxonomy(taxonomy_path)
         self._prefilter_enabled = prefilter_enabled
         self._prefilter_min_matches = max(1, prefilter_min_matches)
+
+        self._rag = rag_classifier
 
         if self._enabled:
             try:
@@ -414,6 +417,8 @@ class SessionTagger:
     def tag_session(self, segments: list[dict], audio_scene: dict | None = None) -> Optional[dict]:
         """Tag a session's segments and return tags dict.
 
+        Uses RAG classification first if available and confident.
+        Falls back to LLM on ambiguous results or when RAG is not ready.
         Returns None on error (API failure, invalid response, etc.).
         """
         if not self._enabled:
@@ -427,6 +432,39 @@ class SessionTagger:
             log.debug("SessionTagger: session text too short, skipping")
             return None
 
+        # --- Phase 1: RAG classification ---
+        rag_result = None
+        if self._rag and self._rag.is_ready():
+            try:
+                from rag_classifier import RagClassifier
+                plain_text = RagClassifier._extract_plain_text(segments)
+                rag_result = self._rag.classify(plain_text)
+            except Exception as e:
+                log.warning("RAG classify failed: %s", e)
+
+        if rag_result and rag_result["confident"]:
+            tags = self._validate_tags(rag_result["tags"])
+            tags["tagged_at"] = datetime.now().isoformat()
+            tags["tag_version"] = 2
+            tags["tag_source"] = "rag"
+            tags["rag_similarity"] = round(rag_result["top_similarity"], 4)
+            # Apply speaker-derived metadata
+            stats = self._compute_speaker_stats(segments)
+            if stats["has_voice_tags"]:
+                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
+                if stats["unknown_ratio"] >= 0.8:
+                    tags["domains"] = []
+            else:
+                tags["external_audio_ratio"] = None
+            # RAG does not produce summary/entities/decision_memo
+            tags.setdefault("summary", "")
+            tags.setdefault("entities", [])
+            tags.setdefault("decision_memo", None)
+            log.info("SessionTagger[RAG]: type=%s, domains=%s, sim=%.3f",
+                     tags["conversation_type"], tags["domains"], rag_result["top_similarity"])
+            return tags
+
+        # --- Phase 2: LLM fallback ---
         # Domain prefilter: scan keywords and inject hint into user message
         prefilter_hint = ""
         if self._prefilter_enabled:
@@ -457,6 +495,7 @@ class SessionTagger:
             tags = self._validate_tags(parsed)
             tags["tagged_at"] = datetime.now().isoformat()
             tags["tag_version"] = 2
+            tags["tag_source"] = "llm"
 
             # Add speaker-derived metadata
             stats = self._compute_speaker_stats(segments)
@@ -469,7 +508,7 @@ class SessionTagger:
                 tags["external_audio_ratio"] = None
 
             log.info(
-                f"SessionTagger: type={tags['conversation_type']}, "
+                f"SessionTagger[LLM]: type={tags['conversation_type']}, "
                 f"outcomes={tags['outcomes']}, "
                 f"domains={tags['domains']}, "
                 f"summary={tags['summary'][:50]}"

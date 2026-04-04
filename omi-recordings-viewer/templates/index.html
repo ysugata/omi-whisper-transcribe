@@ -123,6 +123,7 @@
                 <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
                 <button class="tab" data-tab="voice-tab">Voice</button>
                 <button class="tab" data-tab="taxonomy-tab">Taxonomy</button>
+                <button class="tab" data-tab="rag-tab">RAG</button>
                 <button class="tab" data-tab="export-tab">Export</button>
             </div>
 
@@ -270,6 +271,28 @@
                     <div class="taxonomy-actions">
                         <button id="taxonomy-save-btn" class="btn-primary">Save Taxonomy</button>
                         <span id="taxonomy-status" class="save-status"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RAG tab -->
+            <div id="rag-tab" class="tab-content">
+                <p class="text-dim">過去セッションの埋め込みベクトルを使い、LLM なしで高速にタグ分類します。</p>
+                <div id="rag-status-panel" style="margin:12px 0;">
+                    <div class="text-dim" id="rag-loading">読み込み中...</div>
+                    <div id="rag-info" class="hidden">
+                        <table class="rag-status-table" style="width:100%;font-size:0.9em;">
+                            <tr><td>Status</td><td id="rag-ready-badge">-</td></tr>
+                            <tr><td>Index Sessions</td><td id="rag-session-count">-</td></tr>
+                            <tr><td>Min Sessions</td><td id="rag-min-sessions">-</td></tr>
+                            <tr><td>Model</td><td id="rag-model">-</td></tr>
+                            <tr><td>k</td><td id="rag-k">-</td></tr>
+                            <tr><td>Confidence</td><td id="rag-confidence">-</td></tr>
+                        </table>
+                        <div style="margin-top:12px;">
+                            <button id="rag-rebuild-btn" class="btn-danger">Rebuild Index</button>
+                            <span id="rag-status-msg" class="save-status"></span>
+                        </div>
                     </div>
                 </div>
             </div>
