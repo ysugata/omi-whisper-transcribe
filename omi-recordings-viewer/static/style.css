@@ -392,6 +392,37 @@ main {
     border-color: var(--accent);
 }
 
+/* Settings attention badge (on gear button) */
+.settings-attention-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #e67e22;
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    position: relative;
+    top: -6px;
+    margin-left: 2px;
+}
+.settings-attention-badge.hidden { display: none; }
+
+/* Nav attention dot (orange dot on nav items) */
+.nav-attention-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    background: #e67e22;
+    border-radius: 50%;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+.nav-attention-dot.hidden { display: none; }
+
 /* Settings modal */
 .settings-modal-content {
     max-width: 920px;

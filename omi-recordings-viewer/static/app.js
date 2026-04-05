@@ -763,6 +763,7 @@
         loadTaxonomySettings();
         loadRagSettings();
         loadRefinerSettings();
+        checkSettingsAttention();
     }
 
     function closeSettings() {
@@ -2889,6 +2890,7 @@
                 reviewDrawer.classList.add("visible");
                 loadDrawerSuggestions();
                 loadDrawerTerms();
+                loadDrawerRefiner();
             } else {
                 reviewDrawer.classList.remove("visible");
             }
@@ -2911,6 +2913,107 @@
         fetch("/api/terms").then(function (r) { return r.json(); }).then(function (data) {
             renderTermsInto(drawerTermsListEl, data, null);
         });
+    }
+
+    // --- Drawer Refiner ---
+    var drawerRefinerStatus = document.getElementById("drawer-refiner-status");
+    var drawerRefinerPending = document.getElementById("drawer-refiner-pending");
+
+    function loadDrawerRefiner() {
+        if (!drawerRefinerStatus) return;
+        drawerRefinerStatus.textContent = "読み込み中...";
+        drawerRefinerStatus.classList.remove("hidden");
+        if (drawerRefinerPending) drawerRefinerPending.classList.add("hidden");
+
+        fetch("/api/taxonomy/refine/status").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            var statusParts = [];
+            statusParts.push(data.enabled ? "有効" : "無効");
+            if (data.running) statusParts.push("実行中 (" + (data.phase || "") + ")");
+            if (data.last_run) statusParts.push("最終: " + data.last_run);
+            drawerRefinerStatus.textContent = statusParts.join(" / ");
+
+            if (data.has_pending) {
+                loadDrawerRefinerPending();
+            }
+            if (data.running) {
+                setTimeout(loadDrawerRefiner, 5000);
+            }
+        }).catch(function (err) {
+            drawerRefinerStatus.textContent = "Error: " + err.message;
+        });
+    }
+
+    function loadDrawerRefinerPending() {
+        if (!drawerRefinerPending) return;
+        fetch("/api/taxonomy/refine/pending").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            if (!data.pending) return;
+            drawerRefinerPending.classList.remove("hidden");
+
+            var changes = data.pending.changes || [];
+            var typeColors = {"split": "#3498db", "merge": "#e67e22", "new": "#2ecc71", "remove": "#e74c3c"};
+            var html = "<div style='margin-bottom:8px;font-size:0.85em;color:var(--text-dim);'>" + changes.length + " 件の提案</div>";
+
+            changes.forEach(function (c, idx) {
+                var typeColor = typeColors[c.type] || "#aaa";
+                html += "<div class='refiner-change-card accepted' data-index='" + idx + "' style='margin-bottom:6px;padding:8px;'>";
+                html += "<div style='margin-bottom:4px;'>";
+                html += "<span style='color:" + typeColor + ";font-weight:bold;font-size:0.8em;'>[" + escapeHtml(c.type) + "]</span> ";
+                html += "<span style='font-size:0.85em;'>" + escapeHtml(c.axis || "") + "</span>";
+                html += "</div>";
+                html += "<div style='font-size:0.8em;color:var(--text-dim);'>" + escapeHtml(c.description || "") + "</div>";
+                html += "</div>";
+            });
+
+            if (data.pending.validation) {
+                var v = data.pending.validation;
+                html += "<div style='margin-top:8px;font-size:0.8em;color:var(--text-dim);'>";
+                html += "検証: 精度 " + ((v.accuracy_vs_current * 100).toFixed(1)) + "% / ";
+                html += "<span style='color:#2ecc71;'>改善 " + (v.improved_count || 0) + "</span> / ";
+                html += "<span style='color:#e74c3c;'>劣化 " + (v.degraded_count || 0) + "</span>";
+                html += "</div>";
+            }
+
+            html += "<div style='margin-top:10px;display:flex;gap:6px;'>";
+            html += "<button class='btn-sm btn-primary' id='drawer-refiner-approve'>全て承認</button>";
+            html += "<button class='btn-sm' id='drawer-refiner-reject' style='background:#e74c3c;color:#fff;'>却下</button>";
+            html += "</div>";
+
+            drawerRefinerPending.innerHTML = html;
+
+            var approveBtn = document.getElementById("drawer-refiner-approve");
+            if (approveBtn) {
+                approveBtn.addEventListener("click", function () {
+                    if (!confirm("全ての変更を適用してタクソノミーを更新しますか？")) return;
+                    fetch("/api/taxonomy/refine/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+                        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+                        .then(function (res) {
+                            alert("承認: " + (res.accepted || 0) + " 件適用。タクソノミーが更新されました。");
+                            loadDrawerRefiner();
+                            checkSettingsAttention();
+                        }).catch(function (err) { alert("Error: " + err.message); });
+                });
+            }
+
+            var rejectBtn = document.getElementById("drawer-refiner-reject");
+            if (rejectBtn) {
+                rejectBtn.addEventListener("click", function () {
+                    if (!confirm("提案を却下しますか？")) return;
+                    fetch("/api/taxonomy/refine/reject", { method: "POST" })
+                        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+                        .then(function () {
+                            alert("却下しました。");
+                            loadDrawerRefiner();
+                            checkSettingsAttention();
+                        }).catch(function (err) { alert("Error: " + err.message); });
+                });
+            }
+        }).catch(function () {});
     }
 
     function renderTermsInto(container, data, filter) {
@@ -3279,6 +3382,84 @@
         }, 3000);
     }
 
+    // --- Settings attention badge ---
+
+    var settingsAttentionBadge = document.getElementById("settings-attention-badge");
+    var navDotSuggestions = document.getElementById("nav-dot-suggestions");
+    var navDotRag = document.getElementById("nav-dot-rag");
+    var navDotRefiner = document.getElementById("nav-dot-refiner");
+    var navDotVoice = document.getElementById("nav-dot-voice");
+
+    function checkSettingsAttention() {
+        var count = 0;
+        var done = 0;
+        var total = 4;
+
+        function update() {
+            done++;
+            if (done < total) return;
+            if (count > 0) {
+                settingsAttentionBadge.textContent = count;
+                settingsAttentionBadge.classList.remove("hidden");
+            } else {
+                settingsAttentionBadge.classList.add("hidden");
+            }
+        }
+
+        // 1. Voice: 0 speakers registered
+        fetch("/api/speakers/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data || data.speaker_count === 0) {
+                count++;
+                if (navDotVoice) navDotVoice.classList.remove("hidden");
+            } else {
+                if (navDotVoice) navDotVoice.classList.add("hidden");
+            }
+            update();
+        }).catch(function () { update(); });
+
+        // 2. LLM Suggestions pending
+        fetch("/api/suggestions").then(function (r) { return r.json(); }).then(function (data) {
+            if (data && data.length > 0) {
+                count++;
+                if (navDotSuggestions) navDotSuggestions.classList.remove("hidden");
+            } else {
+                if (navDotSuggestions) navDotSuggestions.classList.add("hidden");
+            }
+            update();
+        }).catch(function () { update(); });
+
+        // 3. RAG not built
+        fetch("/api/rag/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (!data || !data.ready) {
+                count++;
+                if (navDotRag) navDotRag.classList.remove("hidden");
+            } else {
+                if (navDotRag) navDotRag.classList.add("hidden");
+            }
+            update();
+        }).catch(function () { update(); });
+
+        // 4. Refiner has pending proposals
+        fetch("/api/taxonomy/refine/status").then(function (r) {
+            if (!r.ok) return null;
+            return r.json();
+        }).then(function (data) {
+            if (data && data.has_pending) {
+                count++;
+                if (navDotRefiner) navDotRefiner.classList.remove("hidden");
+            } else {
+                if (navDotRefiner) navDotRefiner.classList.add("hidden");
+            }
+            update();
+        }).catch(function () { update(); });
+    }
+
     // --- Init ---
     Promise.all([loadSpeakerNames(), loadTaxonomy(), loadAudioSceneLabels()]).then(function () {
         loadPage(1);
@@ -3287,4 +3468,5 @@
     checkBatchStatus("tags");
     loadHotwordsStatus();
     loadReviewStats();
+    checkSettingsAttention();
 })();

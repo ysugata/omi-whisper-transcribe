@@ -25,7 +25,7 @@
             レビュー <span id="review-count-badge" class="review-count-badge hidden">0</span>
         </button>
 
-        <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
+        <button id="settings-btn" class="settings-btn" title="Settings">&#9881;<span id="settings-attention-badge" class="settings-attention-badge hidden">0</span></button>
     </header>
 
     <div id="filter-panel" class="filter-panel hidden">
@@ -126,12 +126,12 @@
                 <button class="settings-nav-item" data-tab="terms-tab">Term Corrections</button>
                 <button class="settings-nav-item" data-tab="hotwords-tab">Hotwords</button>
                 <div class="settings-nav-category">AI パイプライン</div>
-                <button class="settings-nav-item" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
+                <button class="settings-nav-item" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span><span id="nav-dot-suggestions" class="nav-attention-dot hidden"></span></button>
                 <button class="settings-nav-item" data-tab="taxonomy-tab">Taxonomy</button>
-                <button class="settings-nav-item" data-tab="rag-tab">RAG</button>
-                <button class="settings-nav-item" data-tab="refiner-tab">Refiner</button>
+                <button class="settings-nav-item" data-tab="rag-tab">RAG <span id="nav-dot-rag" class="nav-attention-dot hidden"></span></button>
+                <button class="settings-nav-item" data-tab="refiner-tab">Refiner <span id="nav-dot-refiner" class="nav-attention-dot hidden"></span></button>
                 <div class="settings-nav-category">話者・音声</div>
-                <button class="settings-nav-item" data-tab="voice-tab">Voice</button>
+                <button class="settings-nav-item" data-tab="voice-tab">Voice <span id="nav-dot-voice" class="nav-attention-dot hidden"></span></button>
                 <div class="settings-nav-category">データ</div>
                 <button class="settings-nav-item" data-tab="export-tab">Export</button>
             </nav>
@@ -478,7 +478,8 @@
             </div>
             <div class="drawer-tabs">
                 <button class="drawer-tab active" data-drawer-tab="drawer-suggestions">LLM Suggestions</button>
-                <button class="drawer-tab" data-drawer-tab="drawer-terms">Term Corrections</button>
+                <button class="drawer-tab" data-drawer-tab="drawer-terms">Terms</button>
+                <button class="drawer-tab" data-drawer-tab="drawer-refiner">Refiner</button>
             </div>
             <div id="drawer-suggestions" class="drawer-tab-content active">
                 <div id="drawer-suggestions-list"></div>
@@ -490,6 +491,10 @@
                     <button id="drawer-term-add-btn" class="btn-primary">Add</button>
                 </div>
                 <div id="drawer-terms-list" class="terms-list" style="max-height:calc(100vh - 240px);"></div>
+            </div>
+            <div id="drawer-refiner" class="drawer-tab-content">
+                <div id="drawer-refiner-status" class="text-dim" style="padding:8px 0;">読み込み中...</div>
+                <div id="drawer-refiner-pending" class="hidden"></div>
             </div>
         </div>
     </div>
