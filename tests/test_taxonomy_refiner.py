@@ -306,6 +306,7 @@ class TestApproveUpdatesTaxonomy:
 
         result = refiner.approve_proposal()
         assert result["status"] == "approved"
+        assert result["accepted"] == 1
 
         # Verify taxonomy was updated
         with open(taxonomy_path) as f:
@@ -321,6 +322,222 @@ class TestApproveUpdatesTaxonomy:
         with open(os.path.join(reports_dir, "2026-04.json")) as f:
             report = json.load(f)
         assert report["status"] == "approved"
+
+
+class TestSelectiveApproval:
+    """Test approving individual changes from a proposal."""
+
+    def test_partial_approve(self, tmp_dirs):
+        """Approve one change, reject another."""
+        rec_dir, cfg_dir = tmp_dirs
+        taxonomy_path = os.path.join(cfg_dir, "tag_taxonomy.json")
+
+        initial = {
+            "conversation_type": ["会議", "雑談"],
+            "outcomes": ["情報共有"],
+            "domains": ["技術"],
+            "keyword_anchors": {},
+            "domain_descriptions": {},
+        }
+        with open(taxonomy_path, "w") as f:
+            json.dump(initial, f)
+
+        pending_path = os.path.join(cfg_dir, "pending_taxonomy.json")
+        pending = {
+            "created_at": "2026-04-01T00:00:00",
+            "proposed_taxonomy": {
+                "conversation_type": ["会議", "雑談", "報告"],
+                "outcomes": ["情報共有", "意思決定"],
+                "domains": ["技術", "健康"],
+                "keyword_anchors": {"健康": ["病院"]},
+                "domain_descriptions": {"健康": "健康関連"},
+            },
+            "changes": [
+                {"type": "new", "axis": "conversation_type",
+                 "description": "報告を追加", "before": [], "after": ["報告"]},
+                {"type": "new", "axis": "domains",
+                 "description": "健康を追加", "before": [], "after": ["健康"]},
+            ],
+            "validation": {"accuracy_vs_current": 0.95},
+        }
+        with open(pending_path, "w") as f:
+            json.dump(pending, f)
+
+        reports_dir = os.path.join(cfg_dir, "taxonomy_reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        with open(os.path.join(reports_dir, "2026-04.json"), "w") as f:
+            json.dump({"status": "pending_approval"}, f)
+
+        refiner = TaxonomyRefiner(
+            api_key="fake", recordings_dir=rec_dir, config_dir=cfg_dir,
+            rag_classifier=None,
+        )
+
+        # Accept only change 0 (報告), reject change 1 (健康)
+        result = refiner.approve_proposal(accepted_indices=[0])
+        assert result["status"] == "partial"
+        assert result["accepted"] == 1
+        assert result["rejected"] == 1
+
+        with open(taxonomy_path) as f:
+            updated = json.load(f)
+
+        # "報告" should be added (accepted)
+        assert "報告" in updated["conversation_type"]
+        # "健康" should NOT be added (rejected/reverted)
+        assert "健康" not in updated["domains"]
+        # keyword_anchors for 健康 should not exist
+        assert "健康" not in updated.get("keyword_anchors", {})
+
+        assert not os.path.exists(pending_path)
+
+    def test_reject_all_via_empty_indices(self, tmp_dirs):
+        """Passing empty accepted_indices should revert all changes."""
+        rec_dir, cfg_dir = tmp_dirs
+        taxonomy_path = os.path.join(cfg_dir, "tag_taxonomy.json")
+
+        initial = {
+            "conversation_type": ["会議"],
+            "outcomes": [],
+            "domains": ["技術"],
+            "keyword_anchors": {},
+            "domain_descriptions": {},
+        }
+        with open(taxonomy_path, "w") as f:
+            json.dump(initial, f)
+
+        pending_path = os.path.join(cfg_dir, "pending_taxonomy.json")
+        pending = {
+            "created_at": "2026-04-01T00:00:00",
+            "proposed_taxonomy": {
+                "conversation_type": ["会議", "雑談"],
+                "outcomes": [],
+                "domains": ["技術", "AI"],
+                "keyword_anchors": {"AI": ["GPT"]},
+                "domain_descriptions": {"AI": "AI関連"},
+            },
+            "changes": [
+                {"type": "new", "axis": "conversation_type",
+                 "before": [], "after": ["雑談"]},
+                {"type": "new", "axis": "domains",
+                 "before": [], "after": ["AI"]},
+            ],
+            "validation": {},
+        }
+        with open(pending_path, "w") as f:
+            json.dump(pending, f)
+
+        refiner = TaxonomyRefiner(
+            api_key="fake", recordings_dir=rec_dir, config_dir=cfg_dir,
+            rag_classifier=None,
+        )
+
+        result = refiner.approve_proposal(accepted_indices=[])
+        assert result["accepted"] == 0
+        assert result["rejected"] == 2
+
+        with open(taxonomy_path) as f:
+            updated = json.load(f)
+        assert "雑談" not in updated["conversation_type"]
+        assert "AI" not in updated["domains"]
+
+    def test_revert_merge(self, tmp_dirs):
+        """Rejecting a merge change should restore the original items."""
+        rec_dir, cfg_dir = tmp_dirs
+        taxonomy_path = os.path.join(cfg_dir, "tag_taxonomy.json")
+
+        initial = {
+            "conversation_type": ["会議", "ミーティング"],
+            "outcomes": [],
+            "domains": [],
+            "keyword_anchors": {},
+            "domain_descriptions": {},
+        }
+        with open(taxonomy_path, "w") as f:
+            json.dump(initial, f)
+
+        pending_path = os.path.join(cfg_dir, "pending_taxonomy.json")
+        pending = {
+            "created_at": "2026-04-01T00:00:00",
+            "proposed_taxonomy": {
+                "conversation_type": ["社内ミーティング"],
+                "outcomes": [],
+                "domains": [],
+                "keyword_anchors": {},
+                "domain_descriptions": {},
+            },
+            "changes": [
+                {"type": "merge", "axis": "conversation_type",
+                 "description": "会議とミーティングを統合",
+                 "before": ["会議", "ミーティング"],
+                 "after": ["社内ミーティング"]},
+            ],
+            "validation": {},
+        }
+        with open(pending_path, "w") as f:
+            json.dump(pending, f)
+
+        refiner = TaxonomyRefiner(
+            api_key="fake", recordings_dir=rec_dir, config_dir=cfg_dir,
+            rag_classifier=None,
+        )
+
+        # Reject the merge
+        result = refiner.approve_proposal(accepted_indices=[])
+
+        with open(taxonomy_path) as f:
+            updated = json.load(f)
+        # Original items should be restored
+        assert "会議" in updated["conversation_type"]
+        assert "ミーティング" in updated["conversation_type"]
+        assert "社内ミーティング" not in updated["conversation_type"]
+
+    def test_revert_remove(self, tmp_dirs):
+        """Rejecting a remove change should restore the removed item."""
+        rec_dir, cfg_dir = tmp_dirs
+        taxonomy_path = os.path.join(cfg_dir, "tag_taxonomy.json")
+
+        initial = {
+            "conversation_type": ["会議", "雑談"],
+            "outcomes": [],
+            "domains": [],
+            "keyword_anchors": {},
+            "domain_descriptions": {},
+        }
+        with open(taxonomy_path, "w") as f:
+            json.dump(initial, f)
+
+        pending_path = os.path.join(cfg_dir, "pending_taxonomy.json")
+        pending = {
+            "created_at": "2026-04-01T00:00:00",
+            "proposed_taxonomy": {
+                "conversation_type": ["会議"],
+                "outcomes": [],
+                "domains": [],
+                "keyword_anchors": {},
+                "domain_descriptions": {},
+            },
+            "changes": [
+                {"type": "remove", "axis": "conversation_type",
+                 "description": "雑談を削除",
+                 "before": ["雑談"], "after": []},
+            ],
+            "validation": {},
+        }
+        with open(pending_path, "w") as f:
+            json.dump(pending, f)
+
+        refiner = TaxonomyRefiner(
+            api_key="fake", recordings_dir=rec_dir, config_dir=cfg_dir,
+            rag_classifier=None,
+        )
+
+        # Reject the remove → 雑談 should be restored
+        result = refiner.approve_proposal(accepted_indices=[])
+
+        with open(taxonomy_path) as f:
+            updated = json.load(f)
+        assert "雑談" in updated["conversation_type"]
 
 
 class TestRejectCleansPending:

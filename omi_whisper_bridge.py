@@ -3686,7 +3686,15 @@ async def main():
     async def handle_taxonomy_refine_approve(request):
         if not taxonomy_refiner:
             return web.json_response({"error": "Taxonomy refiner not enabled"}, status=503)
-        result = taxonomy_refiner.approve_proposal()
+        # Support selective approval via accepted_indices
+        accepted_indices = None
+        try:
+            body = await request.json()
+            if "accepted_indices" in body:
+                accepted_indices = [int(i) for i in body["accepted_indices"]]
+        except Exception:
+            pass  # No body or invalid JSON → approve all
+        result = taxonomy_refiner.approve_proposal(accepted_indices=accepted_indices)
         if "error" in result:
             return web.json_response(result, status=400)
         # Reload taxonomy in session tagger

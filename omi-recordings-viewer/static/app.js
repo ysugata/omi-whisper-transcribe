@@ -699,7 +699,7 @@
     var filterPanel = document.getElementById("filter-panel");
     var filterClearBtn = document.getElementById("filter-clear-btn");
     var filterCountBadge = document.getElementById("filter-count-badge");
-    var allFilterSelects = [filterConversationType, filterOutcome, filterDomain, filterImportanceV2, filterUserTag, filterSpeaker, filterAudioScene];
+    var allFilterSelects = [filterConversationType, filterOutcome, filterDomain, filterImportanceV2, filterSpeaker, filterAudioScene];
 
     function updateFilterCount() {
         var count = 0;
@@ -2607,13 +2607,43 @@
             var changesList = document.getElementById("refiner-changes-list");
             if (changesList && data.pending.changes) {
                 var html = "";
-                data.pending.changes.forEach(function (c) {
-                    var typeColor = {"split": "#3498db", "merge": "#e67e22", "new": "#2ecc71", "remove": "#e74c3c"}[c.type] || "#aaa";
-                    html += "<div style='margin:4px 0;'><span style='color:" + typeColor + ";font-weight:bold;'>[" + c.type + "]</span> " + (c.axis || "") + ": " + (c.description || "") + "</div>";
-                    if (c.before && c.before.length) html += "<div style='margin-left:16px;color:#999;'>Before: " + c.before.join(", ") + "</div>";
-                    if (c.after && c.after.length) html += "<div style='margin-left:16px;color:#ccc;'>After: " + c.after.join(", ") + "</div>";
+                var typeColors = {"split": "#3498db", "merge": "#e67e22", "new": "#2ecc71", "remove": "#e74c3c"};
+                data.pending.changes.forEach(function (c, idx) {
+                    var typeColor = typeColors[c.type] || "#aaa";
+                    html += "<div class='refiner-change-card accepted' data-index='" + idx + "'>";
+                    html += "<div class='card-header'>";
+                    html += "<input type='checkbox' class='refiner-change-cb' data-index='" + idx + "' checked>";
+                    html += "<span style='color:" + typeColor + ";font-weight:bold;'>[" + c.type + "]</span> ";
+                    html += "<span>" + (c.axis || "") + "</span>";
+                    html += "</div>";
+                    html += "<div class='card-detail'>" + (c.description || "") + "</div>";
+                    if (c.before && c.before.length) {
+                        html += "<div class='card-detail' style='color:#999;'>Before: " + c.before.join(", ") + "</div>";
+                    }
+                    if (c.after && c.after.length) {
+                        html += "<div class='card-detail' style='color:#ccc;'>After: " + c.after.join(", ") + "</div>";
+                    }
+                    html += "</div>";
                 });
                 changesList.innerHTML = html || "<div class='text-dim'>変更なし</div>";
+
+                // Toggle checkbox on card click
+                changesList.querySelectorAll(".refiner-change-card").forEach(function (card) {
+                    card.addEventListener("click", function (e) {
+                        if (e.target.type === "checkbox") return; // let checkbox handle itself
+                        var cb = card.querySelector(".refiner-change-cb");
+                        if (cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event("change")); }
+                    });
+                });
+                changesList.querySelectorAll(".refiner-change-cb").forEach(function (cb) {
+                    cb.addEventListener("change", function () {
+                        var card = cb.closest(".refiner-change-card");
+                        if (card) {
+                            card.classList.toggle("accepted", cb.checked);
+                            card.classList.toggle("rejected", !cb.checked);
+                        }
+                    });
+                });
             }
 
             var validationEl = document.getElementById("refiner-validation");
@@ -2651,20 +2681,45 @@
         });
     }
 
+    function refinerApproveWith(indices) {
+        var body = indices !== null ? JSON.stringify({ accepted_indices: indices }) : "{}";
+        var label = indices !== null
+            ? (indices.length + " 件の変更を適用")
+            : "全ての変更を適用";
+        if (!confirm(label + "してタクソノミーを更新しますか？")) return;
+        fetch("/api/taxonomy/refine/approve", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: body
+        }).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            var msg = "承認: " + (data.accepted || 0) + " 件適用";
+            if (data.rejected) msg += "、" + data.rejected + " 件スキップ";
+            alert(msg + "。タクソノミーが更新されました。");
+            loadRefinerSettings();
+            loadTaxonomySettings();
+        }).catch(function (err) {
+            alert("Error: " + err.message);
+        });
+    }
+
     var refinerApproveBtn = document.getElementById("refiner-approve-btn");
     if (refinerApproveBtn) {
         refinerApproveBtn.addEventListener("click", function () {
-            if (!confirm("提案を承認してタクソノミーを更新しますか？")) return;
-            fetch("/api/taxonomy/refine/approve", { method: "POST" }).then(function (r) {
-                if (!r.ok) throw new Error("HTTP " + r.status);
-                return r.json();
-            }).then(function () {
-                alert("承認しました。タクソノミーが更新されました。");
-                loadRefinerSettings();
-                loadTaxonomySettings();
-            }).catch(function (err) {
-                alert("Error: " + err.message);
-            });
+            var checked = document.querySelectorAll(".refiner-change-cb:checked");
+            var indices = [];
+            checked.forEach(function (cb) { indices.push(parseInt(cb.getAttribute("data-index"), 10)); });
+            if (indices.length === 0) { alert("適用する変更を選択してください。"); return; }
+            refinerApproveWith(indices);
+        });
+    }
+
+    var refinerApproveAllBtn = document.getElementById("refiner-approve-all-btn");
+    if (refinerApproveAllBtn) {
+        refinerApproveAllBtn.addEventListener("click", function () {
+            refinerApproveWith(null);
         });
     }
 

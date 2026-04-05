@@ -746,8 +746,13 @@ JSON のみを返してください。"""
         except (json.JSONDecodeError, OSError):
             return None
 
-    def approve_proposal(self) -> dict:
-        """Approve the pending proposal and update taxonomy."""
+    def approve_proposal(self, accepted_indices: Optional[list[int]] = None) -> dict:
+        """Approve the pending proposal and update taxonomy.
+
+        Args:
+            accepted_indices: If provided, only apply changes at these indices.
+                If None, apply all changes (backward compatible).
+        """
         pending = self.get_pending_proposal()
         if not pending:
             return {"error": "No pending proposal"}
@@ -756,34 +761,92 @@ JSON のみを返してください。"""
         if not proposed:
             return {"error": "Invalid proposal: no taxonomy"}
 
-        # Load current taxonomy and update
-        taxonomy = self._load_taxonomy()
+        changes = pending.get("changes", [])
 
-        # Update axes
+        if accepted_indices is not None:
+            # Selective approval: start from proposed, revert rejected changes
+            taxonomy = json.loads(json.dumps(proposed))  # deep copy
+            rejected = [i for i in range(len(changes)) if i not in accepted_indices]
+            for idx in rejected:
+                if idx < 0 or idx >= len(changes):
+                    continue
+                self._revert_change(taxonomy, changes[idx])
+            status_label = "partial"
+            accepted_count = len(accepted_indices)
+            rejected_count = len(rejected)
+        else:
+            # Full approval: use proposed as-is
+            taxonomy = json.loads(json.dumps(proposed))
+            status_label = "approved"
+            accepted_count = len(changes)
+            rejected_count = 0
+
+        # Load current taxonomy and merge in the (possibly partial) proposed
+        current = self._load_taxonomy()
         for key in ("conversation_type", "outcomes", "domains"):
-            if key in proposed and isinstance(proposed[key], list):
-                taxonomy[key] = proposed[key]
-
-        # Update keyword_anchors if provided
-        if "keyword_anchors" in proposed and isinstance(proposed["keyword_anchors"], dict):
-            taxonomy["keyword_anchors"] = proposed["keyword_anchors"]
-
-        # Update domain_descriptions if provided
-        if "domain_descriptions" in proposed and isinstance(proposed["domain_descriptions"], dict):
-            taxonomy["domain_descriptions"] = proposed["domain_descriptions"]
+            if key in taxonomy and isinstance(taxonomy[key], list):
+                current[key] = taxonomy[key]
+        if "keyword_anchors" in taxonomy and isinstance(taxonomy["keyword_anchors"], dict):
+            current["keyword_anchors"] = taxonomy["keyword_anchors"]
+        if "domain_descriptions" in taxonomy and isinstance(taxonomy["domain_descriptions"], dict):
+            current["domain_descriptions"] = taxonomy["domain_descriptions"]
 
         # Save updated taxonomy
         with open(self._taxonomy_path, "w", encoding="utf-8") as f:
-            json.dump(taxonomy, f, ensure_ascii=False, indent=2)
+            json.dump(current, f, ensure_ascii=False, indent=2)
 
         # Remove pending
         self._remove_pending()
 
         # Update report status
-        self._update_latest_report_status("approved")
+        self._update_latest_report_status(status_label)
 
-        log.info("Taxonomy proposal approved and applied")
-        return {"status": "approved", "taxonomy": taxonomy}
+        log.info("Taxonomy proposal %s: %d accepted, %d rejected",
+                 status_label, accepted_count, rejected_count)
+        return {"status": status_label, "taxonomy": current,
+                "accepted": accepted_count, "rejected": rejected_count}
+
+    @staticmethod
+    def _revert_change(taxonomy: dict, change: dict) -> None:
+        """Revert a single change from the proposed taxonomy."""
+        axis = change.get("axis", "")
+        ctype = change.get("type", "")
+        before = change.get("before", [])
+        after = change.get("after", [])
+
+        if axis not in ("conversation_type", "outcomes", "domains"):
+            return
+        items = taxonomy.get(axis, [])
+
+        if ctype == "new":
+            # Remove newly added items
+            for item in after:
+                if item in items:
+                    items.remove(item)
+            # Clean up keyword_anchors and domain_descriptions for removed items
+            if axis == "domains":
+                for item in after:
+                    taxonomy.get("keyword_anchors", {}).pop(item, None)
+                    taxonomy.get("domain_descriptions", {}).pop(item, None)
+        elif ctype == "remove":
+            # Add back removed items
+            for item in before:
+                if item not in items:
+                    items.append(item)
+        elif ctype in ("merge", "split"):
+            # Remove after items, add back before items
+            for item in after:
+                if item in items:
+                    items.remove(item)
+            for item in before:
+                if item not in items:
+                    items.append(item)
+            if axis == "domains":
+                for item in after:
+                    taxonomy.get("keyword_anchors", {}).pop(item, None)
+                    taxonomy.get("domain_descriptions", {}).pop(item, None)
+
+        taxonomy[axis] = items
 
     def reject_proposal(self) -> dict:
         """Reject the pending proposal."""

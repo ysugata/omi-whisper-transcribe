@@ -179,7 +179,7 @@ open http://localhost:8092
 | POST | `/taxonomy/refine/run` | 精緻化パイプラインを手動実行 (バックグラウンド) |
 | GET | `/taxonomy/refine/status` | 実行状態・pending 有無・過去レポート |
 | GET | `/taxonomy/refine/pending` | 承認待ち提案の詳細 |
-| POST | `/taxonomy/refine/approve` | 提案を承認してタクソノミーを更新 |
+| POST | `/taxonomy/refine/approve` | 提案を承認してタクソノミーを更新 (`{"accepted_indices": [0,1]}` で個別承認可) |
 | POST | `/taxonomy/refine/reject` | 提案を却下 |
 
 ### 一括タグ付け (セッション + 話者)
