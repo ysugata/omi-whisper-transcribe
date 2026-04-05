@@ -53,6 +53,14 @@ git push origin --delete <branch名>
 
 ### Step 2: Docker ビルド
 
+> **重要: worktree 使用時のビルド順序**
+> Docker Compose は `omi_whisper_transcribe/` (main) のコードをマウント/COPYする。
+> **worktree で開発している場合、先に main へマージしてからビルド**すること。
+> worktree ディレクトリからビルドしても、コンテナには main のコードが入るため、
+> 変更が反映されず結合テストで古いコードをテストしてしまう。
+>
+> 正しい手順: worktree でコミット → main にマージ → `docker compose build`
+
 ```bash
 docker compose build <変更したサービス>
 ```
