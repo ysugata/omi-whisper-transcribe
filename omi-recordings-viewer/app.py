@@ -854,6 +854,14 @@ async def handle_vibevoice_cancel(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Whisper Config プロキシ API
+# ============================================================
+
+async def handle_whisper_config(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/whisper/config")
+
+
+# ============================================================
 # RAG Classifier プロキシ API
 # ============================================================
 
@@ -1299,6 +1307,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/speaker-names", handle_api_speaker_names)
     app.router.add_get("/api/audio-scene-labels", handle_audio_scene_labels)
     app.router.add_get("/api/audio-scene/status", handle_audio_scene_status)
+    app.router.add_get("/api/whisper/config", handle_whisper_config)
     app.router.add_get("/api/sessions/{date}/{time}", handle_api_session_detail)
     app.router.add_get("/audio/{date}/{time}/", handle_audio_auto)
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)

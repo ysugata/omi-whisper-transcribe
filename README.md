@@ -118,6 +118,7 @@ open http://localhost:8092
 | POST | `/model/load` | モデルロード (冪等) |
 | POST | `/model/unload` | モデルアンロード (セッション中は 409) |
 | GET | `/model/status` | モデル状態を返す |
+| GET | `/whisper/config` | Whisper 設定パラメータを返す (読み取り専用) |
 
 ### バッチ話者分離
 

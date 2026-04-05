@@ -117,22 +117,52 @@
     <div id="settings-modal" class="modal hidden">
         <div class="modal-content settings-modal-content">
             <button class="modal-close" id="settings-close">&times;</button>
-            <h2>Whisper Settings</h2>
 
-            <!-- Tabs -->
-            <div class="tabs">
-                <button class="tab active" data-tab="terms-tab">Term Corrections</button>
-                <button class="tab" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
-                <button class="tab" data-tab="hotwords-tab">Hotwords <span id="hotwords-badge" class="badge">0</span></button>
-                <button class="tab" data-tab="voice-tab">Voice</button>
-                <button class="tab" data-tab="taxonomy-tab">Taxonomy</button>
-                <button class="tab" data-tab="rag-tab">RAG</button>
-                <button class="tab" data-tab="refiner-tab">Refiner</button>
-                <button class="tab" data-tab="export-tab">Export</button>
+            <div class="settings-layout">
+            <nav class="settings-nav">
+                <div class="settings-nav-category">システム情報</div>
+                <button class="settings-nav-item active" data-tab="whisper-tab">Whisper</button>
+                <div class="settings-nav-category">文字起こし</div>
+                <button class="settings-nav-item" data-tab="terms-tab">Term Corrections</button>
+                <button class="settings-nav-item" data-tab="hotwords-tab">Hotwords</button>
+                <div class="settings-nav-category">AI パイプライン</div>
+                <button class="settings-nav-item" data-tab="suggestions-tab">LLM Suggestions <span id="suggestion-badge" class="badge hidden">0</span></button>
+                <button class="settings-nav-item" data-tab="taxonomy-tab">Taxonomy</button>
+                <button class="settings-nav-item" data-tab="rag-tab">RAG</button>
+                <button class="settings-nav-item" data-tab="refiner-tab">Refiner</button>
+                <div class="settings-nav-category">話者・音声</div>
+                <button class="settings-nav-item" data-tab="voice-tab">Voice</button>
+                <div class="settings-nav-category">データ</div>
+                <button class="settings-nav-item" data-tab="export-tab">Export</button>
+            </nav>
+
+            <div class="settings-content">
+
+            <!-- Whisper config tab (read-only) -->
+            <div id="whisper-tab" class="tab-content active">
+                <h3 style="font-size:1rem;margin-bottom:12px;">Whisper Configuration</h3>
+                <div id="whisper-loading" class="text-dim" style="padding:12px 0;">読み込み中...</div>
+                <div id="whisper-info" class="hidden">
+                    <table class="whisper-config-table" style="width:100%;font-size:0.9em;">
+                        <tr><td>Model</td><td id="whisper-model-name">-</td></tr>
+                        <tr><td>Compute Type</td><td id="whisper-compute-type">-</td></tr>
+                        <tr><td>Status</td><td id="whisper-loaded">-</td></tr>
+                        <tr><td>Active Sessions</td><td id="whisper-session-count">-</td></tr>
+                        <tr><td>Language</td><td id="whisper-language">-</td></tr>
+                        <tr><td>Beam Size</td><td id="whisper-beam-size">-</td></tr>
+                        <tr><td>VAD Filter</td><td id="whisper-vad-filter">-</td></tr>
+                        <tr><td>No Repeat N-gram</td><td id="whisper-ngram">-</td></tr>
+                        <tr><td>Patience</td><td id="whisper-patience">-</td></tr>
+                        <tr><td>Log Prob Threshold</td><td id="whisper-logprob">-</td></tr>
+                        <tr><td>Max Segment Duration</td><td id="whisper-seg-max">-</td></tr>
+                        <tr><td>Normalize</td><td id="whisper-normalize">-</td></tr>
+                        <tr><td>Noise Reduce</td><td id="whisper-noise-reduce">-</td></tr>
+                    </table>
+                </div>
             </div>
 
             <!-- Term corrections tab -->
-            <div id="terms-tab" class="tab-content active">
+            <div id="terms-tab" class="tab-content">
                 <div class="term-add-row">
                     <input type="text" id="term-wrong" placeholder="Wrong (e.g. クーバネティス)">
                     <input type="text" id="term-correct" placeholder="Correct (e.g. Kubernetes)">
@@ -411,7 +441,9 @@
                     <button id="export-download-btn" class="btn-primary" disabled>Download JSONL</button>
                     <span id="export-status" class="save-status"></span>
                 </div>
-            </div>
+
+            </div><!-- .settings-content -->
+            </div><!-- .settings-layout -->
         </div>
     </div>
 
@@ -433,6 +465,30 @@
                 <button id="review-accept-btn" class="review-action-btn review-accept"><span class="key-badge">A</span> 承認</button>
                 <button id="review-edit-btn" class="review-action-btn review-edit"><span class="key-badge">E</span> 編集</button>
                 <button id="review-skip-btn" class="review-action-btn review-skip"><span class="key-badge">S</span> スキップ</button>
+                <button id="review-drawer-btn" class="review-action-btn review-skip" style="margin-left:auto;"><span class="key-badge">D</span> Settings</button>
+            </div>
+        </div>
+
+        <!-- Review side drawer -->
+        <div id="review-drawer" class="review-drawer">
+            <div class="drawer-header">
+                <span class="drawer-title">Settings</span>
+                <button id="drawer-close-btn" class="review-close-btn">&times;</button>
+            </div>
+            <div class="drawer-tabs">
+                <button class="drawer-tab active" data-drawer-tab="drawer-suggestions">LLM Suggestions</button>
+                <button class="drawer-tab" data-drawer-tab="drawer-terms">Term Corrections</button>
+            </div>
+            <div id="drawer-suggestions" class="drawer-tab-content active">
+                <div id="drawer-suggestions-list"></div>
+            </div>
+            <div id="drawer-terms" class="drawer-tab-content">
+                <div class="term-add-row" style="margin-top:8px;">
+                    <input type="text" id="drawer-term-wrong" placeholder="Wrong">
+                    <input type="text" id="drawer-term-correct" placeholder="Correct">
+                    <button id="drawer-term-add-btn" class="btn-primary">Add</button>
+                </div>
+                <div id="drawer-terms-list" class="terms-list" style="max-height:calc(100vh - 240px);"></div>
             </div>
         </div>
     </div>

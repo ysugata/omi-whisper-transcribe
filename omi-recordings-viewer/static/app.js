@@ -752,6 +752,7 @@
 
     function openSettings() {
         settingsModal.classList.remove("hidden");
+        loadWhisperConfig();
         loadTerms();
         loadAutoDetected();
         loadSuggestions();
@@ -774,15 +775,69 @@
         if (e.target === settingsModal) closeSettings();
     });
 
-    // Tabs
-    var tabs = document.querySelectorAll(".tab");
-    for (var i = 0; i < tabs.length; i++) {
-        tabs[i].addEventListener("click", function () {
+    // --- Whisper config (read-only) ---
+
+    function loadWhisperConfig() {
+        var loading = document.getElementById("whisper-loading");
+        var info = document.getElementById("whisper-info");
+        if (loading) loading.style.display = "";
+        if (info) info.classList.add("hidden");
+        fetch("/api/whisper/config").then(function (r) { return r.json(); }).then(function (d) {
+            if (loading) loading.style.display = "none";
+            if (info) info.classList.remove("hidden");
+            var set = function (id, val) { var el = document.getElementById(id); if (el) el.textContent = val; };
+            set("whisper-model-name", d.model_name || "-");
+            set("whisper-compute-type", d.compute_type || "-");
+            var statusEl = document.getElementById("whisper-loaded");
+            if (statusEl) {
+                statusEl.textContent = d.loaded ? "Loaded" : "Unloaded";
+                statusEl.className = d.loaded ? "status-loaded" : "status-unloaded";
+            }
+            set("whisper-session-count", d.session_count != null ? d.session_count : "-");
+            set("whisper-language", d.language || "-");
+            set("whisper-beam-size", d.beam_size != null ? d.beam_size : "-");
+            set("whisper-vad-filter", d.vad_filter ? "Enabled" : "Disabled");
+            set("whisper-ngram", d.no_repeat_ngram_size != null ? d.no_repeat_ngram_size : "-");
+            set("whisper-patience", d.patience != null ? d.patience : "-");
+            set("whisper-logprob", d.log_prob_threshold != null ? d.log_prob_threshold : "-");
+            set("whisper-seg-max", d.segment_max_duration != null ? d.segment_max_duration + "s" : "-");
+            set("whisper-normalize", d.normalize_enabled ? "Enabled" : "Disabled");
+            set("whisper-noise-reduce", d.noise_reduce_enabled ? "Enabled" : "Disabled");
+        }).catch(function () {
+            if (loading) loading.textContent = "Whisper 設定を取得できませんでした";
+        });
+    }
+
+    // Settings left nav tabs
+    var settingsNavItems = document.querySelectorAll(".settings-nav-item");
+    var settingsTabContents = document.querySelectorAll(".settings-content > .tab-content");
+    for (var i = 0; i < settingsNavItems.length; i++) {
+        settingsNavItems[i].addEventListener("click", function () {
             var targetId = this.getAttribute("data-tab");
-            document.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
-            document.querySelectorAll(".tab-content").forEach(function (c) { c.classList.remove("active"); });
+            settingsNavItems.forEach(function (n) { n.classList.remove("active"); });
+            settingsTabContents.forEach(function (c) { c.classList.remove("active"); });
             this.classList.add("active");
-            document.getElementById(targetId).classList.add("active");
+            var target = document.getElementById(targetId);
+            if (target) target.classList.add("active");
+        });
+    }
+
+    // Mobile: category accordion
+    var navCategories = document.querySelectorAll(".settings-nav-category");
+    for (var ci = 0; ci < navCategories.length; ci++) {
+        navCategories[ci].addEventListener("click", function () {
+            var isExpanded = this.classList.contains("expanded");
+            // Collapse all
+            navCategories.forEach(function (c) { c.classList.remove("expanded"); });
+            document.querySelectorAll(".settings-nav-item").forEach(function (it) { it.classList.remove("mobile-visible"); });
+            if (!isExpanded) {
+                this.classList.add("expanded");
+                var sib = this.nextElementSibling;
+                while (sib && sib.classList.contains("settings-nav-item")) {
+                    sib.classList.add("mobile-visible");
+                    sib = sib.nextElementSibling;
+                }
+            }
         });
     }
 
@@ -953,7 +1008,9 @@
 
     function loadSuggestions() {
         fetch("/api/suggestions").then(function (r) { return r.json(); }).then(function (data) {
-            renderSuggestions(data);
+            renderSuggestionsInto(suggestionsListEl, data, function () {
+                loadSuggestions();
+            });
             // Update badge
             if (data.length > 0) {
                 suggestionBadge.textContent = data.length;
@@ -964,9 +1021,9 @@
         });
     }
 
-    function renderSuggestions(list) {
+    function renderSuggestionsInto(container, list, onChanged) {
         if (list.length === 0) {
-            suggestionsListEl.innerHTML = '<div class="loading">No pending suggestions</div>';
+            container.innerHTML = '<div class="loading">No pending suggestions</div>';
             return;
         }
 
@@ -988,52 +1045,40 @@
             html += '</div>';
             html += '</div>';
         });
-        suggestionsListEl.innerHTML = html;
+        container.innerHTML = html;
 
         // Bind events
-        var approveBtns = suggestionsListEl.querySelectorAll(".suggestion-approve");
+        var approveBtns = container.querySelectorAll(".suggestion-approve");
         for (var i = 0; i < approveBtns.length; i++) {
             approveBtns[i].addEventListener("click", function () {
-                approveSuggestion(this.getAttribute("data-id"));
+                var sid = this.getAttribute("data-id");
+                fetch("/api/suggestions/" + sid + "/approve", { method: "POST" })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { termsCache = null; if (onChanged) onChanged(); loadTerms(); loadAutoDetected(); });
             });
         }
 
-        var rejectBtns = suggestionsListEl.querySelectorAll(".suggestion-reject");
+        var rejectBtns = container.querySelectorAll(".suggestion-reject");
         for (var j = 0; j < rejectBtns.length; j++) {
             rejectBtns[j].addEventListener("click", function () {
-                rejectSuggestion(this.getAttribute("data-id"));
+                var sid = this.getAttribute("data-id");
+                fetch("/api/suggestions/" + sid + "/reject", { method: "POST" })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { if (onChanged) onChanged(); });
             });
         }
 
-        var editBtns = suggestionsListEl.querySelectorAll(".suggestion-edit-btn");
+        var editBtns = container.querySelectorAll(".suggestion-edit-btn");
         for (var k = 0; k < editBtns.length; k++) {
             editBtns[k].addEventListener("click", function () {
-                editSuggestion(this.getAttribute("data-id"));
+                var sid = this.getAttribute("data-id");
+                editSuggestionInContainer(container, sid, onChanged);
             });
         }
     }
 
-    function approveSuggestion(id) {
-        fetch("/api/suggestions/" + id + "/approve", {
-            method: "POST",
-        }).then(function (r) { return r.json(); }).then(function () {
-            termsCache = null;
-            loadSuggestions();
-            loadTerms();
-            loadAutoDetected();
-        });
-    }
-
-    function rejectSuggestion(id) {
-        fetch("/api/suggestions/" + id + "/reject", {
-            method: "POST",
-        }).then(function (r) { return r.json(); }).then(function () {
-            loadSuggestions();
-        });
-    }
-
-    function editSuggestion(id) {
-        var correctSpan = suggestionsListEl.querySelector('.correct[data-id="' + id + '"]');
+    function editSuggestionInContainer(container, id, onChanged) {
+        var correctSpan = container.querySelector('.correct[data-id="' + id + '"]');
         if (!correctSpan || correctSpan.querySelector("input")) return;
 
         var currentValue = correctSpan.textContent;
@@ -1056,7 +1101,7 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ correct: newCorrect }),
             }).then(function (r) { return r.json(); }).then(function () {
-                loadSuggestions();
+                if (onChanged) onChanged();
             });
         }
 
@@ -1066,6 +1111,8 @@
         });
         input.addEventListener("blur", save);
     }
+
+
 
     // ============================================================
     // Presets
@@ -1080,7 +1127,9 @@
         // Review mode shortcuts
         if (reviewState.active) {
             if (e.key === "Escape") {
-                if (reviewState.editing) {
+                if (reviewState.drawerOpen) {
+                    toggleReviewDrawer(false);
+                } else if (reviewState.editing) {
                     reviewState.editing = false;
                     loadNextReviewItem();
                 } else {
@@ -1088,6 +1137,7 @@
                 }
                 return;
             }
+            if (e.key === "d" || e.key === "D") { toggleReviewDrawer(); return; }
             if (e.key === "a" || e.key === "A") { reviewAccept(); return; }
             if (e.key === "e" || e.key === "E") { reviewEdit(); return; }
             if (e.key === "s" || e.key === "S" || e.key === " ") { e.preventDefault(); reviewSkip(); return; }
@@ -1333,7 +1383,7 @@
     var hotwordsTotalCount = document.getElementById("hotwords-total-count");
     var saveHotwordsBtn = document.getElementById("save-hotwords-settings");
     var hotwordsStatus = document.getElementById("hotwords-status");
-    var hotwordsBadge = document.getElementById("hotwords-badge");
+
 
     var hotwordsSettingsCache = null;
     var hotwordsStatusCache = null;
@@ -1345,7 +1395,6 @@
         }).then(function (data) {
             if (!data) return;
             hotwordsStatusCache = data;
-            hotwordsBadge.textContent = data.count || 0;
             hotwordsTotalCount.textContent = (data.count || 0) + " active";
         }).catch(function () {});
     }
@@ -2813,10 +2862,120 @@
         reviewState.active = false;
         reviewState.currentItem = null;
         reviewState.editing = false;
+        reviewState.drawerOpen = false;
+        var drawer = document.getElementById("review-drawer");
+        if (drawer) drawer.classList.remove("visible");
         reviewOverlay.classList.add("hidden");
         document.body.style.overflow = "";
         loadReviewStats();
         loadPage(currentPage);
+    }
+
+    // --- Review side drawer ---
+
+    reviewState.drawerOpen = false;
+
+    var reviewDrawer = document.getElementById("review-drawer");
+    var reviewDrawerBtn = document.getElementById("review-drawer-btn");
+    var drawerCloseBtn = document.getElementById("drawer-close-btn");
+    var drawerSuggestionsEl = document.getElementById("drawer-suggestions-list");
+    var drawerTermsListEl = document.getElementById("drawer-terms-list");
+
+    function toggleReviewDrawer(forceState) {
+        var open = forceState != null ? forceState : !reviewState.drawerOpen;
+        reviewState.drawerOpen = open;
+        if (reviewDrawer) {
+            if (open) {
+                reviewDrawer.classList.add("visible");
+                loadDrawerSuggestions();
+                loadDrawerTerms();
+            } else {
+                reviewDrawer.classList.remove("visible");
+            }
+        }
+    }
+
+    function loadDrawerSuggestions() {
+        if (!drawerSuggestionsEl) return;
+        fetch("/api/suggestions").then(function (r) { return r.json(); }).then(function (data) {
+            renderSuggestionsInto(drawerSuggestionsEl, data, function () {
+                loadDrawerSuggestions();
+                // Invalidate settings modal cache
+                suggestionsListEl.innerHTML = "";
+            });
+        });
+    }
+
+    function loadDrawerTerms() {
+        if (!drawerTermsListEl) return;
+        fetch("/api/terms").then(function (r) { return r.json(); }).then(function (data) {
+            renderTermsInto(drawerTermsListEl, data, null);
+        });
+    }
+
+    function renderTermsInto(container, data, filter) {
+        var keys = Object.keys(data).sort(function (a, b) {
+            return data[a].toLowerCase().localeCompare(data[b].toLowerCase()) || a.localeCompare(b);
+        });
+        if (filter) {
+            var f = filter.toLowerCase();
+            keys = keys.filter(function (k) { return k.toLowerCase().indexOf(f) >= 0 || data[k].toLowerCase().indexOf(f) >= 0; });
+        }
+        if (keys.length === 0) {
+            container.innerHTML = '<div class="loading">No terms</div>';
+            return;
+        }
+        var html = "";
+        keys.forEach(function (wrong) {
+            html += '<div class="term-row">';
+            html += '<span class="term-wrong">' + escapeHtml(wrong) + '</span>';
+            html += '<span class="term-arrow">&rarr;</span>';
+            html += '<span class="term-correct">' + escapeHtml(data[wrong]) + '</span>';
+            html += '</div>';
+        });
+        container.innerHTML = html;
+    }
+
+    if (reviewDrawerBtn) {
+        reviewDrawerBtn.addEventListener("click", function () { toggleReviewDrawer(); });
+    }
+    if (drawerCloseBtn) {
+        drawerCloseBtn.addEventListener("click", function () { toggleReviewDrawer(false); });
+    }
+
+    // Drawer term add
+    var drawerTermWrong = document.getElementById("drawer-term-wrong");
+    var drawerTermCorrect = document.getElementById("drawer-term-correct");
+    var drawerTermAddBtn = document.getElementById("drawer-term-add-btn");
+    if (drawerTermAddBtn) {
+        drawerTermAddBtn.addEventListener("click", function () {
+            var wrong = drawerTermWrong.value.trim();
+            var correct = drawerTermCorrect.value.trim();
+            if (!wrong || !correct) return;
+            fetch("/api/terms", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ wrong: wrong, correct: correct }),
+            }).then(function (r) { return r.json(); }).then(function () {
+                drawerTermWrong.value = "";
+                drawerTermCorrect.value = "";
+                loadDrawerTerms();
+                termsCache = null;
+            });
+        });
+    }
+
+    // Drawer tabs
+    var drawerTabs = document.querySelectorAll(".drawer-tab");
+    for (var dti = 0; dti < drawerTabs.length; dti++) {
+        drawerTabs[dti].addEventListener("click", function () {
+            var target = this.getAttribute("data-drawer-tab");
+            drawerTabs.forEach(function (t) { t.classList.remove("active"); });
+            document.querySelectorAll(".drawer-tab-content").forEach(function (c) { c.classList.remove("active"); });
+            this.classList.add("active");
+            var el = document.getElementById(target);
+            if (el) el.classList.add("active");
+        });
     }
 
     function loadNextReviewItem() {

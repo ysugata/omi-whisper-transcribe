@@ -2813,6 +2813,23 @@ async def main():
     async def handle_model_status(request):
         return web.json_response(model_manager.status())
 
+    async def handle_whisper_config(request):
+        return web.json_response({
+            "model_name": WHISPER_MODEL,
+            "compute_type": COMPUTE_TYPE,
+            "language": LANGUAGE or "auto",
+            "beam_size": BEAM_SIZE,
+            "vad_filter": VAD_FILTER,
+            "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
+            "patience": PATIENCE,
+            "log_prob_threshold": LOG_PROB_THRESHOLD,
+            "segment_max_duration": SEGMENT_MAX_DURATION,
+            "normalize_enabled": NORMALIZE_ENABLED,
+            "noise_reduce_enabled": NOISE_REDUCE_ENABLED,
+            "loaded": model_manager.loaded,
+            "session_count": model_manager.session_count,
+        })
+
     async def handle_batch_start(request):
         if diarizer is None:
             return web.json_response(
@@ -3757,6 +3774,7 @@ async def main():
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)
+    mgmt_app.router.add_get("/whisper/config", handle_whisper_config)
     mgmt_app.router.add_post("/diarize/start", handle_batch_start)
     mgmt_app.router.add_get("/diarize/status", handle_batch_status)
     mgmt_app.router.add_post("/diarize/cancel", handle_batch_cancel)
