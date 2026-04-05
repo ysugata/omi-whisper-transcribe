@@ -30,6 +30,7 @@ COPY hotword_loader.py .
 COPY speaker_filter.py .
 COPY session_tagger.py .
 COPY rag_classifier.py .
+COPY taxonomy_refiner.py .
 COPY keyword_learner.py .
 COPY training_sanitizer.py .
 COPY responses_sanitizer.py .

@@ -124,6 +124,7 @@
                 <button class="tab" data-tab="voice-tab">Voice</button>
                 <button class="tab" data-tab="taxonomy-tab">Taxonomy</button>
                 <button class="tab" data-tab="rag-tab">RAG</button>
+                <button class="tab" data-tab="refiner-tab">Refiner</button>
                 <button class="tab" data-tab="export-tab">Export</button>
             </div>
 
@@ -294,6 +295,40 @@
                             <span id="rag-status-msg" class="save-status"></span>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Refiner tab -->
+            <div id="refiner-tab" class="tab-content">
+                <p class="text-dim">月次バッチでタクソノミーの妥当性を検証し、改善提案を自動生成します。</p>
+                <div id="refiner-status-panel" style="margin:12px 0;">
+                    <div class="text-dim" id="refiner-loading">読み込み中...</div>
+                    <div id="refiner-info" class="hidden">
+                        <table style="width:100%;font-size:0.9em;">
+                            <tr><td>Status</td><td id="refiner-enabled-badge">-</td></tr>
+                            <tr><td>Running</td><td id="refiner-running">-</td></tr>
+                            <tr><td>Phase</td><td id="refiner-phase">-</td></tr>
+                            <tr><td>Last Run</td><td id="refiner-last-run">-</td></tr>
+                            <tr><td>Pending Proposal</td><td id="refiner-has-pending">-</td></tr>
+                        </table>
+                        <div style="margin-top:12px;">
+                            <button id="refiner-run-btn" class="btn-primary">今すぐ実行</button>
+                            <span id="refiner-status-msg" class="save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div id="refiner-pending-panel" class="hidden" style="margin-top:16px;border:1px solid #555;border-radius:6px;padding:12px;">
+                    <h4 style="margin:0 0 8px 0;">承認待ち提案</h4>
+                    <div id="refiner-changes-list"></div>
+                    <div id="refiner-validation" style="margin-top:8px;"></div>
+                    <div style="margin-top:12px;">
+                        <button id="refiner-approve-btn" class="btn-primary">承認</button>
+                        <button id="refiner-reject-btn" class="btn-danger" style="margin-left:8px;">却下</button>
+                    </div>
+                </div>
+                <div id="refiner-reports" style="margin-top:16px;">
+                    <h4 style="margin:0 0 8px 0;">過去のレポート</h4>
+                    <div id="refiner-reports-list" class="text-dim">なし</div>
                 </div>
             </div>
 

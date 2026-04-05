@@ -761,6 +761,7 @@
         loadVoiceSettings();
         loadTaxonomySettings();
         loadRagSettings();
+        loadRefinerSettings();
     }
 
     function closeSettings() {
@@ -2523,6 +2524,162 @@
             }).finally(function () {
                 ragRebuildBtn.disabled = false;
                 setTimeout(function () { if (statusMsg) statusMsg.textContent = ""; }, 5000);
+            });
+        });
+    }
+
+    // ============================================================
+    // Refiner Settings
+    // ============================================================
+
+    function loadRefinerSettings() {
+        var loadingEl = document.getElementById("refiner-loading");
+        var infoEl = document.getElementById("refiner-info");
+        var pendingPanel = document.getElementById("refiner-pending-panel");
+        if (loadingEl) loadingEl.classList.remove("hidden");
+        if (infoEl) infoEl.classList.add("hidden");
+        if (pendingPanel) pendingPanel.classList.add("hidden");
+
+        fetch("/api/taxonomy/refine/status").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            if (loadingEl) loadingEl.classList.add("hidden");
+            if (infoEl) infoEl.classList.remove("hidden");
+
+            var badge = document.getElementById("refiner-enabled-badge");
+            if (badge) {
+                if (data.enabled) {
+                    badge.textContent = "ENABLED";
+                    badge.style.color = "#2ecc71";
+                } else {
+                    badge.textContent = "DISABLED";
+                    badge.style.color = "#e74c3c";
+                }
+            }
+
+            var runningEl = document.getElementById("refiner-running");
+            if (runningEl) runningEl.textContent = data.running ? "Yes (" + (data.phase || "") + ")" : "No";
+
+            var phaseEl = document.getElementById("refiner-phase");
+            if (phaseEl) phaseEl.textContent = data.phase || "-";
+
+            var lastRunEl = document.getElementById("refiner-last-run");
+            if (lastRunEl) lastRunEl.textContent = data.last_run || "-";
+
+            var pendingEl = document.getElementById("refiner-has-pending");
+            if (pendingEl) pendingEl.textContent = data.has_pending ? "Yes" : "No";
+
+            // Load pending if exists
+            if (data.has_pending) {
+                loadRefinerPending();
+            }
+
+            // Render reports
+            var reportsList = document.getElementById("refiner-reports-list");
+            if (reportsList && data.reports && data.reports.length > 0) {
+                var html = "<table style='width:100%;font-size:0.85em;'><tr><th>Date</th><th>Status</th><th>Samples</th><th>Clusters</th></tr>";
+                data.reports.forEach(function (r) {
+                    html += "<tr><td>" + (r.filename || "-") + "</td><td>" + (r.status || "-") + "</td><td>" + (r.sample_count || 0) + "</td><td>" + (r.cluster_count || 0) + "</td></tr>";
+                });
+                html += "</table>";
+                reportsList.innerHTML = html;
+            }
+
+            // If running, poll
+            if (data.running) {
+                setTimeout(loadRefinerSettings, 5000);
+            }
+        }).catch(function (err) {
+            if (loadingEl) loadingEl.textContent = "Error: " + err.message;
+        });
+    }
+
+    function loadRefinerPending() {
+        var panel = document.getElementById("refiner-pending-panel");
+        fetch("/api/taxonomy/refine/pending").then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (data) {
+            if (!data.pending) return;
+            if (panel) panel.classList.remove("hidden");
+
+            var changesList = document.getElementById("refiner-changes-list");
+            if (changesList && data.pending.changes) {
+                var html = "";
+                data.pending.changes.forEach(function (c) {
+                    var typeColor = {"split": "#3498db", "merge": "#e67e22", "new": "#2ecc71", "remove": "#e74c3c"}[c.type] || "#aaa";
+                    html += "<div style='margin:4px 0;'><span style='color:" + typeColor + ";font-weight:bold;'>[" + c.type + "]</span> " + (c.axis || "") + ": " + (c.description || "") + "</div>";
+                    if (c.before && c.before.length) html += "<div style='margin-left:16px;color:#999;'>Before: " + c.before.join(", ") + "</div>";
+                    if (c.after && c.after.length) html += "<div style='margin-left:16px;color:#ccc;'>After: " + c.after.join(", ") + "</div>";
+                });
+                changesList.innerHTML = html || "<div class='text-dim'>変更なし</div>";
+            }
+
+            var validationEl = document.getElementById("refiner-validation");
+            if (validationEl && data.pending.validation) {
+                var v = data.pending.validation;
+                validationEl.innerHTML = "<table style='font-size:0.85em;'>"
+                    + "<tr><td>Accuracy</td><td>" + ((v.accuracy_vs_current * 100).toFixed(1)) + "%</td></tr>"
+                    + "<tr><td>Improved</td><td style='color:#2ecc71;'>" + (v.improved_count || 0) + "</td></tr>"
+                    + "<tr><td>Degraded</td><td style='color:#e74c3c;'>" + (v.degraded_count || 0) + "</td></tr>"
+                    + "<tr><td>Unchanged</td><td>" + (v.unchanged_count || 0) + "</td></tr>"
+                    + "</table>";
+            }
+        }).catch(function () {});
+    }
+
+    // Refiner buttons
+    var refinerRunBtn = document.getElementById("refiner-run-btn");
+    if (refinerRunBtn) {
+        refinerRunBtn.addEventListener("click", function () {
+            if (!confirm("タクソノミー精緻化パイプラインを実行しますか？（Batch API の完了まで数時間かかる場合があります）")) return;
+            var statusMsg = document.getElementById("refiner-status-msg");
+            refinerRunBtn.disabled = true;
+            fetch("/api/taxonomy/refine/run", { method: "POST" }).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            }).then(function () {
+                if (statusMsg) { statusMsg.textContent = "Started"; statusMsg.style.color = "#2ecc71"; }
+                setTimeout(loadRefinerSettings, 3000);
+            }).catch(function (err) {
+                if (statusMsg) { statusMsg.textContent = "Error: " + err.message; statusMsg.style.color = "#e74c3c"; }
+            }).finally(function () {
+                refinerRunBtn.disabled = false;
+                setTimeout(function () { if (statusMsg) statusMsg.textContent = ""; }, 5000);
+            });
+        });
+    }
+
+    var refinerApproveBtn = document.getElementById("refiner-approve-btn");
+    if (refinerApproveBtn) {
+        refinerApproveBtn.addEventListener("click", function () {
+            if (!confirm("提案を承認してタクソノミーを更新しますか？")) return;
+            fetch("/api/taxonomy/refine/approve", { method: "POST" }).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            }).then(function () {
+                alert("承認しました。タクソノミーが更新されました。");
+                loadRefinerSettings();
+                loadTaxonomySettings();
+            }).catch(function (err) {
+                alert("Error: " + err.message);
+            });
+        });
+    }
+
+    var refinerRejectBtn = document.getElementById("refiner-reject-btn");
+    if (refinerRejectBtn) {
+        refinerRejectBtn.addEventListener("click", function () {
+            if (!confirm("提案を却下しますか？")) return;
+            fetch("/api/taxonomy/refine/reject", { method: "POST" }).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            }).then(function () {
+                alert("却下しました。");
+                loadRefinerSettings();
+            }).catch(function (err) {
+                alert("Error: " + err.message);
             });
         });
     }

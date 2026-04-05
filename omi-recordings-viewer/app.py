@@ -857,6 +857,30 @@ async def handle_rag_rebuild(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Taxonomy Refiner プロキシ API
+# ============================================================
+
+async def handle_taxonomy_refine_run(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/taxonomy/refine/run", timeout_sec=10)
+
+
+async def handle_taxonomy_refine_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/taxonomy/refine/status")
+
+
+async def handle_taxonomy_refine_pending(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/taxonomy/refine/pending")
+
+
+async def handle_taxonomy_refine_approve(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/taxonomy/refine/approve", timeout_sec=10)
+
+
+async def handle_taxonomy_refine_reject(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/taxonomy/refine/reject", timeout_sec=10)
+
+
+# ============================================================
 # Export API
 # ============================================================
 
@@ -1219,6 +1243,11 @@ def create_app() -> web.Application:
     # RAG classifier プロキシ API
     app.router.add_get("/api/rag/status", handle_rag_status)
     app.router.add_post("/api/rag/rebuild", handle_rag_rebuild)
+    app.router.add_post("/api/taxonomy/refine/run", handle_taxonomy_refine_run)
+    app.router.add_get("/api/taxonomy/refine/status", handle_taxonomy_refine_status)
+    app.router.add_get("/api/taxonomy/refine/pending", handle_taxonomy_refine_pending)
+    app.router.add_post("/api/taxonomy/refine/approve", handle_taxonomy_refine_approve)
+    app.router.add_post("/api/taxonomy/refine/reject", handle_taxonomy_refine_reject)
 
     # Export API
     app.router.add_get("/api/export/stats", handle_export_stats)

@@ -83,6 +83,12 @@ RAG_K = int(os.environ.get("RAG_K", "7"))
 RAG_CONFIDENCE_THRESHOLD = float(os.environ.get("RAG_CONFIDENCE_THRESHOLD", "0.5"))
 RAG_MIN_SESSIONS = int(os.environ.get("RAG_MIN_SESSIONS", "20"))
 
+# --- タクソノミー自動精緻化設定 ---
+TAXONOMY_REFINE_ENABLED = os.environ.get("TAXONOMY_REFINE_ENABLED", "true").lower() in ("true", "1", "yes")
+TAXONOMY_SAMPLE_RATIO = float(os.environ.get("TAXONOMY_SAMPLE_RATIO", "0.2"))
+TAXONOMY_PROPOSAL_MODEL = os.environ.get("TAXONOMY_PROPOSAL_MODEL", "gemini-2.5-flash")
+TAXONOMY_VALIDATION_MODEL = os.environ.get("TAXONOMY_VALIDATION_MODEL", "gemini-2.5-flash-lite")
+
 # --- 音響シーン分類設定 ---
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")
 AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
@@ -165,6 +171,7 @@ from hotword_loader import HotwordLoader
 from speaker_filter import SpeakerFilter
 from session_tagger import SessionTagger
 from rag_classifier import RagClassifier
+from taxonomy_refiner import TaxonomyRefiner
 from training_sanitizer import TrainingSanitizer
 from responses_sanitizer import ResponsesSanitizer
 from segment_screener import SegmentScreener
@@ -239,6 +246,19 @@ if RAG_ENABLED and GEMINI_API_KEY:
         k=RAG_K,
         confidence_threshold=RAG_CONFIDENCE_THRESHOLD,
         min_sessions=RAG_MIN_SESSIONS,
+    )
+
+# タクソノミー自動精緻化
+taxonomy_refiner: TaxonomyRefiner | None = None
+if TAXONOMY_REFINE_ENABLED and GEMINI_API_KEY and rag_classifier:
+    taxonomy_refiner = TaxonomyRefiner(
+        api_key=GEMINI_API_KEY,
+        recordings_dir=RECORDINGS_DIR,
+        config_dir=CONFIG_DIR,
+        rag_classifier=rag_classifier,
+        sample_ratio=TAXONOMY_SAMPLE_RATIO,
+        proposal_model=TAXONOMY_PROPOSAL_MODEL,
+        validation_model=TAXONOMY_VALIDATION_MODEL,
     )
 
 # セッションタグ付け (LLM API キーがあれば利用可能)
@@ -2261,6 +2281,14 @@ async def _nightly_scheduler():
             log.info("Nightly scheduler: Phase 2 — combined tag (voice → session)")
             await _batch_combined_tag_task(force=False)
 
+            # Phase 3: Monthly taxonomy refinement (1st of month only)
+            now_after_tag = datetime.now()
+            if taxonomy_refiner and now_after_tag.day == 1:
+                _nightly_state["phase"] = "taxonomy_refine"
+                log.info("Nightly scheduler: Phase 3 — monthly taxonomy refinement")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, taxonomy_refiner.run)
+
             _nightly_state["last_result"] = "success"
         except Exception as e:
             log.error("Nightly scheduler: error: %s", e, exc_info=True)
@@ -3623,6 +3651,57 @@ async def main():
         asyncio.create_task(_auto_build_rag_index())
         return web.json_response({"status": "rebuild_started"})
 
+    # --- Taxonomy Refiner API ---
+
+    async def handle_taxonomy_refine_run(request):
+        if not taxonomy_refiner:
+            return web.json_response({"error": "Taxonomy refiner not enabled"}, status=503)
+        if taxonomy_refiner._running:
+            return web.json_response({"error": "Already running"}, status=409)
+
+        async def _run_refine():
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, taxonomy_refiner.run)
+            except Exception as e:
+                log.error("Taxonomy refine task error: %s", e)
+
+        asyncio.create_task(_run_refine())
+        return web.json_response({"status": "started"})
+
+    async def handle_taxonomy_refine_status(request):
+        if not taxonomy_refiner:
+            return web.json_response({"enabled": False, "running": False, "has_pending": False})
+        status = taxonomy_refiner.get_status()
+        status["enabled"] = True
+        status["reports"] = taxonomy_refiner.get_reports()
+        return web.json_response(status)
+
+    async def handle_taxonomy_refine_pending(request):
+        if not taxonomy_refiner:
+            return web.json_response({"pending": None})
+        pending = taxonomy_refiner.get_pending_proposal()
+        return web.json_response({"pending": pending})
+
+    async def handle_taxonomy_refine_approve(request):
+        if not taxonomy_refiner:
+            return web.json_response({"error": "Taxonomy refiner not enabled"}, status=503)
+        result = taxonomy_refiner.approve_proposal()
+        if "error" in result:
+            return web.json_response(result, status=400)
+        # Reload taxonomy in session tagger
+        if session_tagger:
+            session_tagger.reload_taxonomy()
+        return web.json_response(result)
+
+    async def handle_taxonomy_refine_reject(request):
+        if not taxonomy_refiner:
+            return web.json_response({"error": "Taxonomy refiner not enabled"}, status=503)
+        result = taxonomy_refiner.reject_proposal()
+        if "error" in result:
+            return web.json_response(result, status=400)
+        return web.json_response(result)
+
     # --- Nightly scheduler API ---
 
     async def handle_nightly_status(request):
@@ -3724,6 +3803,12 @@ async def main():
     # RAG classifier API
     mgmt_app.router.add_get("/rag/status", handle_rag_status)
     mgmt_app.router.add_post("/rag/rebuild", handle_rag_rebuild)
+    # Taxonomy Refiner API
+    mgmt_app.router.add_post("/taxonomy/refine/run", handle_taxonomy_refine_run)
+    mgmt_app.router.add_get("/taxonomy/refine/status", handle_taxonomy_refine_status)
+    mgmt_app.router.add_get("/taxonomy/refine/pending", handle_taxonomy_refine_pending)
+    mgmt_app.router.add_post("/taxonomy/refine/approve", handle_taxonomy_refine_approve)
+    mgmt_app.router.add_post("/taxonomy/refine/reject", handle_taxonomy_refine_reject)
     # Nightly scheduler API
     mgmt_app.router.add_get("/nightly/status", handle_nightly_status)
     mgmt_app.router.add_post("/nightly/trigger", handle_nightly_trigger)

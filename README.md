@@ -31,6 +31,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | LLM スクリーニング | 辞書補正 + 信頼度スコアで LLM 不要なセグメントを自動スキップ (API call 60-80% 削減) |
 | セッションタグ (3軸分類) | LLM による日本語3軸タグ付け (会話種類・成果物・事業領域 + 要約・判断メモ) |
 | RAG 分類 | 過去セッションの埋め込みベクトルによる k-NN 加重投票分類 (LLM コスト 80-90% 削減) |
+| タクソノミー自動精緻化 | 月次バッチでタクソノミーの妥当性を検証し改善提案を自動生成 (Gemini Batch API) |
 | バッチ話者分離 | pyannote で全録音の話者分離を一括実行 |
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
@@ -170,6 +171,16 @@ open http://localhost:8092
 |----------|------|------|
 | GET | `/rag/status` | RAG インデックス状態 (セッション数・モデル・ready) |
 | POST | `/rag/rebuild` | RAG インデックスを削除して再構築 |
+
+### タクソノミー自動精緻化
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/taxonomy/refine/run` | 精緻化パイプラインを手動実行 (バックグラウンド) |
+| GET | `/taxonomy/refine/status` | 実行状態・pending 有無・過去レポート |
+| GET | `/taxonomy/refine/pending` | 承認待ち提案の詳細 |
+| POST | `/taxonomy/refine/approve` | 提案を承認してタクソノミーを更新 |
+| POST | `/taxonomy/refine/reject` | 提案を却下 |
 
 ### 一括タグ付け (セッション + 話者)
 
@@ -317,6 +328,15 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `RAG_K` | `7` | k-NN 検索時の近傍数 |
 | `RAG_CONFIDENCE_THRESHOLD` | `0.5` | RAG 確信度閾値 (top 投票比率がこれ以上で LLM スキップ) |
 | `RAG_MIN_SESSIONS` | `20` | RAG 有効化に必要な最小インデックスセッション数 |
+
+### タクソノミー自動精緻化
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `TAXONOMY_REFINE_ENABLED` | `true` | タクソノミー自動精緻化機能の有効/無効 |
+| `TAXONOMY_SAMPLE_RATIO` | `0.2` | サンプリング率 (各 conversation_type から何割抽出するか) |
+| `TAXONOMY_PROPOSAL_MODEL` | `gemini-2.5-flash` | Step 3 (提案生成) に使う LLM モデル |
+| `TAXONOMY_VALIDATION_MODEL` | `gemini-2.5-flash-lite` | Step 4 (検証) に使う LLM モデル |
 
 ### 深夜スケジューラ
 
@@ -856,6 +876,7 @@ omi_whisper_transcribe/
 ├── correction_metrics.py     # スクリーニング統計メトリクス
 ├── session_tagger.py         # Gemini によるセッションタグ付け
 ├── rag_classifier.py         # RAG 分類 (Embedding + k-NN 加重投票)
+├── taxonomy_refiner.py       # タクソノミー自動精緻化 (月次バッチ, Gemini Batch API)
 ├── keyword_learner.py        # タグ修正ドリブンのキーワード候補学習
 ├── diarizer.py               # pyannote バッチ話者分離
 ├── speaker_filter.py         # 声紋登録・話者タグ付け
@@ -873,6 +894,8 @@ omi_whisper_transcribe/
 │   ├── tag_taxonomy.json     # セッションタグ3軸分類 (会話種類・成果物・事業領域)
 │   ├── rag_embeddings.npz   # RAG 埋め込みベクトルインデックス (自動生成)
 │   ├── rag_metadata.json    # RAG セッションメタデータ (自動生成)
+│   ├── pending_taxonomy.json # 承認待ちタクソノミー提案 (自動生成)
+│   ├── taxonomy_reports/    # 月次精緻化レポート (自動生成)
 ├── tools/                    # 運用・検証スクリプト
 ├── tests/                    # ユニットテスト (pytest)
 ├── omi-recordings-viewer/    # Viewer Web アプリ
