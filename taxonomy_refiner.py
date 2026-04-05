@@ -91,6 +91,8 @@ class TaxonomyRefiner:
         while time.time() - start < timeout:
             job = client.batches.get(name=batch_name)
             state = job.state.name if hasattr(job.state, "name") else str(job.state)
+            elapsed = int(time.time() - start)
+            log.info("Batch poll: %s state=%s (elapsed=%ds)", batch_name, state, elapsed)
             if state == "JOB_STATE_SUCCEEDED":
                 return job
             if state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
@@ -438,33 +440,36 @@ class TaxonomyRefiner:
 
 JSON のみを返してください。説明文は不要です。"""
 
+    def _generate_content(self, model: str, prompt: str) -> str:
+        """Direct (non-batch) API call for single request."""
+        client = self._get_client()
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+        )
+        return response.text if hasattr(response, "text") else ""
+
     def _step3_propose(self, clusters: list[dict], taxonomy: dict) -> dict:
-        """Generate taxonomy proposal via Gemini Batch API."""
+        """Generate taxonomy proposal via direct Gemini API call."""
         self._phase = "proposing"
         if not clusters:
             return {"no_change": True, "changes": [], "proposed_taxonomy": taxonomy}
 
         prompt = self._build_proposal_prompt(clusters, taxonomy)
 
-        requests = [
-            {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            },
-        ]
-
-        log.info("Step 3: submitting proposal batch job")
-        batch_name = self._submit_batch(self._proposal_model, requests,
-                                        display_name="taxonomy-proposal")
-
-        log.info("Step 3: polling batch job %s", batch_name)
-        batch_job = self._poll_batch(batch_name)
-
-        responses = self._extract_batch_responses(batch_job)
-        if not responses or not responses[0]:
-            log.warning("Step 3: no response from proposal batch")
+        # Single request: use direct API (much faster than Batch API)
+        log.info("Step 3: generating proposal via direct API (%s)", self._proposal_model)
+        try:
+            response_text = self._generate_content(self._proposal_model, prompt)
+        except Exception as e:
+            log.error("Step 3: direct API call failed: %s", e)
             return {"no_change": True, "changes": [], "proposed_taxonomy": taxonomy}
 
-        return self._parse_proposal_json(responses[0], taxonomy)
+        if not response_text:
+            log.warning("Step 3: empty response from proposal API")
+            return {"no_change": True, "changes": [], "proposed_taxonomy": taxonomy}
+
+        return self._parse_proposal_json(response_text, taxonomy)
 
     def _parse_proposal_json(self, text: str, fallback_taxonomy: dict) -> dict:
         """Parse LLM response JSON for proposal."""
@@ -554,8 +559,10 @@ JSON のみを返してください。"""
         domain_match = 0
         total = 0
 
-        valid_types = set(proposed_taxonomy.get("conversation_type", []))
-        valid_domains = set(proposed_taxonomy.get("domains", []))
+        valid_types = set(str(x) for x in proposed_taxonomy.get("conversation_type", [])
+                         if isinstance(x, str))
+        valid_domains = set(str(x) for x in proposed_taxonomy.get("domains", [])
+                           if isinstance(x, str))
 
         for i, sample in enumerate(samples):
             if i >= len(responses) or not responses[i]:
@@ -574,7 +581,9 @@ JSON のみを返してください。"""
                     end = text.index("```", start)
                     text = text[start:end].strip()
                 new_tags = json.loads(text)
-            except (json.JSONDecodeError, ValueError):
+                if not isinstance(new_tags, dict):
+                    raise ValueError("not a dict")
+            except (json.JSONDecodeError, ValueError, TypeError):
                 unchanged += 1
                 total += 1
                 continue
@@ -584,12 +593,17 @@ JSON のみを返してください。"""
 
             # Check conversation_type match
             new_ct = new_tags.get("conversation_type", "")
+            if isinstance(new_ct, list):
+                new_ct = new_ct[0] if new_ct else ""
             cur_ct = current.get("conversation_type", "")
-            ct_valid = new_ct in valid_types
+            ct_valid = isinstance(new_ct, str) and new_ct in valid_types
 
-            # Check domains match
+            # Check domains match (ensure list of strings)
             new_domains = new_tags.get("domains", [])
-            cur_domains = set(current.get("domains", []))
+            if not isinstance(new_domains, list):
+                new_domains = [new_domains] if isinstance(new_domains, str) else []
+            new_domains = [str(d) for d in new_domains if isinstance(d, str)]
+            cur_domains = set(str(d) for d in current.get("domains", []) if isinstance(d, str))
             new_domains_set = set(new_domains)
             domains_valid = all(d in valid_domains for d in new_domains)
 

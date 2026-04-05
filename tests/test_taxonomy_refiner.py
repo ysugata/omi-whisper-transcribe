@@ -214,12 +214,9 @@ class TestProposeNoChange:
 
         taxonomy = {"conversation_type": ["会議", "雑談"], "domains": ["技術"]}
 
-        # Mock batch methods
-        refiner._submit_batch = lambda *a, **kw: "fake-batch"
-        refiner._poll_batch = lambda *a, **kw: type("Obj", (), {"dest": None})()
-        refiner._extract_batch_responses = lambda *a: [
+        # Mock direct API call (Step 3 uses generate_content, not Batch)
+        refiner._generate_content = lambda *a, **kw: \
             '{"no_change": true, "changes": [], "proposed_taxonomy": {}}'
-        ]
 
         result = refiner._step3_propose([{"cluster_id": 0, "size": 5,
                                            "representative_texts": ["test"],
