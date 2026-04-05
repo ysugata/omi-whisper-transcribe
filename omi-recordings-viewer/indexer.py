@@ -621,14 +621,14 @@ class Indexer:
 
         return where, params
 
-    # Default review scoring weights (sum = 1.0 for base axes)
+    # Default review scoring weights (sum = 1.0 for 5 base axes)
+    # importance is applied as a multiplier, not an additive axis
     _DEFAULT_REVIEW_WEIGHTS = {
-        "model_uncertainty": 0.35,
+        "model_uncertainty": 0.40,
         "novelty": 0.20,
         "content_complexity": 0.15,
-        "audio_scene_ambiguity": 0.10,
-        "temporal_freshness": 0.10,
-        "importance": 0.10,
+        "audio_scene_ambiguity": 0.12,
+        "temporal_freshness": 0.13,
     }
 
     def _get_review_weights(self) -> dict:
@@ -638,7 +638,7 @@ class Indexer:
             if weights_path.exists():
                 data = json.loads(weights_path.read_text(encoding="utf-8"))
                 adjusted = data.get("adjusted_weights")
-                if adjusted and len(adjusted) == 6:
+                if adjusted and len(adjusted) == 5:
                     return adjusted
         except Exception:
             logger.warning("Failed to load review_weights.json, using defaults")
@@ -647,14 +647,17 @@ class Indexer:
     async def get_review_queue(self, limit: int = 1, offset: int = 0) -> list[dict]:
         """Get sessions ordered by review priority (highest uncertainty first).
 
-        Priority score (0-1.1, higher = more urgent) — 6 axes + interaction bonus:
-        - A. Model uncertainty (0.35): continuous RAG similarity / LLM quality
+        priority_score = base_score * importance_multiplier
+
+        Base score (5 axes + interaction bonus):
+        - A. Model uncertainty (0.40): continuous RAG similarity / LLM quality
         - B. Novelty (0.20): conversation_type その他 or NULL
         - C. Content complexity (0.15): segment count proportional
-        - D. Audio scene ambiguity (0.10): external audio + low scene confidence
-        - E. Temporal freshness (0.10): 90-day linear decay
-        - F. Importance (0.10): importance_v2 高/中/低
-        - G. Interaction bonus (+0.10 max): compound risk signals
+        - D. Audio scene ambiguity (0.12): external audio + low scene confidence
+        - E. Temporal freshness (0.13): 90-day linear decay
+        - F. Interaction bonus (+0.10 max): compound risk signals
+
+        Importance multiplier: 高=1.5, 中=1.0, 低/NULL=0.8
         """
         w = self._get_review_weights()
         w_a = w["model_uncertainty"]
@@ -662,61 +665,62 @@ class Indexer:
         w_c = w["content_complexity"]
         w_d = w["audio_scene_ambiguity"]
         w_e = w["temporal_freshness"]
-        w_f = w["importance"]
 
         sql = f"""
             SELECT *,
                 (
-                    -- A. Model uncertainty ({w_a}): continuous value
+                    (
+                        -- A. Model uncertainty ({w_a}): continuous value
+                        CASE
+                            WHEN tags_tag_source = 'rag' THEN
+                                (1.0 - COALESCE(tags_rag_similarity, 0.5)) * {w_a}
+                            WHEN tags_quality IN ('noisy', 'fragmented') THEN {w_a} * 0.857
+                            WHEN tags_quality = 'partial' THEN {w_a} * 0.571
+                            ELSE {w_a} * 0.429
+                        END
+                        +
+                        -- B. Novelty ({w_b})
+                        CASE
+                            WHEN tags_conversation_type = 'その他' THEN {w_b}
+                            WHEN tags_conversation_type IS NULL THEN {w_b} * 0.9
+                            WHEN tags_conversation_type IN ('独り言・メモ', '雑談・移動中メモ') THEN {w_b} * 0.25
+                            ELSE 0.0
+                        END
+                        +
+                        -- C. Content complexity ({w_c}): proportional to segment count
+                        MIN(COALESCE(segment_count, 1), 50) * 1.0 / 50 * {w_c}
+                        +
+                        -- D. Audio scene ambiguity ({w_d})
+                        CASE WHEN COALESCE(tags_external_audio, 0) >= 0.5 THEN {w_d} * 0.6 ELSE 0.0 END
+                        +
+                        CASE
+                            WHEN tags_audio_scene_confidence IS NOT NULL AND tags_audio_scene_confidence < 0.7
+                            THEN (1.0 - tags_audio_scene_confidence) * {w_d} * 0.4
+                            ELSE 0.0
+                        END
+                        +
+                        -- E. Temporal freshness ({w_e}): 90-day linear decay
+                        CASE
+                            WHEN start_at IS NOT NULL THEN
+                                MAX(0.0, 1.0 - (julianday('now') - julianday(start_at)) / 90.0) * {w_e}
+                            ELSE {w_e} * 0.5
+                        END
+                        +
+                        -- F. Interaction bonus (+0.10 max)
+                        CASE
+                            WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
+                                 AND tags_quality IN ('noisy', 'fragmented') THEN 0.10
+                            WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
+                                 AND COALESCE(tags_external_audio, 0) >= 0.5 THEN 0.08
+                            ELSE 0.0
+                        END
+                    )
+                    *
+                    -- Importance multiplier
                     CASE
-                        WHEN tags_tag_source = 'rag' THEN
-                            (1.0 - COALESCE(tags_rag_similarity, 0.5)) * {w_a}
-                        WHEN tags_quality IN ('noisy', 'fragmented') THEN {w_a} * 0.857
-                        WHEN tags_quality = 'partial' THEN {w_a} * 0.571
-                        ELSE {w_a} * 0.429
-                    END
-                    +
-                    -- B. Novelty ({w_b})
-                    CASE
-                        WHEN tags_conversation_type = 'その他' THEN {w_b}
-                        WHEN tags_conversation_type IS NULL THEN {w_b} * 0.9
-                        WHEN tags_conversation_type IN ('独り言・メモ', '雑談・移動中メモ') THEN {w_b} * 0.25
-                        ELSE 0.0
-                    END
-                    +
-                    -- C. Content complexity ({w_c}): proportional to segment count
-                    MIN(COALESCE(segment_count, 1), 50) * 1.0 / 50 * {w_c}
-                    +
-                    -- D. Audio scene ambiguity ({w_d})
-                    CASE WHEN COALESCE(tags_external_audio, 0) >= 0.5 THEN {w_d} * 0.6 ELSE 0.0 END
-                    +
-                    CASE
-                        WHEN tags_audio_scene_confidence IS NOT NULL AND tags_audio_scene_confidence < 0.7
-                        THEN (1.0 - tags_audio_scene_confidence) * {w_d} * 0.4
-                        ELSE 0.0
-                    END
-                    +
-                    -- E. Temporal freshness ({w_e}): 90-day linear decay
-                    CASE
-                        WHEN start_at IS NOT NULL THEN
-                            MAX(0.0, 1.0 - (julianday('now') - julianday(start_at)) / 90.0) * {w_e}
-                        ELSE {w_e} * 0.5
-                    END
-                    +
-                    -- F. Importance ({w_f})
-                    CASE
-                        WHEN tags_importance_v2 = '高' THEN {w_f}
-                        WHEN tags_importance_v2 = '中' THEN {w_f} * 0.5
-                        ELSE 0.0
-                    END
-                    +
-                    -- G. Interaction bonus (+0.10 max)
-                    CASE
-                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
-                             AND tags_quality IN ('noisy', 'fragmented') THEN 0.10
-                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
-                             AND COALESCE(tags_external_audio, 0) >= 0.5 THEN 0.08
-                        ELSE 0.0
+                        WHEN tags_importance_v2 = '高' THEN 1.5
+                        WHEN tags_importance_v2 = '中' THEN 1.0
+                        ELSE 0.8
                     END
                 ) AS priority_score
             FROM sessions
@@ -755,7 +759,6 @@ class Indexer:
         quality = session.get("tags_quality")
         conv_type = session.get("tags_conversation_type")
         ext_audio = session.get("tags_external_audio") or 0
-        importance = session.get("tags_importance_v2")
 
         # Axis A: model uncertainty
         if tag_source == "rag":
@@ -775,10 +778,6 @@ class Indexer:
         # Axis D: audio scene ambiguity
         if ext_audio >= 0.5:
             signals.append("high_external_audio")
-
-        # Axis F: importance
-        if importance == "高":
-            signals.append("high_importance")
 
         return signals
 
@@ -832,7 +831,6 @@ class Indexer:
             "llm_clean": "model_uncertainty",
             "sono_ta": "novelty",
             "high_external_audio": "audio_scene_ambiguity",
-            "high_importance": "importance",
         }
 
         # Compute max correction rate per axis

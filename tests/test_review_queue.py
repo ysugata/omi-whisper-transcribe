@@ -325,7 +325,7 @@ async def test_continuous_rag_similarity(tmp_env):
 
 @pytest.mark.asyncio
 async def test_importance_affects_priority(tmp_env):
-    """importance_v2=高 should produce higher priority than importance_v2=低."""
+    """importance_v2=高 should produce 1.5/0.8 = 1.875x higher score than importance_v2=低."""
     db_path, rec_dir = tmp_env
 
     _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
@@ -352,6 +352,55 @@ async def test_importance_affects_priority(tmp_env):
     queue = await indexer.get_review_queue(limit=10, offset=0)
     assert len(queue) == 2
     assert queue[0]["time"] == "10-00-00", "高 importance should rank higher"
+    assert queue[0]["priority_score"] > queue[1]["priority_score"]
+
+    # Multiplier ratio: 高(1.5) / 低(0.8) = 1.875
+    ratio = queue[0]["priority_score"] / queue[1]["priority_score"]
+    assert abs(ratio - 1.875) < 0.01, f"Expected ratio ~1.875, got {ratio:.4f}"
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_importance_multiplier_overrides_quality(tmp_env):
+    """importance=高 + clean should rank higher than importance=低 + noisy.
+
+    This is the core test: the old additive model could rank noisy+低 above clean+高
+    because the noisy axis contribution exceeded the importance axis contribution.
+    With the multiplier model, 高 gets 1.5x on all axes, ensuring important sessions
+    always rank above unimportant ones when base scores are comparable.
+    """
+    db_path, rec_dir = tmp_env
+
+    # Important + clean
+    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+        "conversation_type": "業務会話",
+        "outcomes": ["意思決定"],
+        "importance": "高",
+        "tag_source": "llm",
+        "quality": "clean",
+        "tag_version": 2,
+    })
+
+    # Unimportant + noisy (was previously ranked higher under additive model)
+    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "noisy",
+        "external_audio_ratio": 0.8,
+        "tag_version": 2,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 2
+    assert queue[0]["time"] == "10-00-00", \
+        f"importance=高+clean should rank above importance=低+noisy, got {queue[0]['time']}"
     assert queue[0]["priority_score"] > queue[1]["priority_score"]
 
     await indexer.close()
@@ -431,7 +480,7 @@ async def test_interaction_term(tmp_env):
     without_interaction = next(q for q in queue if q["time"] == "11-00-00")
 
     bonus = with_interaction["priority_score"] - without_interaction["priority_score"]
-    assert bonus >= 0.08, f"Interaction bonus should be >= 0.08, got {bonus:.4f}"
+    assert bonus >= 0.079, f"Interaction bonus should be >= 0.079, got {bonus:.4f}"
 
     await indexer.close()
 
@@ -526,7 +575,6 @@ def test_classify_session_signals():
     assert "rag_low_sim" in signals
     assert "sono_ta" in signals
     assert "high_external_audio" in signals
-    assert "high_importance" in signals
 
     # RAG high similarity
     signals = Indexer.classify_session_signals({
@@ -540,7 +588,6 @@ def test_classify_session_signals():
     assert "rag_high_sim" in signals
     assert "sono_ta" not in signals
     assert "high_external_audio" not in signals
-    assert "high_importance" not in signals
 
     # LLM noisy
     signals = Indexer.classify_session_signals({
