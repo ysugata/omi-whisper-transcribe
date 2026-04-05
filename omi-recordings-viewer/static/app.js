@@ -3385,6 +3385,7 @@
     // --- Settings attention badge ---
 
     var settingsAttentionBadge = document.getElementById("settings-attention-badge");
+    var drawerAttentionBadge = document.getElementById("drawer-attention-badge");
     var navDotSuggestions = document.getElementById("nav-dot-suggestions");
     var navDotRag = document.getElementById("nav-dot-rag");
     var navDotRefiner = document.getElementById("nav-dot-refiner");
@@ -3398,12 +3399,16 @@
         function update() {
             done++;
             if (done < total) return;
-            if (count > 0) {
-                settingsAttentionBadge.textContent = count;
-                settingsAttentionBadge.classList.remove("hidden");
-            } else {
-                settingsAttentionBadge.classList.add("hidden");
-            }
+            // Update both header badge and drawer button badge
+            [settingsAttentionBadge, drawerAttentionBadge].forEach(function (badge) {
+                if (!badge) return;
+                if (count > 0) {
+                    badge.textContent = count;
+                    badge.classList.remove("hidden");
+                } else {
+                    badge.classList.add("hidden");
+                }
+            });
         }
 
         // 1. Voice: 0 speakers registered
