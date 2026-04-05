@@ -2880,7 +2880,8 @@
     var reviewDrawerBtn = document.getElementById("review-drawer-btn");
     var drawerCloseBtn = document.getElementById("drawer-close-btn");
     var drawerSuggestionsEl = document.getElementById("drawer-suggestions-list");
-    var drawerTermsListEl = document.getElementById("drawer-terms-list");
+    var drawerTabSuggestionsBadge = document.getElementById("drawer-tab-suggestions-badge");
+    var drawerTabRefinerBadge = document.getElementById("drawer-tab-refiner-badge");
 
     function toggleReviewDrawer(forceState) {
         var open = forceState != null ? forceState : !reviewState.drawerOpen;
@@ -2889,7 +2890,6 @@
             if (open) {
                 reviewDrawer.classList.add("visible");
                 loadDrawerSuggestions();
-                loadDrawerTerms();
                 loadDrawerRefiner();
             } else {
                 reviewDrawer.classList.remove("visible");
@@ -2905,13 +2905,15 @@
                 // Invalidate settings modal cache
                 suggestionsListEl.innerHTML = "";
             });
-        });
-    }
-
-    function loadDrawerTerms() {
-        if (!drawerTermsListEl) return;
-        fetch("/api/terms").then(function (r) { return r.json(); }).then(function (data) {
-            renderTermsInto(drawerTermsListEl, data, null);
+            // Update drawer tab badge
+            if (drawerTabSuggestionsBadge) {
+                if (data && data.length > 0) {
+                    drawerTabSuggestionsBadge.textContent = data.length;
+                    drawerTabSuggestionsBadge.classList.remove("hidden");
+                } else {
+                    drawerTabSuggestionsBadge.classList.add("hidden");
+                }
+            }
         });
     }
 
@@ -2934,6 +2936,16 @@
             if (data.running) statusParts.push("実行中 (" + (data.phase || "") + ")");
             if (data.last_run) statusParts.push("最終: " + data.last_run);
             drawerRefinerStatus.textContent = statusParts.join(" / ");
+
+            // Update drawer tab badge
+            if (drawerTabRefinerBadge) {
+                if (data.has_pending) {
+                    drawerTabRefinerBadge.textContent = "!";
+                    drawerTabRefinerBadge.classList.remove("hidden");
+                } else {
+                    drawerTabRefinerBadge.classList.add("hidden");
+                }
+            }
 
             if (data.has_pending) {
                 loadDrawerRefinerPending();
@@ -3016,56 +3028,11 @@
         }).catch(function () {});
     }
 
-    function renderTermsInto(container, data, filter) {
-        var keys = Object.keys(data).sort(function (a, b) {
-            return data[a].toLowerCase().localeCompare(data[b].toLowerCase()) || a.localeCompare(b);
-        });
-        if (filter) {
-            var f = filter.toLowerCase();
-            keys = keys.filter(function (k) { return k.toLowerCase().indexOf(f) >= 0 || data[k].toLowerCase().indexOf(f) >= 0; });
-        }
-        if (keys.length === 0) {
-            container.innerHTML = '<div class="loading">No terms</div>';
-            return;
-        }
-        var html = "";
-        keys.forEach(function (wrong) {
-            html += '<div class="term-row">';
-            html += '<span class="term-wrong">' + escapeHtml(wrong) + '</span>';
-            html += '<span class="term-arrow">&rarr;</span>';
-            html += '<span class="term-correct">' + escapeHtml(data[wrong]) + '</span>';
-            html += '</div>';
-        });
-        container.innerHTML = html;
-    }
-
     if (reviewDrawerBtn) {
         reviewDrawerBtn.addEventListener("click", function () { toggleReviewDrawer(); });
     }
     if (drawerCloseBtn) {
         drawerCloseBtn.addEventListener("click", function () { toggleReviewDrawer(false); });
-    }
-
-    // Drawer term add
-    var drawerTermWrong = document.getElementById("drawer-term-wrong");
-    var drawerTermCorrect = document.getElementById("drawer-term-correct");
-    var drawerTermAddBtn = document.getElementById("drawer-term-add-btn");
-    if (drawerTermAddBtn) {
-        drawerTermAddBtn.addEventListener("click", function () {
-            var wrong = drawerTermWrong.value.trim();
-            var correct = drawerTermCorrect.value.trim();
-            if (!wrong || !correct) return;
-            fetch("/api/terms", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ wrong: wrong, correct: correct }),
-            }).then(function (r) { return r.json(); }).then(function () {
-                drawerTermWrong.value = "";
-                drawerTermCorrect.value = "";
-                loadDrawerTerms();
-                termsCache = null;
-            });
-        });
     }
 
     // Drawer tabs

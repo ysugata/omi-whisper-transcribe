@@ -477,20 +477,11 @@
                 <button id="drawer-close-btn" class="review-close-btn">&times;</button>
             </div>
             <div class="drawer-tabs">
-                <button class="drawer-tab active" data-drawer-tab="drawer-suggestions">LLM Suggestions</button>
-                <button class="drawer-tab" data-drawer-tab="drawer-terms">Terms</button>
-                <button class="drawer-tab" data-drawer-tab="drawer-refiner">Refiner</button>
+                <button class="drawer-tab active" data-drawer-tab="drawer-suggestions">LLM Suggestions <span id="drawer-tab-suggestions-badge" class="drawer-tab-badge hidden">0</span></button>
+                <button class="drawer-tab" data-drawer-tab="drawer-refiner">Refiner <span id="drawer-tab-refiner-badge" class="drawer-tab-badge hidden">0</span></button>
             </div>
             <div id="drawer-suggestions" class="drawer-tab-content active">
                 <div id="drawer-suggestions-list"></div>
-            </div>
-            <div id="drawer-terms" class="drawer-tab-content">
-                <div class="term-add-row" style="margin-top:8px;">
-                    <input type="text" id="drawer-term-wrong" placeholder="Wrong">
-                    <input type="text" id="drawer-term-correct" placeholder="Correct">
-                    <button id="drawer-term-add-btn" class="btn-primary">Add</button>
-                </div>
-                <div id="drawer-terms-list" class="terms-list" style="max-height:calc(100vh - 240px);"></div>
             </div>
             <div id="drawer-refiner" class="drawer-tab-content">
                 <div id="drawer-refiner-status" class="text-dim" style="padding:8px 0;">読み込み中...</div>
