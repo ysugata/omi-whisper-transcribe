@@ -236,8 +236,22 @@ open http://localhost:8092
 |----------|------|------|
 | GET | `/api/review/queue?limit=1&offset=0` | 優先度順にレビュー対象セッションを返却 (transcript 付き) |
 | GET | `/api/review/stats` | キュー統計 (残数、済数、今日の処理数) |
-| POST | `/api/review/accept` | セッションを承認 (`{"date","time"}`) → `manually_corrected` を書き込み |
+| POST | `/api/review/accept` | セッションを承認 (`{"date","time"}`) → `manually_corrected` + `review_outcome` を書き込み + フィードバック記録 |
 | POST | `/api/review/skip` | スキップ (永続化なし、メモリのみ。リロードで再表示) |
+
+#### 優先度スコアリング (6軸 + 交互作用ボーナス)
+
+| 軸 | 重み | シグナル | 計算方法 |
+|----|------|---------|---------|
+| A. モデル不確実性 | 0.35 | rag_similarity, quality | RAG: `(1-sim)*0.35` (連続値)、LLM noisy: 0.30、partial: 0.20、clean: 0.15 |
+| B. 新規性 | 0.20 | conversation_type | 「その他」0.20、NULL 0.18、「独り言・メモ」「雑談・移動中メモ」0.05、他 0.0 |
+| C. コンテンツ複雑度 | 0.15 | segment_count | `MIN(segments, 50) / 50 * 0.15` (連続値) |
+| D. 音声シーン曖昧性 | 0.10 | external_audio, scene_confidence | external>=0.5 → +0.06、scene_confidence<0.7 → `(1-conf)*0.04` |
+| E. 時間的鮮度 | 0.10 | start_at | `MAX(0, 1 - days/90) * 0.10` (90日で線形減衰) |
+| F. 重要度 | 0.10 | importance_v2 | 高=0.10、中=0.05、低=0.0 |
+| G. 交互作用ボーナス | +0.10 | 複合 | RAG低信頼+noisy → +0.10、RAG低信頼+外部音声高 → +0.08 |
+
+重みはフィードバックループ (`config/review_weights.json`) により EMA で自動調整されます。Accept/Edit 操作のたびにシグナルバケット別の修正率が更新され、修正頻度の高い軸の重みが増加します。
 
 ## 環境変数
 

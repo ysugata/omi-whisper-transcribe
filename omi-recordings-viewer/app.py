@@ -672,8 +672,9 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     session = data.setdefault("session", {})
     tags = session.setdefault("tags", {})
 
-    # Remember old domains for keyword learning
+    # Remember old state for keyword learning and feedback
     old_domains = list(tags.get("domains", []))
+    was_already_corrected = tags.get("manually_corrected", False)
 
     # Partial update: only provided fields (empty lists are valid)
     if conv_type is not None:
@@ -687,12 +688,14 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
 
     tags["manually_corrected"] = True
     tags["corrected_at"] = datetime.now().isoformat(timespec="seconds")
+    if not was_already_corrected:
+        tags["review_outcome"] = "corrected"
 
     transcript_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # Re-index
+    # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
     try:
         info = indexer._parse_transcript(date, time)
@@ -711,7 +714,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                 tags_decision_memo, tags_importance_v2, tags_version,
                 tags_external_audio,
                 tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
+                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
+                tags_review_outcome)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -724,10 +728,13 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
                        :tags_external_audio,
                        :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
+                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
+                       :tags_review_outcome)""",
             info,
         )
         await indexer._db.commit()
+        if not was_already_corrected:
+            indexer.record_review_feedback(info, was_corrected=True)
     except Exception as e:
         logger.warning(f"Re-index after session-tags update failed: {e}")
 
@@ -949,12 +956,13 @@ async def handle_review_accept(request: web.Request) -> web.Response:
 
     tags["manually_corrected"] = True
     tags["corrected_at"] = datetime.now().isoformat(timespec="seconds")
+    tags["review_outcome"] = "accepted"
 
     transcript_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # Re-index
+    # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
     try:
         info = indexer._parse_transcript(date, time_val)
@@ -973,7 +981,8 @@ async def handle_review_accept(request: web.Request) -> web.Response:
                 tags_decision_memo, tags_importance_v2, tags_version,
                 tags_external_audio,
                 tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
+                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
+                tags_review_outcome)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -986,10 +995,12 @@ async def handle_review_accept(request: web.Request) -> web.Response:
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
                        :tags_external_audio,
                        :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
+                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
+                       :tags_review_outcome)""",
             info,
         )
         await indexer._db.commit()
+        indexer.record_review_feedback(info, was_corrected=False)
     except Exception as e:
         logger.warning(f"Re-index after review accept failed: {e}")
 

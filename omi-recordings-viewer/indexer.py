@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_rag_similarity REAL,
     tags_manually_corrected INTEGER DEFAULT 0,
     tags_corrected_at TEXT,
+    tags_review_outcome TEXT,
     UNIQUE(date, time)
 );
 
@@ -115,6 +117,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_rag_similarity REAL",
     "ALTER TABLE sessions ADD COLUMN tags_manually_corrected INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN tags_corrected_at TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_review_outcome TEXT",
 ]
 
 FTS_SCHEMA = """
@@ -300,6 +303,7 @@ class Indexer:
             "tags_rag_similarity": tags.get("rag_similarity"),
             "tags_manually_corrected": 1 if tags.get("manually_corrected") else 0,
             "tags_corrected_at": tags.get("corrected_at"),
+            "tags_review_outcome": tags.get("review_outcome"),
         }
 
     async def sync(self) -> int:
@@ -355,7 +359,8 @@ class Indexer:
                     tags_decision_memo, tags_importance_v2, tags_version,
                     tags_external_audio,
                     tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                    tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
+                    tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
+                    tags_review_outcome)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -368,7 +373,8 @@ class Indexer:
                            :tags_decision_memo, :tags_importance_v2, :tags_version,
                            :tags_external_audio,
                            :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                           :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
+                           :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
+                           :tags_review_outcome)""",
                 info,
             )
             count += 1
@@ -615,44 +621,101 @@ class Indexer:
 
         return where, params
 
+    # Default review scoring weights (sum = 1.0 for base axes)
+    _DEFAULT_REVIEW_WEIGHTS = {
+        "model_uncertainty": 0.35,
+        "novelty": 0.20,
+        "content_complexity": 0.15,
+        "audio_scene_ambiguity": 0.10,
+        "temporal_freshness": 0.10,
+        "importance": 0.10,
+    }
+
+    def _get_review_weights(self) -> dict:
+        """Load adjusted review weights from config, or return defaults."""
+        weights_path = self.recordings_dir.parent / "config" / "review_weights.json"
+        try:
+            if weights_path.exists():
+                data = json.loads(weights_path.read_text(encoding="utf-8"))
+                adjusted = data.get("adjusted_weights")
+                if adjusted and len(adjusted) == 6:
+                    return adjusted
+        except Exception:
+            logger.warning("Failed to load review_weights.json, using defaults")
+        return dict(self._DEFAULT_REVIEW_WEIGHTS)
+
     async def get_review_queue(self, limit: int = 1, offset: int = 0) -> list[dict]:
         """Get sessions ordered by review priority (highest uncertainty first).
 
-        Priority score (0-1, higher = more urgent):
-        - Model uncertainty (0.35): RAG low similarity / LLM noisy quality
-        - Novelty (0.25): conversation_type is その他 or untagged
-        - Source trust (0.20): RAG is less trusted than LLM
-        - Unreviewed (0.20): not yet manually corrected
+        Priority score (0-1.1, higher = more urgent) — 6 axes + interaction bonus:
+        - A. Model uncertainty (0.35): continuous RAG similarity / LLM quality
+        - B. Novelty (0.20): conversation_type その他 or NULL
+        - C. Content complexity (0.15): segment count proportional
+        - D. Audio scene ambiguity (0.10): external audio + low scene confidence
+        - E. Temporal freshness (0.10): 90-day linear decay
+        - F. Importance (0.10): importance_v2 高/中/低
+        - G. Interaction bonus (+0.10 max): compound risk signals
         """
-        sql = """
+        w = self._get_review_weights()
+        w_a = w["model_uncertainty"]
+        w_b = w["novelty"]
+        w_c = w["content_complexity"]
+        w_d = w["audio_scene_ambiguity"]
+        w_e = w["temporal_freshness"]
+        w_f = w["importance"]
+
+        sql = f"""
             SELECT *,
                 (
-                    -- Model uncertainty (0.35)
+                    -- A. Model uncertainty ({w_a}): continuous value
                     CASE
-                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0) < 0.5 THEN 0.35
-                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0) < 0.7 THEN 0.25
-                        WHEN tags_quality = 'noisy' THEN 0.30
-                        WHEN tags_quality = 'partial' THEN 0.15
+                        WHEN tags_tag_source = 'rag' THEN
+                            (1.0 - COALESCE(tags_rag_similarity, 0.5)) * {w_a}
+                        WHEN tags_quality IN ('noisy', 'fragmented') THEN {w_a} * 0.857
+                        WHEN tags_quality = 'partial' THEN {w_a} * 0.571
+                        ELSE {w_a} * 0.429
+                    END
+                    +
+                    -- B. Novelty ({w_b})
+                    CASE
+                        WHEN tags_conversation_type = 'その他' THEN {w_b}
+                        WHEN tags_conversation_type IS NULL THEN {w_b} * 0.9
+                        WHEN tags_conversation_type IN ('独り言・メモ', '雑談・移動中メモ') THEN {w_b} * 0.25
                         ELSE 0.0
                     END
                     +
-                    -- Novelty (0.25)
+                    -- C. Content complexity ({w_c}): proportional to segment count
+                    MIN(COALESCE(segment_count, 1), 50) * 1.0 / 50 * {w_c}
+                    +
+                    -- D. Audio scene ambiguity ({w_d})
+                    CASE WHEN COALESCE(tags_external_audio, 0) >= 0.5 THEN {w_d} * 0.6 ELSE 0.0 END
+                    +
                     CASE
-                        WHEN tags_conversation_type = 'その他' THEN 0.25
-                        WHEN tags_version = 0 THEN 0.20
+                        WHEN tags_audio_scene_confidence IS NOT NULL AND tags_audio_scene_confidence < 0.7
+                        THEN (1.0 - tags_audio_scene_confidence) * {w_d} * 0.4
                         ELSE 0.0
                     END
                     +
-                    -- Source trust (0.20)
+                    -- E. Temporal freshness ({w_e}): 90-day linear decay
                     CASE
-                        WHEN tags_tag_source = 'rag' THEN 0.20
-                        WHEN tags_tag_source IS NULL THEN 0.15
+                        WHEN start_at IS NOT NULL THEN
+                            MAX(0.0, 1.0 - (julianday('now') - julianday(start_at)) / 90.0) * {w_e}
+                        ELSE {w_e} * 0.5
+                    END
+                    +
+                    -- F. Importance ({w_f})
+                    CASE
+                        WHEN tags_importance_v2 = '高' THEN {w_f}
+                        WHEN tags_importance_v2 = '中' THEN {w_f} * 0.5
                         ELSE 0.0
                     END
                     +
-                    -- Unreviewed (0.20)
+                    -- G. Interaction bonus (+0.10 max)
                     CASE
-                        WHEN COALESCE(tags_manually_corrected, 0) = 0 THEN 0.20
+                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
+                             AND tags_quality IN ('noisy', 'fragmented') THEN 0.10
+                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0.5) < 0.5
+                             AND COALESCE(tags_external_audio, 0) >= 0.5 THEN 0.08
                         ELSE 0.0
                     END
                 ) AS priority_score
@@ -682,6 +745,126 @@ class Indexer:
             "total_reviewed": r["total_reviewed"] or 0,
             "reviewed_today": r["reviewed_today"] or 0,
         }
+
+    @staticmethod
+    def classify_session_signals(session: dict) -> list[str]:
+        """Classify session attributes into signal buckets for feedback tracking."""
+        signals = []
+        tag_source = session.get("tags_tag_source")
+        rag_sim = session.get("tags_rag_similarity")
+        quality = session.get("tags_quality")
+        conv_type = session.get("tags_conversation_type")
+        ext_audio = session.get("tags_external_audio") or 0
+        importance = session.get("tags_importance_v2")
+
+        # Axis A: model uncertainty
+        if tag_source == "rag":
+            if rag_sim is not None and rag_sim < 0.5:
+                signals.append("rag_low_sim")
+            else:
+                signals.append("rag_high_sim")
+        elif quality in ("noisy", "fragmented"):
+            signals.append("llm_noisy")
+        else:
+            signals.append("llm_clean")
+
+        # Axis B: novelty
+        if conv_type == "その他":
+            signals.append("sono_ta")
+
+        # Axis D: audio scene ambiguity
+        if ext_audio >= 0.5:
+            signals.append("high_external_audio")
+
+        # Axis F: importance
+        if importance == "高":
+            signals.append("high_importance")
+
+        return signals
+
+    def record_review_feedback(self, session: dict, was_corrected: bool) -> None:
+        """Record review outcome and update scoring weights via EMA feedback.
+
+        Args:
+            session: dict with session DB columns (tags_tag_source, etc.)
+            was_corrected: True if user edited tags, False if accepted as-is
+        """
+        weights_path = self.recordings_dir.parent / "config" / "review_weights.json"
+        ema_alpha = 0.15
+
+        # Load or initialize
+        try:
+            if weights_path.exists():
+                data = json.loads(weights_path.read_text(encoding="utf-8"))
+            else:
+                data = {}
+        except Exception:
+            data = {}
+
+        if "version" not in data:
+            data = {
+                "version": 1,
+                "updated_at": "",
+                "base_weights": dict(self._DEFAULT_REVIEW_WEIGHTS),
+                "correction_rates": {},
+                "adjusted_weights": dict(self._DEFAULT_REVIEW_WEIGHTS),
+            }
+
+        correction_rates = data.setdefault("correction_rates", {})
+        signals = self.classify_session_signals(session)
+
+        for sig in signals:
+            bucket = correction_rates.setdefault(
+                sig, {"corrections": 0, "total": 0, "rate": 0.0}
+            )
+            bucket["total"] += 1
+            if was_corrected:
+                bucket["corrections"] += 1
+            # EMA update of correction rate
+            observed = 1.0 if was_corrected else 0.0
+            bucket["rate"] = bucket["rate"] * (1 - ema_alpha) + observed * ema_alpha
+
+        # Map signal buckets → axis keys
+        signal_axis_map = {
+            "rag_low_sim": "model_uncertainty",
+            "rag_high_sim": "model_uncertainty",
+            "llm_noisy": "model_uncertainty",
+            "llm_clean": "model_uncertainty",
+            "sono_ta": "novelty",
+            "high_external_audio": "audio_scene_ambiguity",
+            "high_importance": "importance",
+        }
+
+        # Compute max correction rate per axis
+        axis_max_rate = {}
+        for sig, bucket in correction_rates.items():
+            axis = signal_axis_map.get(sig)
+            if axis and bucket["total"] >= 3:  # Need minimum samples
+                axis_max_rate[axis] = max(
+                    axis_max_rate.get(axis, 0.0), bucket["rate"]
+                )
+
+        # Adjust weights: base * (1 + max_rate), then normalize to 1.0
+        base = data.get("base_weights", dict(self._DEFAULT_REVIEW_WEIGHTS))
+        adjusted = {}
+        for key, base_w in base.items():
+            boost = axis_max_rate.get(key, 0.0)
+            adjusted[key] = base_w * (1.0 + boost)
+
+        total = sum(adjusted.values())
+        if total > 0:
+            adjusted = {k: v / total for k, v in adjusted.items()}
+
+        data["adjusted_weights"] = adjusted
+        data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+        try:
+            weights_path.parent.mkdir(parents=True, exist_ok=True)
+            weights_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            logger.exception("Failed to save review_weights.json")
 
     async def periodic_sync(self, interval: int = 30):
         """Background task: sync every `interval` seconds."""

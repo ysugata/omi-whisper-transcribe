@@ -39,14 +39,14 @@ async def test_review_queue_priority_ordering(tmp_env):
     """RAG low similarity should rank higher than LLM noisy, which ranks higher than RAG high similarity."""
     db_path, rec_dir = tmp_env
 
-    # Session 1: RAG with low similarity (highest priority)
+    # Session 1: RAG with very low similarity (highest model uncertainty)
     _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
-        "conversation_type": "日常会話",
+        "conversation_type": "その他",
         "outcomes": ["情報共有"],
         "domains": [],
-        "importance": "低",
+        "importance": "中",
         "tag_source": "rag",
-        "rag_similarity": 0.3,
+        "rag_similarity": 0.15,
         "tag_version": 2,
     })
 
@@ -281,3 +281,286 @@ async def test_new_columns_in_parse_transcript(tmp_env):
     assert s["tags_corrected_at"] == "2026-04-01T10:00:00"
 
     await indexer.close()
+
+
+# ============================================================
+# New tests for improved scoring
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_continuous_rag_similarity(tmp_env):
+    """RAG similarity should produce strictly monotonically decreasing priority scores."""
+    db_path, rec_dir = tmp_env
+
+    for i, sim in enumerate([0.10, 0.40, 0.60, 0.90]):
+        time_str = f"1{i}-00-00"
+        _make_session(rec_dir, "2026-04-01", time_str, tags={
+            "conversation_type": "日常会話",
+            "outcomes": [],
+            "importance": "低",
+            "tag_source": "rag",
+            "rag_similarity": sim,
+            "tag_version": 2,
+        })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 4
+
+    scores = [item["priority_score"] for item in queue]
+    # Should be strictly decreasing (sorted by priority DESC)
+    for i in range(len(scores) - 1):
+        assert scores[i] > scores[i + 1], f"Score {scores[i]} should be > {scores[i+1]}"
+
+    # Verify the order: lowest similarity first
+    assert queue[0]["time"] == "10-00-00"  # sim 0.10
+    assert queue[-1]["time"] == "13-00-00"  # sim 0.90
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_importance_affects_priority(tmp_env):
+    """importance_v2=高 should produce higher priority than importance_v2=低."""
+    db_path, rec_dir = tmp_env
+
+    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "高",
+        "tag_source": "llm",
+        "quality": "clean",
+        "tag_version": 2,
+    })
+    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "clean",
+        "tag_version": 2,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 2
+    assert queue[0]["time"] == "10-00-00", "高 importance should rank higher"
+    assert queue[0]["priority_score"] > queue[1]["priority_score"]
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_external_audio_bonus(tmp_env):
+    """Sessions with external_audio >= 0.5 should get higher priority."""
+    db_path, rec_dir = tmp_env
+
+    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "clean",
+        "external_audio_ratio": 0.8,
+        "tag_version": 2,
+    })
+    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "clean",
+        "external_audio_ratio": 0.0,
+        "tag_version": 2,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 2
+    assert queue[0]["time"] == "10-00-00", "High external audio should rank higher"
+    assert queue[0]["priority_score"] > queue[1]["priority_score"]
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_interaction_term(tmp_env):
+    """RAG low similarity + noisy quality should get interaction bonus >= 0.08."""
+    db_path, rec_dir = tmp_env
+
+    # With interaction: RAG low sim + noisy
+    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "rag",
+        "rag_similarity": 0.3,
+        "quality": "noisy",
+        "tag_version": 2,
+    })
+
+    # Without interaction: RAG low sim only (no noisy)
+    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "rag",
+        "rag_similarity": 0.3,
+        "quality": "clean",
+        "tag_version": 2,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 2
+
+    with_interaction = next(q for q in queue if q["time"] == "10-00-00")
+    without_interaction = next(q for q in queue if q["time"] == "11-00-00")
+
+    bonus = with_interaction["priority_score"] - without_interaction["priority_score"]
+    assert bonus >= 0.08, f"Interaction bonus should be >= 0.08, got {bonus:.4f}"
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_segment_count_complexity(tmp_env):
+    """Sessions with more segments should have higher priority."""
+    db_path, rec_dir = tmp_env
+
+    # 30 segments
+    segs_30 = [{"start": i, "end": i + 1, "text": f"seg {i}"} for i in range(30)]
+    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "clean",
+        "tag_version": 2,
+    }, segments=segs_30)
+
+    # 1 segment
+    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+        "conversation_type": "日常会話",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "clean",
+        "tag_version": 2,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 2
+    assert queue[0]["time"] == "10-00-00", "More segments should rank higher"
+    assert queue[0]["priority_score"] > queue[1]["priority_score"]
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_weight_adjustment(tmp_env):
+    """After repeated corrections, model_uncertainty weight should increase and sum to 1.0."""
+    db_path, rec_dir = tmp_env
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+
+    # Simulate 10 corrections for rag_low_sim sessions
+    for i in range(10):
+        session = {
+            "tags_tag_source": "rag",
+            "tags_rag_similarity": 0.3,
+            "tags_quality": "clean",
+            "tags_conversation_type": "日常会話",
+            "tags_external_audio": 0.0,
+            "tags_importance_v2": "低",
+        }
+        indexer.record_review_feedback(session, was_corrected=True)
+
+    # Load saved weights
+    weights_path = rec_dir.parent / "config" / "review_weights.json"
+    assert weights_path.exists(), "review_weights.json should be created"
+
+    data = json.loads(weights_path.read_text(encoding="utf-8"))
+    adjusted = data["adjusted_weights"]
+
+    # model_uncertainty should be boosted above default
+    assert adjusted["model_uncertainty"] > Indexer._DEFAULT_REVIEW_WEIGHTS["model_uncertainty"], \
+        f"Expected model_uncertainty > {Indexer._DEFAULT_REVIEW_WEIGHTS['model_uncertainty']}, got {adjusted['model_uncertainty']}"
+
+    # Sum should be ~1.0
+    total = sum(adjusted.values())
+    assert abs(total - 1.0) < 0.001, f"Weights should sum to 1.0, got {total}"
+
+    await indexer.close()
+
+
+def test_classify_session_signals():
+    """Test signal bucket classification accuracy."""
+    # RAG low similarity
+    signals = Indexer.classify_session_signals({
+        "tags_tag_source": "rag",
+        "tags_rag_similarity": 0.3,
+        "tags_quality": "clean",
+        "tags_conversation_type": "その他",
+        "tags_external_audio": 0.8,
+        "tags_importance_v2": "高",
+    })
+    assert "rag_low_sim" in signals
+    assert "sono_ta" in signals
+    assert "high_external_audio" in signals
+    assert "high_importance" in signals
+
+    # RAG high similarity
+    signals = Indexer.classify_session_signals({
+        "tags_tag_source": "rag",
+        "tags_rag_similarity": 0.7,
+        "tags_quality": "clean",
+        "tags_conversation_type": "日常会話",
+        "tags_external_audio": 0.0,
+        "tags_importance_v2": "低",
+    })
+    assert "rag_high_sim" in signals
+    assert "sono_ta" not in signals
+    assert "high_external_audio" not in signals
+    assert "high_importance" not in signals
+
+    # LLM noisy
+    signals = Indexer.classify_session_signals({
+        "tags_tag_source": "llm",
+        "tags_rag_similarity": None,
+        "tags_quality": "noisy",
+        "tags_conversation_type": "業務会話",
+        "tags_external_audio": 0.0,
+        "tags_importance_v2": "中",
+    })
+    assert "llm_noisy" in signals
+    assert "rag_low_sim" not in signals
+
+    # LLM clean
+    signals = Indexer.classify_session_signals({
+        "tags_tag_source": "llm",
+        "tags_rag_similarity": None,
+        "tags_quality": "clean",
+        "tags_conversation_type": "日常会話",
+        "tags_external_audio": 0.0,
+        "tags_importance_v2": "低",
+    })
+    assert "llm_clean" in signals
