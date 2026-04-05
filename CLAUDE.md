@@ -7,12 +7,39 @@
 
 ## Git ワークフロー
 
-- ソースを書き換える必要がある場合は必ず **ブランチを切ってから** 作業すること
+### Worktree ベースの並列開発
+
+ソースを書き換える場合は **git worktree** を使い、メインの作業ディレクトリを汚さずに並列開発する。
+
+```bash
+# 1. まず main を最新化（古い main から分岐しないように）
+git fetch origin main
+
+# 2. worktree を作成（ベースブランチを明示）
+git worktree add ../omi_whisper_transcribe-<機能名> -b <branch名> origin/main
+# 例: git worktree add ../omi_whisper_transcribe-fix-filter -b fix/filter-user-tag origin/main
+
+# 3. worktree 内で開発・テスト・コミット・プッシュ
+
+# 4. マージ後にクリーンアップ
+git worktree remove ../omi_whisper_transcribe-<機能名>
+git branch -d <branch名>
+git push origin --delete <branch名>
+```
+
+### ブランチルール
+
 - ブランチ名は内容に応じて `feature/xxx` や `fix/xxx` 等、適切に決める
 - main に直接コミットしない
 - 作業完了後はコミット＆プッシュし、特に指示がなければ main にマージする
 - マージ後は main にチェックアウトして pull し、最新の状態にしておく
 - **マージ完了後はローカル・リモート両方のブランチを削除する**
+- **worktree のディレクトリも削除する** (`git worktree remove`)
+
+### 自動管理 (cron)
+
+- **30分ごと**: `git fetch origin main` で main を最新に保つ
+- **毎日 AM3:30**: `~/scripts/git-worktree-cleanup.sh` でマージ済み worktree を自動削除
 
 ## テスト — 必須ステップ
 
