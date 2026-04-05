@@ -710,7 +710,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                 tags_conversation_type, tags_outcomes, tags_domains,
                 tags_decision_memo, tags_importance_v2, tags_version,
                 tags_external_audio,
-                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence)
+                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                        :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                        :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -722,7 +723,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                        :tags_conversation_type, :tags_outcomes, :tags_domains,
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
                        :tags_external_audio,
-                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence)""",
+                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
             info,
         )
         await indexer._db.commit()
@@ -878,6 +880,125 @@ async def handle_taxonomy_refine_approve(request: web.Request) -> web.Response:
 
 async def handle_taxonomy_refine_reject(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/taxonomy/refine/reject", timeout_sec=10)
+
+
+# ============================================================
+# Review Queue API
+# ============================================================
+
+async def handle_review_queue(request: web.Request) -> web.Response:
+    """GET /api/review/queue — get next items to review, ordered by priority."""
+    indexer: Indexer = request.app["indexer"]
+    limit = max(1, min(20, int(request.query.get("limit", "1"))))
+    offset = max(0, int(request.query.get("offset", "0")))
+
+    try:
+        items = await indexer.get_review_queue(limit=limit, offset=offset)
+    except Exception as e:
+        logger.exception("Review queue query failed")
+        return web.json_response({"error": str(e)}, status=500)
+
+    # Attach transcript for each item
+    results = []
+    for item in items:
+        transcript = await indexer.get_transcript(item["date"], item["time"])
+        results.append({
+            "session": item,
+            "transcript": transcript,
+        })
+
+    return web.json_response({"items": results})
+
+
+async def handle_review_stats(request: web.Request) -> web.Response:
+    """GET /api/review/stats — review queue statistics."""
+    indexer: Indexer = request.app["indexer"]
+    try:
+        stats = await indexer.get_review_stats()
+    except Exception as e:
+        logger.exception("Review stats query failed")
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response(stats)
+
+
+async def handle_review_accept(request: web.Request) -> web.Response:
+    """POST /api/review/accept — mark session as reviewed (accept current tags).
+
+    Body: {"date": "YYYY-MM-DD", "time": "HH-MM-SS"}
+    Writes manually_corrected=true + corrected_at to transcript.json and re-indexes.
+    Idempotent: accepting an already-accepted session is a no-op (200 OK).
+    """
+    body = await request.json()
+    date = body.get("date", "").strip()
+    time_val = body.get("time", "").strip()
+
+    if not date or not time_val:
+        return web.json_response({"error": "date and time are required"}, status=400)
+
+    transcript_path = Path(RECORDINGS_DIR) / date / time_val / "transcript.json"
+    if not transcript_path.exists():
+        return web.json_response({"error": "session not found"}, status=404)
+
+    try:
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return web.json_response({"error": "transcript read error"}, status=500)
+
+    session = data.setdefault("session", {})
+    tags = session.setdefault("tags", {})
+
+    tags["manually_corrected"] = True
+    tags["corrected_at"] = datetime.now().isoformat(timespec="seconds")
+
+    transcript_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Re-index
+    indexer: Indexer = request.app["indexer"]
+    try:
+        info = indexer._parse_transcript(date, time_val)
+        info["last_modified"] = transcript_path.stat().st_mtime
+        await indexer._db.execute(
+            """INSERT OR REPLACE INTO sessions
+               (date, time, start_at, end_at, duration_seconds,
+                audio_size_mb, model, language, transcript_text, segment_count,
+                tags_topics, tags_activity, tags_intent, tags_mood,
+                tags_quality, tags_entities, tags_summary, session_tagged,
+                tags_user, speakers, last_modified,
+                tags_source_type, tags_business_domain, tags_importance,
+                tags_confidentiality, tags_decision_required,
+                tags_decision_summary, tags_action_items, tags_outcome,
+                tags_conversation_type, tags_outcomes, tags_domains,
+                tags_decision_memo, tags_importance_v2, tags_version,
+                tags_external_audio,
+                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
+               VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
+                       :audio_size_mb, :model, :language, :transcript_text, :segment_count,
+                       :tags_topics, :tags_activity, :tags_intent, :tags_mood,
+                       :tags_quality, :tags_entities, :tags_summary, :session_tagged,
+                       :tags_user, :speakers, :last_modified,
+                       :tags_source_type, :tags_business_domain, :tags_importance,
+                       :tags_confidentiality, :tags_decision_required,
+                       :tags_decision_summary, :tags_action_items, :tags_outcome,
+                       :tags_conversation_type, :tags_outcomes, :tags_domains,
+                       :tags_decision_memo, :tags_importance_v2, :tags_version,
+                       :tags_external_audio,
+                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
+            info,
+        )
+        await indexer._db.commit()
+    except Exception as e:
+        logger.warning(f"Re-index after review accept failed: {e}")
+
+    return web.json_response({"status": "ok"})
+
+
+async def handle_review_skip(request: web.Request) -> web.Response:
+    """POST /api/review/skip — skip a review item (no persistence, 200 OK)."""
+    return web.json_response({"status": "ok"})
 
 
 # ============================================================
@@ -1239,6 +1360,12 @@ def create_app() -> web.Application:
     app.router.add_post("/api/vibevoice/start", handle_vibevoice_start)
     app.router.add_get("/api/vibevoice/status", handle_vibevoice_status)
     app.router.add_post("/api/vibevoice/cancel", handle_vibevoice_cancel)
+
+    # Review queue API
+    app.router.add_get("/api/review/queue", handle_review_queue)
+    app.router.add_get("/api/review/stats", handle_review_stats)
+    app.router.add_post("/api/review/accept", handle_review_accept)
+    app.router.add_post("/api/review/skip", handle_review_skip)
 
     # RAG classifier プロキシ API
     app.router.add_get("/api/rag/status", handle_rag_status)

@@ -1071,8 +1071,29 @@
     // Presets
     // ============================================================
 
-    // Escape key closes whichever modal is open
+    // Global keyboard shortcuts
     document.addEventListener("keydown", function (e) {
+        // Skip shortcuts when typing in inputs
+        var tag = e.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+        // Review mode shortcuts
+        if (reviewState.active) {
+            if (e.key === "Escape") {
+                if (reviewState.editing) {
+                    reviewState.editing = false;
+                    loadNextReviewItem();
+                } else {
+                    closeReviewMode();
+                }
+                return;
+            }
+            if (e.key === "a" || e.key === "A") { reviewAccept(); return; }
+            if (e.key === "e" || e.key === "E") { reviewEdit(); return; }
+            if (e.key === "s" || e.key === "S" || e.key === " ") { e.preventDefault(); reviewSkip(); return; }
+            return;
+        }
+
         if (e.key === "Escape") {
             if (!settingsModal.classList.contains("hidden")) {
                 closeSettings();
@@ -2739,6 +2760,366 @@
         });
     }
 
+    // ============================================================
+    // Review Queue Mode
+    // ============================================================
+
+    var reviewOverlay = document.getElementById("review-overlay");
+    var reviewContent = document.getElementById("review-content");
+    var reviewProgressFill = document.getElementById("review-progress-fill");
+    var reviewProgressText = document.getElementById("review-progress-text");
+    var reviewStatsText = document.getElementById("review-stats-text");
+    var reviewBtn = document.getElementById("review-btn");
+    var reviewCountBadge = document.getElementById("review-count-badge");
+    var reviewCloseBtn = document.getElementById("review-close-btn");
+    var reviewAcceptBtn = document.getElementById("review-accept-btn");
+    var reviewEditBtn = document.getElementById("review-edit-btn");
+    var reviewSkipBtn = document.getElementById("review-skip-btn");
+
+    var reviewState = {
+        active: false,
+        currentItem: null,
+        totalPending: 0,
+        reviewedCount: 0,
+        skippedOffset: 0,
+        editing: false,
+    };
+
+    function loadReviewStats() {
+        fetch("/api/review/stats").then(function (r) { return r.json(); }).then(function (data) {
+            reviewState.totalPending = data.total_pending || 0;
+            if (reviewCountBadge) {
+                if (reviewState.totalPending > 0) {
+                    reviewCountBadge.textContent = reviewState.totalPending;
+                    reviewCountBadge.classList.remove("hidden");
+                } else {
+                    reviewCountBadge.classList.add("hidden");
+                }
+            }
+        }).catch(function () {});
+    }
+
+    function openReviewMode() {
+        reviewState.active = true;
+        reviewState.reviewedCount = 0;
+        reviewState.skippedOffset = 0;
+        reviewState.editing = false;
+        reviewOverlay.classList.remove("hidden");
+        document.body.style.overflow = "hidden";
+        loadNextReviewItem();
+    }
+
+    function closeReviewMode() {
+        reviewState.active = false;
+        reviewState.currentItem = null;
+        reviewState.editing = false;
+        reviewOverlay.classList.add("hidden");
+        document.body.style.overflow = "";
+        loadReviewStats();
+        loadPage(currentPage);
+    }
+
+    function loadNextReviewItem() {
+        reviewState.editing = false;
+        reviewContent.classList.remove("fade-in");
+        reviewContent.classList.add("fade-out");
+
+        setTimeout(function () {
+            fetch("/api/review/queue?limit=1&offset=" + reviewState.skippedOffset)
+                .then(function (r) {
+                    if (!r.ok) throw new Error("HTTP " + r.status);
+                    return r.json();
+                })
+                .then(function (data) {
+                    var items = data.items || [];
+                    if (items.length === 0) {
+                        showReviewComplete();
+                        return;
+                    }
+                    reviewState.currentItem = items[0];
+                    renderReviewItem(items[0]);
+                    updateReviewProgress();
+                    reviewContent.classList.remove("fade-out");
+                    reviewContent.classList.add("fade-in");
+                })
+                .catch(function (err) {
+                    reviewContent.innerHTML = '<div class="review-complete"><h2 style="color:#e74c3c;">Error</h2>'
+                        + '<p>' + escapeHtml(err.message) + '</p>'
+                        + '<button class="btn-primary" onclick="this.closest(\'.review-content\').querySelector(\'div\').remove(); document.getElementById(\'review-close-btn\').click();">Close</button></div>';
+                    reviewContent.classList.remove("fade-out");
+                    reviewContent.classList.add("fade-in");
+                });
+        }, 150);
+    }
+
+    function renderReviewItem(item) {
+        var s = item.session;
+        var t = item.transcript || {};
+        var segments = t.segments || [];
+        var tags = (t.session || {}).tags || {};
+
+        var priorityScore = s.priority_score || 0;
+        var priorityClass = priorityScore >= 0.6 ? "high" : (priorityScore >= 0.35 ? "medium" : "low");
+        var priorityLabel = priorityScore >= 0.6 ? "要確認" : (priorityScore >= 0.35 ? "確認推奨" : "低優先");
+
+        var html = '<div class="review-session-header">';
+        html += '<h2>' + escapeHtml(s.date) + ' ' + escapeHtml(s.time.replace(/-/g, ":"));
+        html += ' <span class="review-priority-badge ' + priorityClass + '">' + priorityLabel + '</span>';
+        html += '</h2>';
+        html += '<div class="review-session-meta">';
+        html += '<span>Duration: ' + formatDuration(s.duration_seconds) + '</span>';
+        html += '<span>' + (s.segment_count || 0) + ' segments</span>';
+        if (s.tags_quality) html += '<span>Quality: ' + escapeHtml(s.tags_quality) + '</span>';
+        html += '</div></div>';
+
+        // Current tags
+        html += '<div class="review-current-tags">';
+        html += '<div class="review-current-tags-label">Current Tags</div>';
+        html += '<div class="detail-tags">';
+        if (s.tags_conversation_type) html += '<span class="tag-badge conv-type">' + escapeHtml(s.tags_conversation_type) + '</span>';
+        if (s.tags_outcomes) {
+            s.tags_outcomes.split(",").forEach(function (o) {
+                html += '<span class="tag-badge outcome">' + escapeHtml(o.trim()) + '</span>';
+            });
+        }
+        if (s.tags_domains) {
+            s.tags_domains.split(",").forEach(function (d) {
+                html += '<span class="tag-badge domain">' + escapeHtml(d.trim()) + '</span>';
+            });
+        }
+        if (s.tags_importance_v2) {
+            var impClass = s.tags_importance_v2 === "高" ? "imp-high" : (s.tags_importance_v2 === "中" ? "imp-med" : "imp-low");
+            html += '<span class="tag-badge ' + impClass + '">' + escapeHtml(s.tags_importance_v2) + '</span>';
+        }
+        html += '</div>';
+
+        // Source info
+        var sourceInfo = '';
+        if (s.tags_tag_source) {
+            sourceInfo += 'Source: ' + escapeHtml(s.tags_tag_source);
+            if (s.tags_tag_source === 'rag' && s.tags_rag_similarity != null) {
+                sourceInfo += ' (similarity: ' + Math.round(s.tags_rag_similarity * 100) + '%)';
+            }
+        }
+        if (s.tags_quality) sourceInfo += (sourceInfo ? '  |  ' : '') + 'Quality: ' + escapeHtml(s.tags_quality);
+        if (sourceInfo) html += '<div class="review-tag-source">' + sourceInfo + '</div>';
+        html += '</div>';
+
+        // Summary
+        if (s.tags_summary) {
+            html += '<div class="detail-summary">' + escapeHtml(s.tags_summary) + '</div>';
+        }
+
+        // Tag editor container (hidden by default, shown on E)
+        html += '<div id="review-tag-editor-container" style="display:none;"></div>';
+
+        // Transcript
+        html += '<div class="review-transcript">';
+        segments.forEach(function (seg) {
+            var timeStr = formatTimestamp(seg.start || 0);
+            var speaker = seg.person_name || "";
+            var speakerClass = "unknown-speaker";
+            if (speaker && speaker !== "unknown") {
+                speakerClass = seg.is_user ? "user-speaker" : "known-speaker";
+            }
+            html += '<div class="segment">';
+            html += '<span class="segment-time">' + timeStr + '</span>';
+            if (speaker) {
+                html += '<span class="speaker-badge ' + speakerClass + '">' + escapeHtml(speaker === "unknown" ? "?" : speaker) + '</span>';
+            }
+            html += '<span class="segment-text">' + escapeHtml(seg.text || "") + '</span>';
+            html += '</div>';
+        });
+        html += '</div>';
+
+        reviewContent.innerHTML = html;
+    }
+
+    function updateReviewProgress() {
+        var total = reviewState.totalPending + reviewState.reviewedCount;
+        if (total > 0) {
+            var pct = Math.round((reviewState.reviewedCount / total) * 100);
+            reviewProgressFill.style.width = pct + "%";
+        } else {
+            reviewProgressFill.style.width = "0%";
+        }
+        reviewProgressText.textContent = reviewState.reviewedCount + " / " + (reviewState.totalPending + reviewState.reviewedCount);
+        reviewStatsText.textContent = "済: " + reviewState.reviewedCount + "  残: " + reviewState.totalPending;
+    }
+
+    function reviewAccept() {
+        var item = reviewState.currentItem;
+        if (!item) return;
+        var s = item.session;
+
+        reviewAcceptBtn.disabled = true;
+        fetch("/api/review/accept", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({date: s.date, time: s.time}),
+        }).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function () {
+            reviewState.reviewedCount++;
+            reviewState.totalPending = Math.max(0, reviewState.totalPending - 1);
+            // Skipped items shift down since one was removed from the queue
+            if (reviewState.skippedOffset > 0) reviewState.skippedOffset--;
+            reviewAcceptBtn.disabled = false;
+            loadNextReviewItem();
+        }).catch(function (err) {
+            showNotification("Error: " + err.message);
+            reviewAcceptBtn.disabled = false;
+        });
+    }
+
+    function reviewEdit() {
+        var item = reviewState.currentItem;
+        if (!item) return;
+        var s = item.session;
+        reviewState.editing = true;
+
+        var container = document.getElementById("review-tag-editor-container");
+        if (!container) return;
+        if (container.style.display !== "none") {
+            container.style.display = "none";
+            reviewState.editing = false;
+            return;
+        }
+        if (!taxonomyCache) {
+            container.innerHTML = '<p class="text-dim">Taxonomy not loaded</p>';
+            container.style.display = "block";
+            return;
+        }
+
+        var currentTags = {
+            conversation_type: s.tags_conversation_type,
+            outcomes: s.tags_outcomes ? s.tags_outcomes.split(",") : [],
+            domains: s.tags_domains ? s.tags_domains.split(",") : [],
+            importance: s.tags_importance_v2,
+        };
+
+        var html = '<div class="review-tag-editor">';
+        html += '<div class="tag-editor-row"><label>会話の種類</label><select id="rte-conv-type">';
+        (taxonomyCache.conversation_type || []).forEach(function (v) {
+            html += '<option value="' + escapeHtml(v) + '"' + (currentTags.conversation_type === v ? ' selected' : '') + '>' + escapeHtml(v) + '</option>';
+        });
+        html += '</select></div>';
+        html += '<div class="tag-editor-row"><label>成果物</label><div class="te-checks">';
+        (taxonomyCache.outcomes || []).forEach(function (v) {
+            var checked = currentTags.outcomes.indexOf(v) !== -1 ? ' checked' : '';
+            html += '<label class="te-check"><input type="checkbox" value="' + escapeHtml(v) + '"' + checked + ' class="rte-outcome-cb"> ' + escapeHtml(v) + '</label>';
+        });
+        html += '</div></div>';
+        html += '<div class="tag-editor-row"><label>事業領域</label><div class="te-checks">';
+        (taxonomyCache.domains || []).forEach(function (v) {
+            var checked = currentTags.domains.indexOf(v) !== -1 ? ' checked' : '';
+            html += '<label class="te-check"><input type="checkbox" value="' + escapeHtml(v) + '"' + checked + ' class="rte-domain-cb"> ' + escapeHtml(v) + '</label>';
+        });
+        html += '</div></div>';
+        html += '<div class="tag-editor-row"><label>重要度</label><select id="rte-importance">';
+        (taxonomyCache.importance || []).forEach(function (v) {
+            html += '<option value="' + escapeHtml(v) + '"' + (currentTags.importance === v ? ' selected' : '') + '>' + escapeHtml(v) + '</option>';
+        });
+        html += '</select></div>';
+        html += '<div class="tag-editor-actions">';
+        html += '<button class="btn-primary" id="rte-save">保存して承認</button>';
+        html += ' <button class="btn-sm" id="rte-cancel">キャンセル</button>';
+        html += ' <span id="rte-status"></span>';
+        html += '</div></div>';
+
+        container.innerHTML = html;
+        container.style.display = "block";
+
+        document.getElementById("rte-cancel").addEventListener("click", function () {
+            container.style.display = "none";
+            reviewState.editing = false;
+        });
+
+        document.getElementById("rte-save").addEventListener("click", function () {
+            var convType = document.getElementById("rte-conv-type").value;
+            var importance = document.getElementById("rte-importance").value;
+            var outcomes = [];
+            var outCbs = container.querySelectorAll(".rte-outcome-cb:checked");
+            for (var i = 0; i < outCbs.length; i++) outcomes.push(outCbs[i].value);
+            var domains = [];
+            var domCbs = container.querySelectorAll(".rte-domain-cb:checked");
+            for (var j = 0; j < domCbs.length; j++) domains.push(domCbs[j].value);
+
+            var statusEl = document.getElementById("rte-status");
+            statusEl.textContent = "Saving...";
+
+            // First update tags, then accept
+            fetch("/api/sessions/" + encodeURIComponent(s.date) + "/" + encodeURIComponent(s.time) + "/session-tags", {
+                method: "PUT",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({conversation_type: convType, outcomes: outcomes, domains: domains, importance: importance}),
+            }).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            }).then(function (data) {
+                if (data.error) throw new Error(data.error);
+                // Tags saved — session is now marked as manually_corrected via PUT handler
+                reviewState.reviewedCount++;
+                reviewState.totalPending = Math.max(0, reviewState.totalPending - 1);
+                if (reviewState.skippedOffset > 0) reviewState.skippedOffset--;
+                container.style.display = "none";
+                reviewState.editing = false;
+                loadNextReviewItem();
+            }).catch(function (err) {
+                statusEl.textContent = "Error: " + err.message;
+                statusEl.style.color = "#e74c3c";
+            });
+        });
+    }
+
+    function reviewSkip() {
+        reviewState.skippedOffset++;
+        fetch("/api/review/skip", { method: "POST" }).catch(function () {});
+        loadNextReviewItem();
+    }
+
+    function showReviewComplete() {
+        reviewContent.classList.remove("fade-out");
+        reviewContent.classList.add("fade-in");
+        reviewContent.innerHTML = '<div class="review-complete">'
+            + '<h2>All Done!</h2>'
+            + '<div class="review-complete-stats">'
+            + '<p>今回のレビュー: ' + reviewState.reviewedCount + ' 件承認</p>'
+            + '<p>スキップ: ' + reviewState.skippedOffset + ' 件 (次回再表示されます)</p>'
+            + '</div>'
+            + '<button class="btn-primary" id="review-complete-close">閉じる</button>'
+            + '</div>';
+        var closeBtn = document.getElementById("review-complete-close");
+        if (closeBtn) closeBtn.addEventListener("click", closeReviewMode);
+        updateReviewProgress();
+    }
+
+    // Event listeners
+    if (reviewBtn) reviewBtn.addEventListener("click", openReviewMode);
+    if (reviewCloseBtn) reviewCloseBtn.addEventListener("click", closeReviewMode);
+    if (reviewAcceptBtn) reviewAcceptBtn.addEventListener("click", reviewAccept);
+    if (reviewEditBtn) reviewEditBtn.addEventListener("click", reviewEdit);
+    if (reviewSkipBtn) reviewSkipBtn.addEventListener("click", reviewSkip);
+
+    // ============================================================
+    // Notification helper
+    // ============================================================
+
+    function showNotification(msg) {
+        var existing = document.querySelector(".notification");
+        if (existing) existing.remove();
+        var el = document.createElement("div");
+        el.className = "notification";
+        el.textContent = msg;
+        document.body.appendChild(el);
+        setTimeout(function () { el.classList.add("show"); }, 10);
+        setTimeout(function () {
+            el.classList.remove("show");
+            setTimeout(function () { el.remove(); }, 300);
+        }, 3000);
+    }
+
     // --- Init ---
     Promise.all([loadSpeakerNames(), loadTaxonomy(), loadAudioSceneLabels()]).then(function () {
         loadPage(1);
@@ -2746,4 +3127,5 @@
     checkBatchStatus("diarize");
     checkBatchStatus("tags");
     loadHotwordsStatus();
+    loadReviewStats();
 })();

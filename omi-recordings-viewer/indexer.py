@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_audio_scene TEXT,
     tags_audio_scene_spatial TEXT,
     tags_audio_scene_confidence REAL,
+    tags_tag_source TEXT,
+    tags_rag_similarity REAL,
+    tags_manually_corrected INTEGER DEFAULT 0,
+    tags_corrected_at TEXT,
     UNIQUE(date, time)
 );
 
@@ -72,6 +76,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_decision_required ON sessions(tags_decis
 CREATE INDEX IF NOT EXISTS idx_sessions_conversation_type ON sessions(tags_conversation_type);
 CREATE INDEX IF NOT EXISTS idx_sessions_importance_v2 ON sessions(tags_importance_v2);
 CREATE INDEX IF NOT EXISTS idx_sessions_audio_scene ON sessions(tags_audio_scene);
+CREATE INDEX IF NOT EXISTS idx_sessions_manually_corrected ON sessions(tags_manually_corrected);
+CREATE INDEX IF NOT EXISTS idx_sessions_tag_source ON sessions(tags_tag_source);
 """
 
 # Migration: add tag columns to existing DBs
@@ -105,6 +111,10 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene_spatial TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene_confidence REAL",
+    "ALTER TABLE sessions ADD COLUMN tags_tag_source TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_rag_similarity REAL",
+    "ALTER TABLE sessions ADD COLUMN tags_manually_corrected INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_corrected_at TEXT",
 ]
 
 FTS_SCHEMA = """
@@ -286,6 +296,10 @@ class Indexer:
             "tags_audio_scene": (session.get("audio_scene") or {}).get("scene_label"),
             "tags_audio_scene_spatial": (session.get("audio_scene") or {}).get("spatial_label"),
             "tags_audio_scene_confidence": (session.get("audio_scene") or {}).get("scene_confidence"),
+            "tags_tag_source": tags.get("tag_source"),
+            "tags_rag_similarity": tags.get("rag_similarity"),
+            "tags_manually_corrected": 1 if tags.get("manually_corrected") else 0,
+            "tags_corrected_at": tags.get("corrected_at"),
         }
 
     async def sync(self) -> int:
@@ -340,7 +354,8 @@ class Indexer:
                     tags_conversation_type, tags_outcomes, tags_domains,
                     tags_decision_memo, tags_importance_v2, tags_version,
                     tags_external_audio,
-                    tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence)
+                    tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                    tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
                            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
                            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -352,7 +367,8 @@ class Indexer:
                            :tags_conversation_type, :tags_outcomes, :tags_domains,
                            :tags_decision_memo, :tags_importance_v2, :tags_version,
                            :tags_external_audio,
-                           :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence)""",
+                           :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                           :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at)""",
                 info,
             )
             count += 1
@@ -598,6 +614,74 @@ class Indexer:
             params.append(importance_v2)
 
         return where, params
+
+    async def get_review_queue(self, limit: int = 1, offset: int = 0) -> list[dict]:
+        """Get sessions ordered by review priority (highest uncertainty first).
+
+        Priority score (0-1, higher = more urgent):
+        - Model uncertainty (0.35): RAG low similarity / LLM noisy quality
+        - Novelty (0.25): conversation_type is その他 or untagged
+        - Source trust (0.20): RAG is less trusted than LLM
+        - Unreviewed (0.20): not yet manually corrected
+        """
+        sql = """
+            SELECT *,
+                (
+                    -- Model uncertainty (0.35)
+                    CASE
+                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0) < 0.5 THEN 0.35
+                        WHEN tags_tag_source = 'rag' AND COALESCE(tags_rag_similarity, 0) < 0.7 THEN 0.25
+                        WHEN tags_quality = 'noisy' THEN 0.30
+                        WHEN tags_quality = 'partial' THEN 0.15
+                        ELSE 0.0
+                    END
+                    +
+                    -- Novelty (0.25)
+                    CASE
+                        WHEN tags_conversation_type = 'その他' THEN 0.25
+                        WHEN tags_version = 0 THEN 0.20
+                        ELSE 0.0
+                    END
+                    +
+                    -- Source trust (0.20)
+                    CASE
+                        WHEN tags_tag_source = 'rag' THEN 0.20
+                        WHEN tags_tag_source IS NULL THEN 0.15
+                        ELSE 0.0
+                    END
+                    +
+                    -- Unreviewed (0.20)
+                    CASE
+                        WHEN COALESCE(tags_manually_corrected, 0) = 0 THEN 0.20
+                        ELSE 0.0
+                    END
+                ) AS priority_score
+            FROM sessions
+            WHERE tags_version >= 2
+              AND COALESCE(tags_manually_corrected, 0) = 0
+              AND segment_count > 0
+            ORDER BY priority_score DESC, start_at DESC
+            LIMIT ? OFFSET ?
+        """
+        cursor = await self._db.execute(sql, (limit, offset))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_review_stats(self) -> dict:
+        """Get review queue statistics."""
+        rows = await self._db.execute_fetchall(
+            """SELECT
+                   SUM(CASE WHEN tags_version >= 2 AND COALESCE(tags_manually_corrected, 0) = 0 AND segment_count > 0 THEN 1 ELSE 0 END) AS total_pending,
+                   SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 THEN 1 ELSE 0 END) AS total_reviewed,
+                   SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 AND tags_corrected_at >= date('now') THEN 1 ELSE 0 END) AS reviewed_today
+               FROM sessions"""
+        )
+        r = rows[0]
+        return {
+            "total_pending": r["total_pending"] or 0,
+            "total_reviewed": r["total_reviewed"] or 0,
+            "reviewed_today": r["reviewed_today"] or 0,
+        }
 
     async def periodic_sync(self, interval: int = 30):
         """Background task: sync every `interval` seconds."""

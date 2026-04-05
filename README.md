@@ -42,6 +42,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
+| タグレビューキュー | 優先度付きレビューモードで不確実なタグを効率的に承認・修正 (キーボードショートカット対応) |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
 ## 必要環境
@@ -228,6 +229,15 @@ open http://localhost:8092
 | POST | `/vibevoice/start` | VibeVoice-ASR バッチ文字起こし開始 (Phase 1: 文字起こし → Phase 2: 声紋タグ付け) |
 | GET | `/vibevoice/status` | 実行状態・進捗を取得 |
 | POST | `/vibevoice/cancel` | 実行中のバッチをキャンセル |
+
+### タグレビューキュー (Viewer API, port 8092)
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/api/review/queue?limit=1&offset=0` | 優先度順にレビュー対象セッションを返却 (transcript 付き) |
+| GET | `/api/review/stats` | キュー統計 (残数、済数、今日の処理数) |
+| POST | `/api/review/accept` | セッションを承認 (`{"date","time"}`) → `manually_corrected` を書き込み |
+| POST | `/api/review/skip` | スキップ (永続化なし、メモリのみ。リロードで再表示) |
 
 ## 環境変数
 
@@ -664,6 +674,7 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 - バッチ処理パネル (話者分離・話者タグ付け・セッションタグ付け)
 - トレーニングデータエクスポート (6 フォーマット、フィルタ、ストリーミングダウンロード)
 - 設定管理 (プロンプト、用語辞書、LLM 提案、プリセット、Hotwords、Voice、Taxonomy)
+- タグレビューキュー (優先度付き、Accept/Edit/Skip、キーボードショートカット A/E/S)
 - 30秒ごとにインクリメンタルスキャン (最新日付以降のみ)
 
 ## トレーニングデータエクスポート
