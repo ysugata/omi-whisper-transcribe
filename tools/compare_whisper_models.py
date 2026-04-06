@@ -186,8 +186,12 @@ def get_audio_path(session_id):
 # Audio loading
 # ---------------------------------------------------------------------------
 
-def load_audio_as_float32(audio_path, target_sr=16000):
-    """Convert audio to float32 numpy array at target sample rate."""
+def load_audio_as_float32(audio_path, target_sr=16000, normalize_dbfs=-16.0):
+    """Convert audio to float32 numpy array at target sample rate.
+
+    Applies loudness normalization to match the Bridge's preprocessing
+    pipeline (AudioPreprocessor with NORMALIZE_TARGET_DBFS=-16.0).
+    """
     import numpy as np
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -203,6 +207,15 @@ def load_audio_as_float32(audio_path, target_sr=16000):
         with wave.open(tmp.name, "rb") as wf:
             frames = wf.readframes(wf.getnframes())
         samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Apply loudness normalization (same as Bridge's AudioPreprocessor)
+        rms = np.sqrt(np.mean(samples**2))
+        if rms > 1e-10 and normalize_dbfs is not None:
+            current_dbfs = 20 * np.log10(rms + 1e-10)
+            gain_db = normalize_dbfs - current_dbfs
+            gain_linear = 10 ** (gain_db / 20)
+            samples = np.clip(samples * gain_linear, -1.0, 1.0).astype(np.float32)
+
         return samples
     finally:
         os.unlink(tmp.name)
@@ -245,10 +258,19 @@ def transcribe_with_model(model, audio_np, hotwords="", beam_size=5):
         no_speech_threshold=0.6,
     )
     if hotwords:
+        # NOTE: distil-whisper models (e.g. kotoba-whisper) may not support hotwords.
+        # If transcription returns 0 segments with hotwords, retry without them.
         transcribe_kwargs["hotwords"] = hotwords
 
     t0 = time.time()
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
+    segments = list(segments)  # consume generator
+
+    # Fallback: if hotwords caused 0 results, retry without them
+    if not segments and hotwords:
+        del transcribe_kwargs["hotwords"]
+        segments, info = model.transcribe(audio_np, **transcribe_kwargs)
+        segments = list(segments)
 
     results = []
     for seg in segments:

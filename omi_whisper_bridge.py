@@ -1025,6 +1025,11 @@ def transcribe_audio(
         transcribe_kwargs["hallucination_silence_threshold"] = HALLUCINATION_SILENCE_THRESHOLD
     if hotwords:
         transcribe_kwargs["hotwords"] = hotwords
+        # faster-whisper 1.2.x bug: repetition_penalty + large hotwords causes
+        # "maximum decoding length must be > 0" crash. Disable rep penalty when
+        # hotwords are active.
+        if REPETITION_PENALTY != 1.0:
+            transcribe_kwargs["repetition_penalty"] = 1.0
 
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
