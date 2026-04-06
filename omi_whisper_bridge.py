@@ -55,6 +55,10 @@ PATIENCE = float(os.environ.get("PATIENCE", "2"))                         # ビ�
 LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セグメント平均対数確率の閾値
 NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
+CONDITION_ON_PREVIOUS_TEXT = os.environ.get("CONDITION_ON_PREVIOUS_TEXT", "true").lower() in ("true", "1", "yes")  # 前文脈を使った認識精度向上
+REPETITION_PENALTY = float(os.environ.get("REPETITION_PENALTY", "1.1"))  # 繰り返しペナルティ (1.0=無効)
+_halluc_thresh = os.environ.get("HALLUCINATION_SILENCE_THRESHOLD", "1.0")
+HALLUCINATION_SILENCE_THRESHOLD = float(_halluc_thresh) if _halluc_thresh else None  # 無音区間ハルシネーション検出閾値 (秒、空文字=無効)
 
 # --- Whisper 内部 VAD パラメータ ---
 # Silero VAD (VAD_SEG_ENABLED) で前分割済みの場合はデフォルトを緩和し、
@@ -138,7 +142,7 @@ SEGMENT_MAX_DURATION = float(os.environ.get("SEGMENT_MAX_DURATION", "15.0"))  # 
 # --- VAD セグメンテーション設定 ---
 VAD_SEG_ENABLED = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
 VAD_CHECK_INTERVAL = float(os.environ.get("VAD_CHECK_INTERVAL", "1.0"))       # VAD チェック間隔 (秒)
-VAD_SILENCE_TRIGGER = float(os.environ.get("VAD_SILENCE_TRIGGER", "0.8"))     # 発話後この無音で文字起こし実行
+VAD_SILENCE_TRIGGER = float(os.environ.get("VAD_SILENCE_TRIGGER", "1.2"))     # 発話後この無音で文字起こし実行 (longer = more context for Whisper)
 VAD_MAX_BUFFER = float(os.environ.get("VAD_MAX_BUFFER", "30.0"))              # バッファ上限 (秒)
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))                 # Silero VAD 閾値
 VAD_MIN_SILENCE_MS = int(os.environ.get("VAD_MIN_SILENCE_MS", "500"))         # 発話間の最小無音 (ms)
@@ -1009,13 +1013,16 @@ def transcribe_audio(
             threshold=WHISPER_VAD_THRESHOLD,
         ),
         word_timestamps=False,
-        condition_on_previous_text=False,
+        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
         no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
         patience=PATIENCE,
         compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
         log_prob_threshold=LOG_PROB_THRESHOLD,
         no_speech_threshold=NO_SPEECH_THRESHOLD,
+        repetition_penalty=REPETITION_PENALTY,
     )
+    if HALLUCINATION_SILENCE_THRESHOLD is not None:
+        transcribe_kwargs["hallucination_silence_threshold"] = HALLUCINATION_SILENCE_THRESHOLD
     if hotwords:
         transcribe_kwargs["hotwords"] = hotwords
 

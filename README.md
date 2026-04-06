@@ -283,6 +283,9 @@ open http://localhost:8092
 | `LOG_PROB_THRESHOLD` | `-0.5` | 対数確率の閾値 |
 | `NO_SPEECH_THRESHOLD` | `0.6` | 非発話判定の閾値 |
 | `COMPRESSION_RATIO_THRESHOLD` | `2.4` | 圧縮率の閾値 |
+| `CONDITION_ON_PREVIOUS_TEXT` | `true` | 前セグメントの文脈を使って認識精度を向上 |
+| `REPETITION_PENALTY` | `1.1` | 繰り返しペナルティ (1.0=無効) |
+| `HALLUCINATION_SILENCE_THRESHOLD` | `1.0` | 無音区間ハルシネーション検出閾値 (秒、空=無効) |
 | `WHISPER_VAD_MIN_SPEECH_MS` | `250`/`500` | Whisper 内部 VAD 最小発話長 (ms)。VAD_SEG 有効時は 250、無効時は 500 |
 | `WHISPER_VAD_MIN_SILENCE_MS` | `500` | Whisper 内部 VAD 最小無音長 (ms) |
 | `WHISPER_VAD_SPEECH_PAD_MS` | `200` | Whisper 内部 VAD 発話パディング (ms) |
@@ -294,7 +297,7 @@ open http://localhost:8092
 |------|-----------|------|
 | `VAD_SEG_ENABLED` | `true` | VAD ベースセグメンテーションの有効化 |
 | `VAD_CHECK_INTERVAL` | `1.0` | VAD チェック間隔 (秒) |
-| `VAD_SILENCE_TRIGGER` | `0.8` | 文字起こしトリガーとなる無音時間 (秒) |
+| `VAD_SILENCE_TRIGGER` | `1.2` | 文字起こしトリガーとなる無音時間 (秒) |
 | `VAD_MAX_BUFFER` | `30.0` | 強制文字起こしまでの最大バッファ (秒) |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD の信頼度閾値 |
 | `VAD_MIN_SILENCE_MS` | `500` | 発話間の最小無音時間 (ms) |
