@@ -67,7 +67,7 @@ HALLUCINATION_SILENCE_THRESHOLD = float(_halluc_thresh) if _halluc_thresh else N
 # NOTE: VAD_SEG_ENABLED は後方 (line ~136) で定義されるため、ここでは env を直接参照
 _vad_seg_on = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
 _default_whisper_vad_min_speech = "250" if _vad_seg_on else "500"
-WHISPER_VAD_MIN_SPEECH_MS = int(os.environ.get("WHISPER_VAD_MIN_SPEECH_MS", _default_whisper_vad_min_speech))
+WHISPER_VAD_MIN_SPEECH_MS = int(os.environ.get("WHISPER_VAD_MIN_SPEECH_MS") or _default_whisper_vad_min_speech)
 WHISPER_VAD_MIN_SILENCE_MS = int(os.environ.get("WHISPER_VAD_MIN_SILENCE_MS", "500"))
 WHISPER_VAD_SPEECH_PAD_MS = int(os.environ.get("WHISPER_VAD_SPEECH_PAD_MS", "200"))
 WHISPER_VAD_THRESHOLD = float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.5"))
