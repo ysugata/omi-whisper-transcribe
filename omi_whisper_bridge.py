@@ -57,6 +57,7 @@ NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無�
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
 CONDITION_ON_PREVIOUS_TEXT = os.environ.get("CONDITION_ON_PREVIOUS_TEXT", "true").lower() in ("true", "1", "yes")  # 前文脈を使った認識精度向上
 REPETITION_PENALTY = float(os.environ.get("REPETITION_PENALTY", "1.1"))  # 繰り返しペナルティ (1.0=無効)
+PROMPT_CARRY_ENABLED = os.environ.get("PROMPT_CARRY_ENABLED", "true").lower() in ("true", "1", "yes")  # チャンク間コンテキスト引き継ぎ
 _halluc_thresh = os.environ.get("HALLUCINATION_SILENCE_THRESHOLD", "1.0")
 HALLUCINATION_SILENCE_THRESHOLD = float(_halluc_thresh) if _halluc_thresh else None  # 無音区間ハルシネーション検出閾値 (秒、空文字=無効)
 
@@ -978,6 +979,7 @@ def transcribe_audio(
     model,
     session_offset: float = 0.0,
     hotwords: str = "",
+    prompt_carry: str = "",
 ) -> list[dict]:
     """PCM 16-bit LE の音声バイト列を受け取り、
     Omi の custom_stt が期待する segments リストを返す。
@@ -987,6 +989,7 @@ def transcribe_audio(
         model: ロード済みの WhisperModel インスタンス
         session_offset: タイムスタンプオフセット (秒)
         hotwords: カンマ区切りの hotwords 文字列 (デコーダバイアス用)
+        prompt_carry: 前チャンクの出力テキスト (チャンク間コンテキスト引き継ぎ用)
     """
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -1025,6 +1028,10 @@ def transcribe_audio(
         transcribe_kwargs["hallucination_silence_threshold"] = HALLUCINATION_SILENCE_THRESHOLD
     if hotwords:
         transcribe_kwargs["hotwords"] = hotwords
+    if prompt_carry:
+        # 前チャンクの出力をinitial_promptとして渡し、チャンク間の文脈を維持。
+        # Whisperのpromptトークン上限(224)に合わせて末尾200文字に制限。
+        transcribe_kwargs["initial_prompt"] = prompt_carry[-200:]
 
     segments, info = model.transcribe(audio_np, **transcribe_kwargs)
 
@@ -2439,6 +2446,10 @@ async def handle_connection(websocket):
         if session_hotwords:
             log.info(f"Hotwords: {hotword_loader.get_count()} terms active")
 
+    # Prompt carry-over: 前チャンクの出力を次チャンクの initial_prompt に渡す
+    # セッション内で文脈を維持し、用語の一貫性・漢字変換精度を向上させる
+    prompt_carry_text = ""  # PROMPT_CARRY_ENABLED=false の場合は常に空のまま
+
     # Realtime voice filter: load embedding model if enabled + user speakers exist
     voice_filter_inference = None
     if VOICE_FILTER_ENABLED and speaker_filter and speaker_filter.enabled:
@@ -2470,7 +2481,7 @@ async def handle_connection(websocket):
 
     async def _transcribe_chunk(chunk: bytes):
         """チャンクを文字起こしして結果を送信する共通処理。"""
-        nonlocal total_audio_seconds, recorder_audio_seconds, recorder
+        nonlocal total_audio_seconds, recorder_audio_seconds, recorder, prompt_carry_text
 
         chunk_duration = len(chunk) / (SAMPLE_RATE * 2)
 
@@ -2491,14 +2502,24 @@ async def handle_connection(websocket):
         t0 = time.time()
 
         loop = asyncio.get_running_loop()
+        _carry = prompt_carry_text  # capture for lambda
         raw_segments = await loop.run_in_executor(
             executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_hotwords),
+            lambda: transcribe_audio(chunk, model, 0.0, session_hotwords, _carry),
         )
 
         elapsed = time.time() - t0
         total_audio_seconds += chunk_duration
         recorder_audio_seconds += chunk_duration
+
+        # Prompt carry-over: 今回の出力を次チャンク用に保持
+        # logprob が低いチャンクはエラー伝播を防ぐためリセット
+        if PROMPT_CARRY_ENABLED and raw_segments:
+            avg_lp = sum(s.get("avg_logprob", -0.5) for s in raw_segments) / len(raw_segments)
+            if avg_lp >= -0.5:
+                prompt_carry_text = " ".join(s["text"] for s in raw_segments[-3:])
+            else:
+                prompt_carry_text = ""  # low confidence → reset to avoid error propagation
 
         # Realtime voice filter: remove non-user segments
         if raw_segments and voice_filter_inference:
@@ -2664,7 +2685,7 @@ async def handle_connection(websocket):
 
                 log.info("Processing remaining buffer...")
                 try:
-                    raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords)
+                    raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords, prompt_carry_text)
                     # Realtime voice filter on remaining buffer
                     if raw_segments and voice_filter_inference:
                         audio_np = np.frombuffer(remaining, dtype=np.int16).astype(np.float32) / 32768.0

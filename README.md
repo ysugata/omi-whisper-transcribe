@@ -286,6 +286,7 @@ open http://localhost:8092
 | `CONDITION_ON_PREVIOUS_TEXT` | `true` | 前セグメントの文脈を使って認識精度を向上 |
 | `REPETITION_PENALTY` | `1.1` | 繰り返しペナルティ (1.0=無効) |
 | `HALLUCINATION_SILENCE_THRESHOLD` | `1.0` | 無音区間ハルシネーション検出閾値 (秒、空=無効) |
+| `PROMPT_CARRY_ENABLED` | `true` | チャンク間コンテキスト引き継ぎ (前チャンク出力を次の initial_prompt に) |
 | `WHISPER_VAD_MIN_SPEECH_MS` | `250`/`500` | Whisper 内部 VAD 最小発話長 (ms)。VAD_SEG 有効時は 250、無効時は 500 |
 | `WHISPER_VAD_MIN_SILENCE_MS` | `500` | Whisper 内部 VAD 最小無音長 (ms) |
 | `WHISPER_VAD_SPEECH_PAD_MS` | `200` | Whisper 内部 VAD 発話パディング (ms) |
