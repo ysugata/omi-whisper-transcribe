@@ -57,7 +57,7 @@ NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無�
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
 CONDITION_ON_PREVIOUS_TEXT = os.environ.get("CONDITION_ON_PREVIOUS_TEXT", "true").lower() in ("true", "1", "yes")  # 前文脈を使った認識精度向上
 REPETITION_PENALTY = float(os.environ.get("REPETITION_PENALTY", "1.1"))  # 繰り返しペナルティ (1.0=無効)
-PROMPT_CARRY_ENABLED = os.environ.get("PROMPT_CARRY_ENABLED", "true").lower() in ("true", "1", "yes")  # チャンク間コンテキスト引き継ぎ
+PROMPT_CARRY_ENABLED = os.environ.get("PROMPT_CARRY_ENABLED", "false").lower() in ("true", "1", "yes")  # チャンク間コンテキスト引き継ぎ
 _halluc_thresh = os.environ.get("HALLUCINATION_SILENCE_THRESHOLD", "1.0")
 HALLUCINATION_SILENCE_THRESHOLD = float(_halluc_thresh) if _halluc_thresh else None  # 無音区間ハルシネーション検出閾値 (秒、空文字=無効)
 
