@@ -56,6 +56,18 @@ LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セ�
 NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
 
+# --- Whisper 内部 VAD パラメータ ---
+# Silero VAD (VAD_SEG_ENABLED) で前分割済みの場合はデフォルトを緩和し、
+# 短い発話 (相槌、応答等) が Whisper 側で再フィルタされるのを防ぐ。
+# 未前分割時はノイズバースト除去のため 500ms をデフォルトにする。
+# NOTE: VAD_SEG_ENABLED は後方 (line ~136) で定義されるため、ここでは env を直接参照
+_vad_seg_on = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
+_default_whisper_vad_min_speech = "250" if _vad_seg_on else "500"
+WHISPER_VAD_MIN_SPEECH_MS = int(os.environ.get("WHISPER_VAD_MIN_SPEECH_MS", _default_whisper_vad_min_speech))
+WHISPER_VAD_MIN_SILENCE_MS = int(os.environ.get("WHISPER_VAD_MIN_SILENCE_MS", "500"))
+WHISPER_VAD_SPEECH_PAD_MS = int(os.environ.get("WHISPER_VAD_SPEECH_PAD_MS", "200"))
+WHISPER_VAD_THRESHOLD = float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.5"))
+
 # --- Layer 3: LLM 後処理設定 ---
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -770,6 +782,31 @@ _GRAMMATICAL_ENDINGS = re.compile(
 _GIBBERISH_LOGPROB_THRESHOLD = -0.7
 
 
+def _has_repetitive_kana(text: str) -> bool:
+    """仮名の過度な繰り返しを検出する。
+
+    ノイズ由来の「オォォォオォゥオォオゥ」「ンンンンンンン」等を検出。
+    ユニーク仮名文字数に対する全仮名文字数の比率で判定する。
+    """
+    body = re.sub(r'[\s,，、。.!?？！・…―「」\-\'\"]+', '', text)
+    kana_chars = re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', body)
+    if len(kana_chars) < 6:
+        return False
+    unique_count = len(set(kana_chars))
+    unique_ratio = unique_count / len(kana_chars)
+    # ユニーク率 30% 未満 = 極端に少ない種類の仮名が繰り返されている
+    # 例: "オォォォオォゥオォオゥ" → 3種/11文字 = 0.27 → True
+    # 例: "ンンンンンンン" → 1種/7文字 = 0.14 → True
+    # 例: "テレビテレビテレビ" → 3種/9文字 = 0.33 → False (正常な繰り返し)
+    if unique_ratio < 0.30:
+        return True
+    # 同一仮名が 60% 以上を占める場合もノイズ
+    from collections import Counter
+    counts = Counter(kana_chars)
+    most_common_ratio = counts.most_common(1)[0][1] / len(kana_chars)
+    return most_common_ratio >= 0.6
+
+
 def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
     """テキストが意味不明なカタカナ/ひらがな羅列 (ギブリッシュ) かどうかを判定する。
 
@@ -782,6 +819,10 @@ def _is_gibberish_kana(text: str, avg_logprob: float) -> bool:
     - 15文字以下 (口語は仮名のみ8〜14文字が普通)
     - 文法的な助詞パターンを含む (文法的に正しい文)
     """
+    # 繰り返し仮名は logprob に関係なく検出 (信頼度チェック前)
+    if _has_repetitive_kana(text):
+        return True
+
     # High confidence → skip
     if avg_logprob >= -0.3:
         return False
@@ -962,10 +1003,10 @@ def transcribe_audio(
         language=LANGUAGE,
         vad_filter=VAD_FILTER,
         vad_parameters=dict(
-            min_speech_duration_ms=500,   # 500ms (was 250ms) — reject short noise bursts
-            min_silence_duration_ms=500,
-            speech_pad_ms=200,
-            threshold=0.5,                # 0.5 (was 0.4) — stricter speech detection
+            min_speech_duration_ms=WHISPER_VAD_MIN_SPEECH_MS,
+            min_silence_duration_ms=WHISPER_VAD_MIN_SILENCE_MS,
+            speech_pad_ms=WHISPER_VAD_SPEECH_PAD_MS,
+            threshold=WHISPER_VAD_THRESHOLD,
         ),
         word_timestamps=False,
         condition_on_previous_text=False,

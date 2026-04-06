@@ -283,6 +283,10 @@ open http://localhost:8092
 | `LOG_PROB_THRESHOLD` | `-0.5` | 対数確率の閾値 |
 | `NO_SPEECH_THRESHOLD` | `0.6` | 非発話判定の閾値 |
 | `COMPRESSION_RATIO_THRESHOLD` | `2.4` | 圧縮率の閾値 |
+| `WHISPER_VAD_MIN_SPEECH_MS` | `250`/`500` | Whisper 内部 VAD 最小発話長 (ms)。VAD_SEG 有効時は 250、無効時は 500 |
+| `WHISPER_VAD_MIN_SILENCE_MS` | `500` | Whisper 内部 VAD 最小無音長 (ms) |
+| `WHISPER_VAD_SPEECH_PAD_MS` | `200` | Whisper 内部 VAD 発話パディング (ms) |
+| `WHISPER_VAD_THRESHOLD` | `0.5` | Whisper 内部 VAD 閾値 |
 
 ### VAD セグメンテーション
 
