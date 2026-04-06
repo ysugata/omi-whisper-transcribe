@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_SETTINGS = {
     "enabled": True,
     "max_total": 500,
+    "max_tokens": 200,  # Whisper max_length=448; leave room for decoding
     "min_length": 3,  # Filter out short entries that cause noise contamination
     "categories": {
         "place": {"enabled": True, "max": 200},
@@ -26,6 +27,15 @@ _DEFAULT_SETTINGS = {
         "product": {"enabled": True, "max": 50},
     },
 }
+
+# Whisper decoder max_length is 448 tokens. Hotwords are tokenized and
+# prepended as prompt tokens, consuming part of this budget.  If the total
+# prompt length exceeds 448, faster-whisper raises:
+#   ValueError: The maximum decoding length must be > 0
+# We cap hotword tokens to max_tokens (default 200) so that >=248 tokens
+# remain for actual decoding output.  This value was determined empirically:
+# at ~225 tokens the crash occurs intermittently; 200 gives safe headroom.
+_MAX_HOTWORD_TOKENS_DEFAULT = 200
 
 
 class HotwordLoader:
@@ -156,14 +166,53 @@ class HotwordLoader:
         if self._dirty:
             self._rebuild_cache()
 
+    @staticmethod
+    def _estimate_tokens(word: str) -> int:
+        """Estimate Whisper token count for a hotword.
+
+        Empirically, Japanese hotwords tokenize at roughly 1 token per
+        character.  The ", " separator between words adds ~1 token.
+        We use len(word) + 1 (for separator) as a conservative estimate.
+        """
+        return len(word) + 1  # +1 for ", " separator
+
     def _rebuild_cache(self) -> None:
-        """設定に基づいてキャッシュされた hotword リストを再構築する。"""
-        words: list[str] = []
+        """設定に基づいてキャッシュされた hotword リストを再構築する。
+
+        カスタム語を最優先でトークン予算に含め、残り予算でカテゴリ語を追加。
+        Whisper の max_length=448 を超えないようトークン数で制限する。
+        """
         max_total = self._settings.get("max_total", 500)
+        max_tokens = self._settings.get("max_tokens", _MAX_HOTWORD_TOKENS_DEFAULT)
         min_length = self._settings.get("min_length", 3)
         cat_settings = self._settings.get("categories", {})
 
-        # カテゴリ別に追加 (min_length 未満のエントリはスキップ)
+        seen: set[str] = set()
+        result: list[str] = []
+        token_count = 0
+
+        def _try_add(word: str) -> bool:
+            """Add word if it fits within token budget. Returns True if added."""
+            nonlocal token_count
+            if word in seen:
+                return False
+            est = self._estimate_tokens(word)
+            if token_count + est > max_tokens:
+                return False
+            if len(result) >= max_total:
+                return False
+            seen.add(word)
+            result.append(word)
+            token_count += est
+            return True
+
+        # Phase 1: カスタム語を最優先 (min_length 対象外)
+        for w in self._custom_words:
+            w = w.strip()
+            if w:
+                _try_add(w)
+
+        # Phase 2: カテゴリ語を追加 (残りのトークン予算で)
         categories = self._hotwords_data.get("categories", {})
         filtered_count = 0
         for cat_name, cat_words in categories.items():
@@ -175,31 +224,22 @@ class HotwordLoader:
             for w in cat_words:
                 if added >= cat_max:
                     break
+                if token_count >= max_tokens:
+                    break
                 if len(w) < min_length:
                     filtered_count += 1
                     continue
-                words.append(w)
-                added += 1
+                if _try_add(w):
+                    added += 1
 
         if filtered_count:
             log.info(f"Hotwords: filtered {filtered_count} entries shorter than {min_length} chars")
 
-        # カスタム words を追加 (カスタムは min_length 対象外、常に含める)
-        words.extend(self._custom_words)
+        log.info(f"Hotwords: {len(result)} words, ~{token_count} tokens "
+                 f"(budget {max_tokens}, custom {len(self._custom_words)})")
 
-        # 重複排除 (順序維持)
-        seen: set[str] = set()
-        unique: list[str] = []
-        for w in words:
-            if w not in seen:
-                seen.add(w)
-                unique.append(w)
-
-        # max_total でカット
-        unique = unique[:max_total]
-
-        self._cached_list = unique
-        self._cached_string = ", ".join(unique)
+        self._cached_list = result
+        self._cached_string = ", ".join(result)
         self._dirty = False
 
     def get_hotwords_string(self) -> str:

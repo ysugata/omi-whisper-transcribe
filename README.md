@@ -526,7 +526,8 @@ Whisper 出力後に `is_user` フラグの付いた登録声紋とコサイン�
 
 - `tools/build_hotwords.py` で `config/hotwords.json` を生成
 - カテゴリ別 ON/OFF (地名、企業名、駅名、姓、名、製品名)
-- カスタム語の追加も可能
+- カスタム語の追加も可能 (カテゴリ語より優先的にトークン予算に含まれる)
+- トークン予算制限 (`max_tokens=200`): Whisper の内部上限 (448 トークン) を超えないよう自動制御
 - `HOTWORDS_ENABLED=false` で無効化
 
 ## LLM 後処理 (3段階パイプライン)
