@@ -112,6 +112,9 @@ AUDIO_SCENE_DEVICE = os.environ.get("AUDIO_SCENE_DEVICE", "cpu")
 AUDIO_SCENE_THRESHOLD = float(os.environ.get("AUDIO_SCENE_THRESHOLD", "0.3"))
 AUDIO_SCENE_MEDIA_THRESHOLD = float(os.environ.get("AUDIO_SCENE_MEDIA_THRESHOLD", "0.6"))
 
+# --- ASR エンジン選択 ---
+ENGINE = os.environ.get("ENGINE", "whisper").lower()  # "whisper" | "qwen3asr"
+
 # --- VibeVoice-ASR 設定 ---
 VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "false").lower() in ("true", "1", "yes")
 
@@ -514,8 +517,9 @@ def _save_llm_suggestions(originals: list[str], corrected_segments: list[dict]) 
 from model_manager import ModelManager
 
 model_manager = ModelManager(
-    model_name=WHISPER_MODEL,
+    model_name=WHISPER_MODEL if ENGINE == "whisper" else "Qwen/Qwen3-ASR-1.7B",
     compute_type=COMPUTE_TYPE,
+    engine=ENGINE,
 )
 
 # ============================================================
@@ -674,7 +678,8 @@ class SessionRecorder:
             "duration_seconds": round(duration_sec, 1),
             "audio_file": audio_file,
             "audio_size_mb": round(file_size_mb, 2),
-            "model": WHISPER_MODEL,
+            "engine": ENGINE,
+            "model": WHISPER_MODEL if ENGINE == "whisper" else "Qwen/Qwen3-ASR-1.7B",
             "language": LANGUAGE,
             "num_speakers": num_speakers,
         }
@@ -2503,23 +2508,34 @@ async def handle_connection(websocket):
         # 音声を録音ファイルに書き込み
         recorder.write_audio(chunk)
 
-        log.info(f"Transcribing {chunk_duration:.1f}s of audio...")
+        log.info(f"Transcribing {chunk_duration:.1f}s of audio ({ENGINE})...")
         t0 = time.time()
 
         loop = asyncio.get_running_loop()
         _carry = prompt_carry_text  # capture for lambda
-        raw_segments = await loop.run_in_executor(
-            executor,
-            lambda: transcribe_audio(chunk, model, 0.0, session_hotwords, _carry),
-        )
+        if ENGINE == "qwen3asr":
+            raw_segments = await loop.run_in_executor(
+                executor,
+                lambda: model.transcribe_audio(
+                    chunk, SAMPLE_RATE, 0.0, session_hotwords,
+                    LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
+                    audio_preprocessor,
+                ),
+            )
+        else:
+            raw_segments = await loop.run_in_executor(
+                executor,
+                lambda: transcribe_audio(chunk, model, 0.0, session_hotwords, _carry),
+            )
 
         elapsed = time.time() - t0
         total_audio_seconds += chunk_duration
         recorder_audio_seconds += chunk_duration
 
-        # Prompt carry-over: 今回の出力を次チャンク用に保持
+        # Prompt carry-over: 今回の出力を次チャンク用に保持 (Whisper only)
+        # Qwen3-ASR の context パラメータはホットワード用で、文脈引き継ぎには使えない
         # logprob が低いチャンクはエラー伝播を防ぐためリセット
-        if PROMPT_CARRY_ENABLED and raw_segments:
+        if PROMPT_CARRY_ENABLED and ENGINE == "whisper" and raw_segments:
             avg_lp = sum(s.get("avg_logprob", -0.5) for s in raw_segments) / len(raw_segments)
             if avg_lp >= -0.5:
                 prompt_carry_text = " ".join(s["text"] for s in raw_segments[-3:])
@@ -2688,9 +2704,16 @@ async def handle_connection(websocket):
                 rec_offset = recorder_audio_seconds
                 recorder.write_audio(remaining)
 
-                log.info("Processing remaining buffer...")
+                log.info(f"Processing remaining buffer ({ENGINE})...")
                 try:
-                    raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords, prompt_carry_text)
+                    if ENGINE == "qwen3asr":
+                        raw_segments = model.transcribe_audio(
+                            remaining, SAMPLE_RATE, 0.0, session_hotwords,
+                            LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
+                            audio_preprocessor,
+                        )
+                    else:
+                        raw_segments = transcribe_audio(remaining, model, 0.0, session_hotwords, prompt_carry_text)
                     # Realtime voice filter on remaining buffer
                     if raw_segments and voice_filter_inference:
                         audio_np = np.frombuffer(remaining, dtype=np.int16).astype(np.float32) / 32768.0
@@ -2744,7 +2767,11 @@ async def handle_connection(websocket):
 async def main():
     global batch_corrector
     log.info(f"Starting Omi-Whisper bridge on ws://{HOST}:{PORT}")
-    log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
+    log.info(f"Engine: {ENGINE}")
+    if ENGINE == "qwen3asr":
+        log.info(f"Model: Qwen/Qwen3-ASR-1.7B, Language: {LANGUAGE}")
+    else:
+        log.info(f"Model: {WHISPER_MODEL}, Compute: {COMPUTE_TYPE}, Language: {LANGUAGE}")
     log.info(f"Buffer: {BUFFER_SECONDS}s, VAD: {VAD_FILTER}, Beam: {BEAM_SIZE}")
     log.info(f"Quality: no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, patience={PATIENCE}, "
              f"log_prob_thresh={LOG_PROB_THRESHOLD}, "

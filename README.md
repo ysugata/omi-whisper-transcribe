@@ -1,14 +1,18 @@
 # omi-whisper-transcribe
 
-Omi デバイスの音声を WebSocket 経由で受信し、ローカルの [faster-whisper](https://github.com/SYSTRAN/faster-whisper) で文字起こしするサービス。
+Omi デバイスの音声を WebSocket 経由で受信し、ローカルの ASR エンジンで文字起こしするサービス。
 Omi の `custom_stt` モードを使い、クラウド STT を完全にバイパスします。
+
+対応エンジン:
+- **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** (large-v3, デフォルト) — 高精度・Hotwords デコーダバイアス対応
+- **[Qwen3-ASR 1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)** — 軽量 (~3.4 GB VRAM)・52言語対応・context boost 対応
 
 ## アーキテクチャ
 
 ```
-Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whisper (GPU)
-                                         ↑
-                              管理 API (:8091)
+Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine (GPU)
+                                         ↑                   ├─ faster-whisper (ENGINE=whisper)
+                              管理 API (:8091)                └─ Qwen3-ASR 1.7B (ENGINE=qwen3asr)
                                          ↑
                               Viewer  (:8092)
 ```
@@ -20,7 +24,9 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 
 | 機能 | 説明 |
 |------|------|
-| リアルタイム文字起こし | WebSocket で受信した音声を faster-whisper で逐次処理 |
+| リアルタイム文字起こし | WebSocket で受信した音声を ASR エンジン (Whisper / Qwen3-ASR) で逐次処理 |
+| ASR エンジン切り替え | `ENGINE` 環境変数で Whisper ↔ Qwen3-ASR を切り替え |
+| エンジン比較ツール | 同じ録音を両エンジンで処理し、CER・RTF を比較 (`tools/compare_engines.py`) |
 | VAD ベースセグメンテーション | Silero VAD で発話区間を検出し、自然な区切りで文字起こし |
 | 無音検出 | RMS ベースで無音を判定し、GPU リソースを節約 |
 | 音声前処理 | ラウドネス正規化 + ノイズ除去 (スペクトルゲーティング) |
@@ -266,6 +272,16 @@ open http://localhost:8092
 重みはフィードバックループ (`config/review_weights.json`) により EMA で自動調整されます。Accept/Edit 操作のたびにシグナルバケット別の修正率が更新され、修正頻度の高い軸の重みが増加します。
 
 ## 環境変数
+
+### ASR エンジン選択
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `ENGINE` | `whisper` | ASR エンジン (`whisper` または `qwen3asr`) |
+
+`ENGINE=qwen3asr` を指定すると、Qwen3-ASR 1.7B (bfloat16, ~3.4 GB VRAM) がリアルタイム文字起こしに使用されます。
+Whisper 固有の環境変数 (BEAM_SIZE, VAD_FILTER 等) は Qwen3-ASR モード時には無視されます。
+Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用されます。
 
 ### Whisper モデル
 
@@ -862,6 +878,7 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 | `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
 | `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
 | `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, NF4) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
+| `tools/compare_engines.py` | Whisper vs Qwen3-ASR 精度比較 (`--sessions N`, `--ids ID...`, `--hotwords`) |
 | `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
 
 ## GPU 共有デプロイ
@@ -945,6 +962,7 @@ omi_whisper_transcribe/
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
 ├── audio_scene_classifier.py  # PANNs CNN14 6次元音響分析
 ├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit NF4, Prefetch)
+├── transcriber_qwen3asr.py   # Qwen3-ASR 1.7B リアルタイム文字起こし (bfloat16, ~3.4 GB VRAM)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
@@ -989,6 +1007,7 @@ omi_whisper_transcribe/
 | [JMnedict](https://www.edrdg.org/enamdict/enamdict_doc.html) | 固有名詞辞書 | CC-BY-SA 3.0 |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 音声区間検出 | MIT |
 | [noisereduce](https://github.com/timsainb/noisereduce) | ノイズ除去 | MIT |
+| [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | リアルタイム文字起こし (1.7B, bfloat16) | Apache 2.0 |
 | [microsoft/VibeVoice-ASR-HF](https://huggingface.co/microsoft/VibeVoice-ASR-HF) | バッチ文字起こし (9B) | MIT |
 | [Gemini API](https://ai.google.dev/) | LLM 後処理・セッションタグ・匿名化 | Google ToS |
 | [OpenAI Responses API](https://platform.openai.com/) | 匿名化・KC 抽出 (GPT-5 nano) | OpenAI ToS |

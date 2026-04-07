@@ -1,8 +1,12 @@
 """
-Model Manager: Whisper モデルのライフサイクル管理
+Model Manager: ASR モデルのライフサイクル管理
 
 GPU 共有の知識を持たないシンプルなモデル管理。
 外部オーケストレーター (gpu-shared) または単体デプロイで使う。
+
+対応エンジン:
+  - whisper: faster-whisper (デフォルト)
+  - qwen3asr: Qwen3-ASR 1.7B
 
 管理 REST API:
   POST /model/load    — モデルロード (冪等)
@@ -21,18 +25,23 @@ _LOAD_TIMEOUT = 600  # モデルロードのタイムアウト (秒)
 
 
 class ModelManager:
-    """Whisper モデルのロード/アンロードとセッション管理"""
+    """ASR モデルのロード/アンロードとセッション管理"""
 
-    def __init__(self, model_name: str, compute_type: str):
+    def __init__(self, model_name: str, compute_type: str, engine: str = "whisper"):
         self._model_name = model_name
         self._compute_type = compute_type
+        self._engine = engine
         self._model = None
         self._executor: ThreadPoolExecutor | None = None
         self._session_count = 0
         self._lock = asyncio.Lock()
         self._gpu_lock = asyncio.Lock()  # diarization 等の排他 GPU 処理用
 
-        log.info(f"ModelManager initialized: model={model_name}, compute={compute_type}")
+        log.info(f"ModelManager initialized: engine={engine}, model={model_name}, compute={compute_type}")
+
+    @property
+    def engine(self) -> str:
+        return self._engine
 
     @property
     def loaded(self) -> bool:
@@ -169,6 +178,7 @@ class ModelManager:
             "session_count": self._session_count,
             "model_name": self._model_name,
             "compute_type": self._compute_type,
+            "engine": self._engine,
         }
 
     # ------------------------------------------------------------------
@@ -176,37 +186,46 @@ class ModelManager:
     # ------------------------------------------------------------------
 
     async def _load_model(self):
-        """Whisper モデルを GPU にロード"""
-        log.info(f"Loading Whisper model: {self._model_name} ({self._compute_type})")
+        """ASR モデルを GPU にロード"""
+        log.info(f"Loading {self._engine} model: {self._model_name} ({self._compute_type})")
 
         loop = asyncio.get_running_loop()
         self._model = await asyncio.wait_for(
             loop.run_in_executor(None, self._load_model_sync),
             timeout=_LOAD_TIMEOUT,
         )
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=self._engine)
 
-        log.info("Whisper model loaded successfully")
+        log.info(f"{self._engine} model loaded successfully")
 
     def _load_model_sync(self):
-        from faster_whisper import WhisperModel
-
-        return WhisperModel(
-            self._model_name,
-            device="cuda",
-            compute_type=self._compute_type,
-        )
+        if self._engine == "qwen3asr":
+            from transcriber_qwen3asr import Qwen3ASRTranscriber
+            transcriber = Qwen3ASRTranscriber()
+            transcriber.load_model()
+            return transcriber
+        else:
+            from faster_whisper import WhisperModel
+            return WhisperModel(
+                self._model_name,
+                device="cuda",
+                compute_type=self._compute_type,
+            )
 
     def _unload_model(self):
-        """Whisper モデルをアンロードして VRAM を解放"""
-        log.info("Unloading Whisper model...")
+        """ASR モデルをアンロードして VRAM を解放"""
+        log.info(f"Unloading {self._engine} model...")
 
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
 
         if self._model is not None:
-            del self._model
+            # Qwen3-ASR transcriber has its own unload method
+            if self._engine == "qwen3asr" and hasattr(self._model, 'unload_model'):
+                self._model.unload_model()
+            else:
+                del self._model
             self._model = None
 
         gc.collect()
@@ -218,4 +237,4 @@ class ModelManager:
         except ImportError:
             log.debug("torch not available, skipping cuda cache clear")
 
-        log.info("Whisper model unloaded")
+        log.info(f"{self._engine} model unloaded")
