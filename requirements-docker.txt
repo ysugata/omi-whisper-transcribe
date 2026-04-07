@@ -8,7 +8,7 @@ whisperx
 pyannote.audio>=4.0.0
 noisereduce>=3.0.0
 panns-inference>=0.1.0
-transformers>=5.3.0
+transformers==4.57.6
 accelerate>=0.26.0
 bitsandbytes
 soundfile

@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # PyTorch with CUDA 12.4 (compatible with host driver 560.94 / CUDA 12.6)
-RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install all requirements (pyannote/whisperx will try to pull torch but pip
 # will see the constraint is already satisfied by 2.6.0+cu124)
@@ -18,12 +18,12 @@ COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
 
 # Restore torch to cu124 if any dependency overwrote it
-RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Qwen3-ASR: install with --no-deps to avoid pulling conflicting transformers/gradio/flask
-# Only qwen-omni-utils is needed as runtime dependency
+# Qwen3-ASR: install with --no-deps to skip heavy/unnecessary deps (gradio, flask, sox, soynlp)
+# then install only the runtime deps we actually need
 RUN pip3 install --no-cache-dir --no-deps qwen-asr>=0.0.6 \
-    && pip3 install --no-cache-dir qwen-omni-utils librosa
+    && pip3 install --no-cache-dir qwen-omni-utils librosa nagisa
 
 
 COPY omi_whisper_bridge.py .

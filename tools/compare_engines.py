@@ -259,6 +259,13 @@ def load_qwen3asr_model():
     return model
 
 
+_LANG_MAP = {
+    "ja": "Japanese", "en": "English", "zh": "Chinese",
+    "ko": "Korean", "de": "German", "fr": "French",
+    "es": "Spanish", "pt": "Portuguese", "ru": "Russian",
+}
+
+
 def transcribe_with_qwen3asr(model, wav_path, context="", language="ja"):
     """Transcribe a WAV file using Qwen3-ASR.
 
@@ -275,7 +282,8 @@ def transcribe_with_qwen3asr(model, wav_path, context="", language="ja"):
 
     transcribe_kwargs = {}
     if language:
-        transcribe_kwargs["language"] = language
+        lang_name = _LANG_MAP.get(language.lower(), language)
+        transcribe_kwargs["language"] = lang_name
     if context:
         transcribe_kwargs["context"] = [context]
 
