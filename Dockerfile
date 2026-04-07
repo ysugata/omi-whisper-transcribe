@@ -9,11 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# PyTorch with CUDA 12.4 (pin version to prevent pyannote 4.x from pulling cu130+)
-RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-
+# Install requirements first (pyannote 4.x will pull torch cu130+)
 COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
+
+# Force PyTorch CUDA 12.4 AFTER requirements (override pyannote's cu130 torch)
+RUN pip3 install --no-cache-dir --force-reinstall torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 
 COPY omi_whisper_bridge.py .
