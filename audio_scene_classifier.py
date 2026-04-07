@@ -135,6 +135,11 @@ class AudioSceneClassifier:
         if self._model is not None:
             return self._model
         try:
+            # Ensure panns_data directory exists before import (panns_inference
+            # downloads class_labels_indices.csv to ~/panns_data/ on import)
+            from pathlib import Path
+            panns_dir = Path.home() / "panns_data"
+            panns_dir.mkdir(parents=True, exist_ok=True)
             from panns_inference import AudioTagging
             self._model = AudioTagging(
                 checkpoint_path=None,  # auto-download CNN14

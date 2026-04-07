@@ -47,8 +47,6 @@ COPY test_whisper.py .
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント
 ENV HF_HOME=/models
-# PANNs CNN14 データを永続ボリューム内に保存 (panns_inference は ~/panns_data/ を参照)
-RUN mkdir -p /models/panns_data && ln -sf /models/panns_data /root/panns_data
 
 EXPOSE 8090
 EXPOSE 8091
