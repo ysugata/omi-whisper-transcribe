@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# PyTorch with CUDA (install before whisperx to prevent CPU-only torch)
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# PyTorch with CUDA 12.1 (pin version to prevent pyannote 4.x from pulling cu130+)
+RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu121
 
 COPY requirements-docker.txt .
 RUN pip3 install --no-cache-dir -r requirements-docker.txt
