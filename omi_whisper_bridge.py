@@ -1837,12 +1837,14 @@ async def _batch_combined_tag_task(force: bool = False):
                     log.info("Combined tag cancelled by user (audio scene phase)")
                     break
                 try:
-                    wav_path = os.path.join(sess_dir, "full_audio.wav")
-                    if not os.path.exists(wav_path):
-                        log.warning("No full_audio.wav in %s, skipping scene classification", sess_dir)
+                    audio_path = os.path.join(sess_dir, "audio.ogg")
+                    if not os.path.exists(audio_path):
+                        audio_path = os.path.join(sess_dir, "audio.wav")
+                    if not os.path.exists(audio_path):
+                        log.warning("No audio file in %s, skipping scene classification", sess_dir)
                         st["audio_scene_failed"] += 1
                         continue
-                    result = audio_scene_classifier.classify(wav_path)
+                    result = audio_scene_classifier.classify(audio_path)
                     if result:
                         sess_data["audio_scene"] = result
                         session_json = os.path.join(sess_dir, "session.json")
