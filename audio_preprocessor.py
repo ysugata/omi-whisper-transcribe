@@ -85,6 +85,16 @@ class AudioPreprocessor:
 
         return reduced.astype(np.float32)
 
+    def normalize_only(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Loudness normalization only (no noise reduction).
+
+        For modern transformer ASR models (Qwen3-ASR, etc.) that have
+        built-in noise robustness, spectral denoising can hurt accuracy.
+        """
+        if self.normalize_enabled:
+            return self._normalize(audio)
+        return audio
+
     def _normalize(self, audio: np.ndarray) -> np.ndarray:
         """ラウドネス正規化。"""
         rms = np.sqrt(np.mean(audio**2))

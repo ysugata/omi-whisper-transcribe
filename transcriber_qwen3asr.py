@@ -132,7 +132,9 @@ class Qwen3ASRTranscriber:
         kwargs = dict(
             dtype=torch.bfloat16,
             device_map="cuda:0",
-            max_new_tokens=512,
+            # max_new_tokens set per-call based on audio duration
+            # (default 1024 covers most real-time chunks)
+            max_new_tokens=1024,
         )
 
         # Try flash_attention_2, fall back to sdpa, then eager
@@ -202,9 +204,12 @@ class Qwen3ASRTranscriber:
         if len(audio_np) < 1600:  # < 0.1s
             return []
 
-        # Audio preprocessing (loudness normalization)
+        # Audio preprocessing: loudness normalization only.
+        # Research (arXiv:2512.17562) shows spectral denoising HURTS
+        # modern transformer ASR models — they have built-in noise robustness.
+        # Only apply volume normalization, skip noise reduction.
         if audio_preprocessor is not None:
-            audio_np = audio_preprocessor.process_array(audio_np, sample_rate)
+            audio_np = audio_preprocessor.normalize_only(audio_np, sample_rate)
 
         return self.transcribe_array(
             audio_np, sample_rate, session_offset, hotwords,
@@ -253,7 +258,8 @@ class Qwen3ASRTranscriber:
             if terms:
                 context = [" ".join(terms)]
 
-        # Build transcribe kwargs
+        # Build transcribe kwargs — greedy decoding is official recommendation
+        # (no temperature/beam_size — the model defaults to greedy)
         transcribe_kwargs = {}
         if language:
             # Map ISO code to full name (Qwen3-ASR expects "Japanese" not "ja")

@@ -255,7 +255,7 @@ def load_qwen3asr_model():
     kwargs = dict(
         dtype=torch.bfloat16,
         device_map="cuda:0",
-        max_new_tokens=512,
+        max_new_tokens=1024,  # Official recommendation for evaluation
     )
 
     model = None
@@ -286,8 +286,24 @@ _LANG_MAP = {
 }
 
 
+def _normalize_audio(audio_data, target_dbfs=-16.0):
+    """Loudness normalization only (no denoising — hurts modern ASR models)."""
+    import numpy as np
+    rms = np.sqrt(np.mean(audio_data**2))
+    if rms < 1e-10:
+        return audio_data
+    current_dbfs = 20 * np.log10(rms + 1e-10)
+    gain_db = target_dbfs - current_dbfs
+    gain_linear = 10 ** (gain_db / 20)
+    normalized = audio_data * gain_linear
+    return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
+
 def transcribe_with_qwen3asr(model, wav_path, context="", language="ja"):
     """Transcribe a WAV file using Qwen3-ASR.
+
+    Applies loudness normalization (no denoising per arXiv:2512.17562).
+    Uses greedy decoding (official recommendation).
 
     Returns list of segments [{"text", "start", "end"}].
     """
@@ -298,8 +314,12 @@ def transcribe_with_qwen3asr(model, wav_path, context="", language="ja"):
     if len(audio_data.shape) > 1:
         audio_data = audio_data.mean(axis=1)
 
+    # Loudness normalization only (denoising hurts transformer ASR)
+    audio_data = _normalize_audio(audio_data)
+
     duration = len(audio_data) / sr
 
+    # Greedy decoding is the official recommendation (no temperature/beam)
     transcribe_kwargs = {}
     if language:
         lang_name = _LANG_MAP.get(language.lower(), language)
@@ -311,19 +331,33 @@ def transcribe_with_qwen3asr(model, wav_path, context="", language="ja"):
     results = model.transcribe(audio=(audio_data, sr), **transcribe_kwargs)
     elapsed = time.time() - t0
 
+    # Context leak detection
+    context_terms = set()
+    if context:
+        context_terms = {t for t in context.split() if len(t) >= 2}
+
     segments = []
     for result in results:
         text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
-        if text:
-            lang = result.language if hasattr(result, 'language') else None
-            seg = {
-                "text": text,
-                "start": 0.0,
-                "end": round(duration, 2),
-            }
-            if lang:
-                seg["language"] = lang
-            segments.append(seg)
+        if not text:
+            continue
+        # Drop if >50% of text matches context terms (context leak)
+        if context_terms:
+            import re as _re
+            matched = sum(text.count(t) * len(t) for t in context_terms)
+            text_chars = len(_re.sub(r'\s+', '', text))
+            if text_chars > 0 and matched / text_chars > 0.5:
+                print(f"    {YELLOW}Context leak detected, skipping{RESET}")
+                continue
+        lang = result.language if hasattr(result, 'language') else None
+        seg = {
+            "text": text,
+            "start": 0.0,
+            "end": round(duration, 2),
+        }
+        if lang:
+            seg["language"] = lang
+        segments.append(seg)
 
     return segments, elapsed, duration
 
