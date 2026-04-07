@@ -314,6 +314,33 @@ audio_scene_classifier = AudioSceneClassifier(
 
 vibevoice_transcriber = VibeVoiceTranscriber()
 
+# Text normalizer (half/full-width, duplicate chars) — CPU only
+text_normalizer_fn = None
+try:
+    from text_normalizer import normalize as _tn_normalize
+    text_normalizer_fn = _tn_normalize
+    log.info("Text normalizer: loaded")
+except ImportError:
+    log.debug("Text normalizer: not available (neologdn not installed)")
+
+# Phonetic corrector (pronunciation-based ASR error correction) — CPU only
+phonetic_corrector_instance = None
+try:
+    from phonetic_corrector import PhoneticCorrector
+    _pc_glossary = []
+    # Build glossary from hotwords custom + term corrections
+    _pc_glossary.extend(hotword_loader.get_custom_words())
+    for v in term_corrector.list_corrections().values():
+        if v not in _pc_glossary:
+            _pc_glossary.append(v)
+    if _pc_glossary:
+        phonetic_corrector_instance = PhoneticCorrector(
+            glossary=_pc_glossary, threshold=0.75, min_word_length=3,
+        )
+        log.info("Phonetic corrector: %d glossary terms", len(_pc_glossary))
+except ImportError:
+    log.debug("Phonetic corrector: not available (pykakasi not installed)")
+
 # Training data sanitizer (LLM API キーがあれば利用可能)
 # SANITIZE_MODEL supports both Gemini and OpenAI models:
 #   gemini-*  → TrainingSanitizer (Chat Completions API, GEMINI_API_KEY)
@@ -1117,6 +1144,12 @@ def transcribe_audio(
 
         # Layer 2: 用語補正
         text = term_corrector.correct(text)
+
+        # Layer 2.5: テキスト正規化 + 音韻補正
+        if text_normalizer_fn is not None:
+            text = text_normalizer_fn(text)
+        if phonetic_corrector_instance is not None:
+            text = phonetic_corrector_instance.correct(text)
 
         seg_dict = {
             "text": text,
