@@ -88,6 +88,45 @@ class Diarizer:
             self._free_vram()
             return segments, False
 
+    def load_pipeline(self):
+        """Load pyannote pipeline once for batch processing. Returns pipeline object."""
+        import torch
+        from pyannote.audio import Pipeline
+
+        log.info("Loading diarization model (pyannote)...")
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-community-1",
+            token=self._hf_token,
+        )
+        pipeline.to(torch.device(self._device))
+        log.info("Diarization model loaded")
+        return pipeline
+
+    def unload_pipeline(self, pipeline):
+        """Unload pipeline and free VRAM."""
+        del pipeline
+        self._free_vram()
+        log.info("Diarization model unloaded, VRAM released")
+
+    def diarize_with_pipeline(
+        self,
+        pipeline,
+        audio_path: str,
+        segments: list[dict],
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+    ) -> tuple[list[dict], bool]:
+        """Diarize using a pre-loaded pipeline (for batch mode)."""
+        if not segments:
+            return segments, False
+        try:
+            result = self._run_pipeline_with(pipeline, audio_path, segments, min_speakers, max_speakers)
+            return result, True
+        except Exception as e:
+            log.error(f"Diarization FAILED (original segments preserved): {e}", exc_info=True)
+            self._free_vram()
+            return segments, False
+
     def _run_pipeline(
         self,
         audio_path: str,
@@ -97,8 +136,26 @@ class Diarizer:
     ) -> list[dict]:
         """話者分離パイプラインの実体。同期メソッド (executor から呼ぶ)。"""
         import torch
-        import torchaudio
         from pyannote.audio import Pipeline
+
+        log.info(f"Starting diarization: {audio_path}")
+        pipeline = self.load_pipeline()
+        try:
+            result = self._run_pipeline_with(pipeline, audio_path, segments, min_speakers, max_speakers)
+        finally:
+            self.unload_pipeline(pipeline)
+        return result
+
+    def _run_pipeline_with(
+        self,
+        pipeline,
+        audio_path: str,
+        segments: list[dict],
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+    ) -> list[dict]:
+        """Run diarization with a pre-loaded pipeline."""
+        import torchaudio
 
         log.info(f"Starting diarization: {audio_path}")
 
@@ -126,18 +183,7 @@ class Diarizer:
         log.info(f"Prepared {len(valid_segments)} segments "
                  f"(from {len(segments)} original, audio={audio_duration:.1f}s)")
 
-        # --- Step 2: Diarization (pyannote) ---
-        log.info("Step 1/2: Loading diarization model (pyannote)...")
-        try:
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-community-1",
-                token=self._hf_token,
-            )
-            pipeline.to(torch.device(self._device))
-        except Exception as e:
-            log.error(f"Failed to load diarization model (check HF token and model access): {e}")
-            raise
-
+        # --- Step 2: Diarization ---
         diarize_kwargs = {}
         if min_speakers is not None:
             diarize_kwargs["min_speakers"] = min_speakers
@@ -145,38 +191,29 @@ class Diarizer:
             diarize_kwargs["max_speakers"] = max_speakers
 
         log.info("Running diarization...")
-        try:
-            diarize_output = pipeline(
-                {"waveform": waveform, "sample_rate": sr},
-                **diarize_kwargs,
-            )
-        except Exception as e:
-            log.error(f"Diarization inference failed: {e}")
-            del pipeline
-            self._free_vram()
-            raise
+        diarize_output = pipeline(
+            {"waveform": waveform, "sample_rate": sr},
+            **diarize_kwargs,
+        )
 
-        del pipeline
+        # Free audio waveform immediately
+        del waveform
         self._free_vram()
-        log.info("Diarization done, VRAM released")
 
-        # pyannote 4.x returns DiarizeOutput dataclass;
-        # extract the Annotation (use exclusive if available for cleaner results)
+        # pyannote 4.x returns DiarizeOutput dataclass
         if hasattr(diarize_output, 'exclusive_speaker_diarization'):
             annotation = diarize_output.exclusive_speaker_diarization
         elif hasattr(diarize_output, 'speaker_diarization'):
             annotation = diarize_output.speaker_diarization
         else:
-            # Older pyannote versions return Annotation directly
             annotation = diarize_output
 
         # --- Step 3: Speaker assignment (CPU only) ---
         log.info("Step 2/2: Assigning speakers...")
         updated = self._assign_speakers(valid_segments, annotation)
 
-        # Free intermediate variables
-        del waveform, annotation
-        self._free_vram()
+        del annotation
+        gc.collect()
 
         speakers = sorted(set(s.get("speaker", "SPEAKER_00") for s in updated))
         log.info(f"Diarization complete: {len(speakers)} speaker(s): {speakers}")

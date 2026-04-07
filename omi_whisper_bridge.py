@@ -1347,56 +1347,57 @@ async def _batch_diarize_task(force: bool = False):
 
         loop = asyncio.get_running_loop()
 
-        for sess in sessions:
-            if _batch_state["cancel_requested"]:
-                log.info("Batch diarization cancelled by user")
-                break
-
-            _batch_state["current_session"] = sess["path"]
-            log.info(f"Batch diarize: {sess['path']}")
-
+        # Load pyannote pipeline once for entire batch
+        async with model_manager.gpu_lock:
+            pipeline = await loop.run_in_executor(None, diarizer.load_pipeline)
             try:
-                # Pyannote (~2GB) + Whisper (~5GB) = ~7GB — fits in RTX 3060 12GB.
-                # No need to unload Whisper. gpu_lock blocks new WS sessions.
-                async with model_manager.gpu_lock:
-                    updated, success = await loop.run_in_executor(
-                        None,
-                        lambda s=sess: diarizer.diarize(
-                            str(s["audio"]), s["data"]["segments"]
-                        ),
-                    )
+                for sess in sessions:
+                    if _batch_state["cancel_requested"]:
+                        log.info("Batch diarization cancelled by user")
+                        break
 
-                if not success:
-                    _batch_state["failed"] += 1
-                    err_msg = f"{sess['path']}: diarization failed (see logs)"
-                    _batch_state["errors"].append(err_msg)
-                    log.warning(f"Batch diarize failed: {sess['path']}")
-                    continue
+                    _batch_state["current_session"] = sess["path"]
+                    log.info(f"Batch diarize: {sess['path']}")
 
-                # バックアップを作成してから transcript.json を更新
-                bak_path = str(sess["transcript_path"]) + ".bak"
-                shutil.copy2(sess["transcript_path"], bak_path)
+                    try:
+                        updated, success = await loop.run_in_executor(
+                            None,
+                            lambda s=sess: diarizer.diarize_with_pipeline(
+                                pipeline, str(s["audio"]), s["data"]["segments"]
+                            ),
+                        )
 
-                data = sess["data"]
-                data["segments"] = updated
-                data["session"]["diarized"] = True
-                speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
-                data["session"]["num_speakers"] = len(speakers)
+                        if not success:
+                            _batch_state["failed"] += 1
+                            err_msg = f"{sess['path']}: diarization failed"
+                            _batch_state["errors"].append(err_msg)
+                            log.warning(f"Batch diarize failed: {sess['path']}")
+                            continue
 
-                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                        # Safe write: tmp + rename
+                        data = sess["data"]
+                        data["segments"] = updated
+                        data["session"]["diarized"] = True
+                        speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
+                        data["session"]["num_speakers"] = len(speakers)
 
-                _batch_state["processed"] += 1
-                log.info(f"Batch diarize done: {sess['path']} ({len(speakers)} speakers)")
+                        tmp_path = str(sess["transcript_path"]) + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp_path, str(sess["transcript_path"]))
 
-            except Exception as e:
-                _batch_state["failed"] += 1
-                err_msg = f"{sess['path']}: {e}"
-                _batch_state["errors"].append(err_msg)
-                log.error(f"Batch diarize error: {err_msg}", exc_info=True)
+                        _batch_state["processed"] += 1
+                        log.info(f"Batch diarize done: {sess['path']} ({len(speakers)} speakers)")
 
-            # Yield to event loop between sessions
-            await asyncio.sleep(0)
+                    except Exception as e:
+                        _batch_state["failed"] += 1
+                        err_msg = f"{sess['path']}: {e}"
+                        _batch_state["errors"].append(err_msg)
+                        log.error(f"Batch diarize error: {err_msg}", exc_info=True)
+
+                    await asyncio.sleep(0)
+            finally:
+                await loop.run_in_executor(None, lambda: diarizer.unload_pipeline(pipeline))
 
     except Exception as e:
         log.error(f"Batch diarization task error: {e}", exc_info=True)
@@ -1546,16 +1547,14 @@ async def _batch_tag_task(force: bool = False):
                     if orig.get("manually_tagged") and i < len(updated):
                         updated[i] = orig
 
-                # バックアップを作成してから transcript.json を更新
-                bak_path = str(sess["transcript_path"]) + ".bak"
-                shutil.copy2(sess["transcript_path"], bak_path)
-
                 data = sess["data"]
                 data["segments"] = updated
                 data["session"]["speaker_tagged"] = True
 
-                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                tmp_path = str(sess["transcript_path"]) + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, str(sess["transcript_path"]))
 
                 _batch_tag_state["processed"] += 1
                 log.info(f"Batch tag done: {sess['path']}")
@@ -1737,16 +1736,14 @@ async def _batch_session_tag_task(force: bool = False):
                 )
 
                 if tags:
-                    # Backup then update transcript.json
-                    bak_path = str(sess["transcript_path"]) + ".bak"
-                    shutil.copy2(sess["transcript_path"], bak_path)
-
                     data = sess["data"]
                     data["session"]["tags"] = tags
                     data["session"]["session_tagged"] = True
 
-                    with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                    tmp_path = str(sess["transcript_path"]) + ".tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, str(sess["transcript_path"]))
 
                     # Update RAG index
                     _update_rag_index(sess["path"], segments, tags)
@@ -1836,110 +1833,126 @@ async def _batch_combined_tag_task(force: bool = False):
     st["audio_scene_processed"] = 0
     st["audio_scene_failed"] = 0
 
-    try:
-        # --- Phase 1: Voice Tag (Speaker) ---
-        # 声紋タグを先に実行し、セグメントに is_user / person_name を付与する。
-        # これにより Phase 2 の LLM タグ付けで話者情報を活用できる。
+    async def _run_voice_tag_phase():
+        """Phase 1: Voice Tag (GPU) — runs in parallel with PANNs."""
         st["phase"] = "voice_tag"
-        if speaker_filter is not None:
-            voice_sessions = _find_untagged_sessions(force=force)
-            st["voice_tag_total"] = len(voice_sessions)
-            st["total"] = len(voice_sessions)
-            log.info(f"Combined tag Phase 1 (voice tag): {len(voice_sessions)} session(s) (force={force})")
-
-            if voice_sessions:
-                loop = asyncio.get_running_loop()
-
-                # Load model once for entire batch
-                async with model_manager.gpu_lock:
-                    inference = await loop.run_in_executor(
-                        None, speaker_filter._load_model
-                    )
-                    try:
-                        for sess in voice_sessions:
-                            if st["cancel_requested"]:
-                                log.info("Combined tag cancelled by user (voice tag phase)")
-                                break
-
-                            st["current_session"] = sess["path"]
-                            try:
-                                original_segments = sess["data"]["segments"]
-                                updated = await loop.run_in_executor(
-                                    None,
-                                    lambda s=sess: speaker_filter.tag_segments_with_model(
-                                        inference, str(s["audio"]), s["data"]["segments"]
-                                    ),
-                                )
-
-                                # Preserve manually_tagged segments
-                                for i, orig in enumerate(original_segments):
-                                    if orig.get("manually_tagged") and i < len(updated):
-                                        updated[i] = orig
-
-                                bak_path = str(sess["transcript_path"]) + ".bak"
-                                shutil.copy2(sess["transcript_path"], bak_path)
-
-                                data = sess["data"]
-                                data["segments"] = updated
-                                data["session"]["speaker_tagged"] = True
-
-                                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                                    json.dump(data, f, ensure_ascii=False, indent=2)
-
-                                st["voice_tag_processed"] += 1
-                                st["processed"] += 1
-
-                            except Exception as e:
-                                st["voice_tag_failed"] += 1
-                                st["failed"] += 1
-                                err_msg = f"{sess['path']}: {e}"
-                                st["errors"].append(err_msg)
-                                log.error(f"Combined tag voice-tag error: {err_msg}", exc_info=True)
-
-                            await asyncio.sleep(0)
-                    finally:
-                        await loop.run_in_executor(
-                            None, lambda: speaker_filter._unload_model(inference)
-                        )
-        else:
+        if speaker_filter is None:
             log.info("Combined tag Phase 1 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
-
-        # --- Phase 1.5: Audio Scene Classification (PANNs CNN14) ---
-        if st["cancel_requested"]:
             return
 
-        if AUDIO_SCENE_ENABLED:
-            st["phase"] = "audio_scene"
-            scene_sessions = _find_unscene_classified_sessions(force=force)
-            st["audio_scene_total"] = len(scene_sessions)
-            log.info(f"Combined tag Phase 1.5 (audio scene): {len(scene_sessions)} session(s)")
-            for sess_dir, sess_data in scene_sessions:
-                if st["cancel_requested"]:
-                    log.info("Combined tag cancelled by user (audio scene phase)")
-                    break
-                try:
-                    audio_path = os.path.join(sess_dir, "audio.ogg")
-                    if not os.path.exists(audio_path):
-                        audio_path = os.path.join(sess_dir, "audio.wav")
-                    if not os.path.exists(audio_path):
-                        log.warning("No audio file in %s, skipping scene classification", sess_dir)
-                        st["audio_scene_failed"] += 1
-                        continue
-                    result = audio_scene_classifier.classify(audio_path)
-                    if result:
-                        sess_data["audio_scene"] = result
-                        session_json = os.path.join(sess_dir, "session.json")
-                        with open(session_json, "w") as f:
-                            json.dump(sess_data, f, ensure_ascii=False, indent=2)
-                        log.info("Audio scene for %s: %s", os.path.basename(sess_dir), result.get("scene_label", "unknown"))
-                        st["audio_scene_processed"] += 1
-                    else:
-                        log.warning("Audio scene for %s: no classification result", os.path.basename(sess_dir))
-                        st["audio_scene_failed"] += 1
-                except Exception as e:
-                    log.error("Audio scene classification failed for %s: %s", sess_dir, e)
+        voice_sessions = _find_untagged_sessions(force=force)
+        st["voice_tag_total"] = len(voice_sessions)
+        st["total"] = len(voice_sessions)
+        log.info(f"Combined tag Phase 1 (voice tag): {len(voice_sessions)} session(s) (force={force})")
+
+        if not voice_sessions:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        # Load model once for entire batch
+        async with model_manager.gpu_lock:
+            inference = await loop.run_in_executor(
+                None, speaker_filter._load_model
+            )
+            try:
+                for sess in voice_sessions:
+                    if st["cancel_requested"]:
+                        log.info("Combined tag cancelled by user (voice tag phase)")
+                        break
+
+                    st["current_session"] = sess["path"]
+                    try:
+                        original_segments = sess["data"]["segments"]
+                        updated = await loop.run_in_executor(
+                            None,
+                            lambda s=sess: speaker_filter.tag_segments_with_model(
+                                inference, str(s["audio"]), s["data"]["segments"]
+                            ),
+                        )
+
+                        # Preserve manually_tagged segments
+                        for i, orig in enumerate(original_segments):
+                            if orig.get("manually_tagged") and i < len(updated):
+                                updated[i] = orig
+
+                        data = sess["data"]
+                        data["segments"] = updated
+                        data["session"]["speaker_tagged"] = True
+
+                        tmp_path = str(sess["transcript_path"]) + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp_path, str(sess["transcript_path"]))
+
+                        st["voice_tag_processed"] += 1
+                        st["processed"] += 1
+
+                    except Exception as e:
+                        st["voice_tag_failed"] += 1
+                        st["failed"] += 1
+                        err_msg = f"{sess['path']}: {e}"
+                        st["errors"].append(err_msg)
+                        log.error(f"Combined tag voice-tag error: {err_msg}", exc_info=True)
+
+                    await asyncio.sleep(0)
+            finally:
+                await loop.run_in_executor(
+                    None, lambda: speaker_filter._unload_model(inference)
+                )
+
+    async def _run_audio_scene_phase():
+        """Phase 1.5: Audio Scene (CPU) — runs in parallel with voice tag."""
+        if not AUDIO_SCENE_ENABLED:
+            return
+
+        scene_sessions = _find_unscene_classified_sessions(force=force)
+        st["audio_scene_total"] = len(scene_sessions)
+        log.info(f"Combined tag Phase 1.5 (audio scene): {len(scene_sessions)} session(s)")
+
+        loop = asyncio.get_running_loop()
+        for sess_dir, sess_data in scene_sessions:
+            if st["cancel_requested"]:
+                log.info("Combined tag cancelled by user (audio scene phase)")
+                break
+            try:
+                audio_path = os.path.join(sess_dir, "audio.ogg")
+                if not os.path.exists(audio_path):
+                    audio_path = os.path.join(sess_dir, "audio.wav")
+                if not os.path.exists(audio_path):
+                    log.warning("No audio file in %s, skipping scene classification", sess_dir)
                     st["audio_scene_failed"] += 1
-                await asyncio.sleep(0)
+                    continue
+                # Run PANNs in executor (CPU-bound)
+                result = await loop.run_in_executor(
+                    None, lambda p=audio_path: audio_scene_classifier.classify(p)
+                )
+                if result:
+                    sess_data["audio_scene"] = result
+                    session_json = os.path.join(sess_dir, "session.json")
+                    tmp_path = session_json + ".tmp"
+                    with open(tmp_path, "w") as f:
+                        json.dump(sess_data, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, session_json)
+                    log.info("Audio scene for %s: %s", os.path.basename(sess_dir), result.get("scene_label", "unknown"))
+                    st["audio_scene_processed"] += 1
+                else:
+                    log.warning("Audio scene for %s: no classification result", os.path.basename(sess_dir))
+                    st["audio_scene_failed"] += 1
+            except Exception as e:
+                log.error("Audio scene classification failed for %s: %s", sess_dir, e)
+                st["audio_scene_failed"] += 1
+            await asyncio.sleep(0)
+
+    try:
+        # --- Phase 1 + 1.5: Voice Tag (GPU) and Audio Scene (CPU) in parallel ---
+        # PANNs runs on CPU, voice tag on GPU — no resource conflict.
+        st["phase"] = "voice_tag+audio_scene"
+        log.info("Combined tag: starting voice tag (GPU) + audio scene (CPU) in parallel")
+        await asyncio.gather(
+            _run_voice_tag_phase(),
+            _run_audio_scene_phase(),
+        )
 
         # --- Phase 2: Session Tag (LLM) ---
         # 声紋タグ済みのセグメントを使って LLM タグ付けを実行する。
@@ -1984,14 +1997,13 @@ async def _batch_combined_tag_task(force: bool = False):
                     )
 
                     if tags:
-                        bak_path = str(sess["transcript_path"]) + ".bak"
-                        shutil.copy2(sess["transcript_path"], bak_path)
-
                         fresh_data["session"]["tags"] = tags
                         fresh_data["session"]["session_tagged"] = True
 
-                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                        tmp_path = str(sess["transcript_path"]) + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
                             json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp_path, str(sess["transcript_path"]))
 
                         # Update RAG index
                         _update_rag_index(sess["path"], segments, tags)
