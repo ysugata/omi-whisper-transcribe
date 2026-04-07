@@ -102,7 +102,19 @@ class SpeakerFilter:
         else:
             model = Model.from_pretrained(EMBEDDING_MODEL, use_auth_token=self._hf_token)
         device = torch.device(self._device)
-        inference = Inference(model, window="whole", device=device)
+        try:
+            inference = Inference(model, window="whole", device=device)
+            # Quick smoke test to catch cuDNN issues early
+            import numpy as np
+            test_wav = torch.randn(1, 16000)
+            inference({"waveform": test_wav, "sample_rate": 16000})
+        except RuntimeError as e:
+            if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
+                log.warning("Embedding model: GPU failed (%s), falling back to CPU", e)
+                device = torch.device("cpu")
+                inference = Inference(model, window="whole", device=device)
+            else:
+                raise
         log.info("Embedding model loaded (device=%s)", device)
         return inference
 
