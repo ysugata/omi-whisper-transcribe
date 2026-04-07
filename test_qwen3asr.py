@@ -10,6 +10,7 @@ from transcriber_qwen3asr import (
     _filter_text,
     _remove_hallucinations,
     _clean_trailing_fragments,
+    _collapse_word_repeats,
     _normalize_punctuation,
     _has_repetitive_kana,
     _is_gibberish_kana,
@@ -91,6 +92,31 @@ class TestPunctuationNormalization:
     def test_decimal_preserved(self):
         result = _normalize_punctuation("3.14です")
         assert "3.14" in result
+
+
+class TestCollapseWordRepeats:
+    def test_basic_repeat(self):
+        result = _collapse_word_repeats("カボ。カボ。カボ。カボ。")
+        assert result.count("カボ") == 1
+
+    def test_comma_repeat(self):
+        result = _collapse_word_repeats("バナナ、バナナ、バナナ、バナナ")
+        assert result.count("バナナ") == 1
+
+    def test_mixed_repeat(self):
+        result = _collapse_word_repeats("前の文。高松。高松。高松。後の文")
+        assert result.count("高松") == 1
+        assert "前の文" in result
+        assert "後の文" in result
+
+    def test_no_repeat_preserved(self):
+        text = "これは普通のテキストです"
+        assert _collapse_word_repeats(text) == text
+
+    def test_short_repeat_not_collapsed(self):
+        # Single char repeats should not be collapsed (handled by kana filter)
+        text = "あ。い。う。え。"
+        assert _collapse_word_repeats(text) == text
 
 
 class TestRepetitiveKana:

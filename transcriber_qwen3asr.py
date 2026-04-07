@@ -94,6 +94,14 @@ _GRAMMATICAL_ENDINGS = re.compile(
     r'|って|かな|かも|でしょ|っけ|じゃん|んだ|のに|けど)'
 )
 
+# Qwen3-ASR specific: word-level repetition (e.g., "カボ。カボ。カボ。")
+# Whisper repeats at kana level; Qwen3-ASR repeats at word level.
+# Matches: word + separator, repeated 3+ times total (with optional trailing separator)
+_WORD_REPEAT_RE = re.compile(
+    r'([\u3040-\u9fff]{2,6})[。、.,\s]+'
+    r'(?:\1[。、.,\s]*){2,}'
+)
+
 SEGMENT_MAX_DURATION_DEFAULT = 15.0
 
 
@@ -232,10 +240,16 @@ class Qwen3ASRTranscriber:
 
         chunk_duration = len(audio_np) / sample_rate
 
-        # Build context from hotwords (comma-separated → space-separated)
+        # Build context from hotwords for Qwen3-ASR's context boost.
+        # IMPORTANT: Passing too many terms causes the model to output
+        # the context words as transcription instead of actual speech.
+        # Limit to max 15 short, high-value terms (custom words only).
         context = []
         if hotwords:
             terms = [w.strip() for w in hotwords.split(",") if w.strip()]
+            # Filter: only short terms (2-8 chars) to reduce context noise
+            terms = [t for t in terms if 2 <= len(t) <= 8]
+            terms = terms[:15]  # Hard cap to prevent context leak
             if terms:
                 context = [" ".join(terms)]
 
@@ -275,7 +289,7 @@ class Qwen3ASRTranscriber:
                 continue
 
             # Qwen3-ASR returns a single text per audio input (no segment timestamps).
-            # Create one segment spanning the chunk duration.
+            # Always split at sentence boundaries for better granularity.
             seg_dict = {
                 "text": text,
                 "speaker": "SPEAKER_00",
@@ -288,12 +302,11 @@ class Qwen3ASRTranscriber:
             if detected_lang:
                 seg_dict["language"] = detected_lang
 
-            # Split long segments at sentence boundaries
-            if segment_max_duration > 0 and chunk_duration > segment_max_duration:
-                split_segs = _split_long_segment(seg_dict, segment_max_duration)
-                segments_out.extend(split_segs)
-            else:
-                segments_out.append(seg_dict)
+            # Always split: Qwen3-ASR outputs one big text block.
+            # Use a tighter max_duration (10s) to match Whisper's granularity.
+            split_dur = min(segment_max_duration, 10.0) if segment_max_duration > 0 else 10.0
+            split_segs = _split_long_segment(seg_dict, split_dur)
+            segments_out.extend(split_segs)
 
         return segments_out
 
@@ -332,6 +345,12 @@ def _filter_text(text: str, term_corrector=None) -> str:
         log.info("Repetitive kana filtered: '%s'", text[:80])
         return ""
 
+    # Qwen3-ASR specific: collapse word-level repetitions
+    # e.g., "カボ。カボ。カボ。カボ。" → "カボ。"
+    text = _collapse_word_repeats(text)
+    if not text:
+        return ""
+
     # Hallucination removal
     cleaned = _remove_hallucinations(text)
     if not cleaned:
@@ -365,6 +384,24 @@ def _remove_hallucinations(text: str) -> str:
         cleaned = pattern.sub("", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _collapse_word_repeats(text: str) -> str:
+    """Collapse word-level repetitions specific to Qwen3-ASR.
+
+    Qwen3-ASR sometimes repeats the same word with punctuation separators:
+    "カボ。カボ。カボ。カボ。" → "カボ。"
+    "バナナ。バナナ。バナナ。" → "バナナ。"
+
+    Also handles comma-separated repeats:
+    "高松。高松。高松ね。" → "高松ね。"
+    """
+    result = _WORD_REPEAT_RE.sub(r'\1。', text)
+    # If collapse reduced text to mostly nothing, return cleaned version
+    stripped = result.strip()
+    if not stripped:
+        return text  # preserve original if collapse eliminated everything
+    return stripped
 
 
 def _clean_trailing_fragments(text: str) -> str:
