@@ -15,6 +15,23 @@ import time
 
 import numpy as np
 
+# Compatibility shim: qwen-asr 0.0.6 uses @check_model_inputs() (decorator factory)
+# but transformers >=5.x changed it to @check_model_inputs (direct decorator).
+# Patch before importing qwen_asr to support both calling conventions.
+try:
+    import transformers.utils.generic as _tug
+    if hasattr(_tug, "check_model_inputs"):
+        _orig_cmi = _tug.check_model_inputs
+
+        def _compat_cmi(func=None):
+            if func is None:
+                return _orig_cmi
+            return _orig_cmi(func)
+
+        _tug.check_model_inputs = _compat_cmi
+except (ImportError, AttributeError):
+    pass
+
 log = logging.getLogger(__name__)
 
 MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
