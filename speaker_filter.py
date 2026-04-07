@@ -94,24 +94,9 @@ class SpeakerFilter:
         """wespeaker-voxceleb-resnet34-LM モデルをロードして返す。"""
         import torch
         from pyannote.audio import Model, Inference
-        # pyannote 4.x uses 'token', 3.x uses 'use_auth_token'
-        import inspect
-        sig = inspect.signature(Model.from_pretrained)
-        if "token" in sig.parameters:
-            model = Model.from_pretrained(EMBEDDING_MODEL, token=self._hf_token)
-        else:
-            model = Model.from_pretrained(EMBEDDING_MODEL, use_auth_token=self._hf_token)
-        # Try requested device, fall back to CPU on driver incompatibility
+        model = Model.from_pretrained(EMBEDDING_MODEL, use_auth_token=self._hf_token)
         device = torch.device(self._device)
-        try:
-            inference = Inference(model, window="whole", device=device)
-        except RuntimeError as e:
-            if "driver" in str(e).lower() or "cuda" in str(e).lower():
-                log.warning("Embedding model: GPU failed (%s), falling back to CPU", e)
-                device = torch.device("cpu")
-                inference = Inference(model, window="whole", device=device)
-            else:
-                raise
+        inference = Inference(model, window="whole", device=device)
         log.info("Embedding model loaded (device=%s)", device)
         return inference
 
