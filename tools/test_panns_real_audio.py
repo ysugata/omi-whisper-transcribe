@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Test PANNs CNN14 audio scene classifier with real recorded audio.
 
-Runs classification on many sessions and prints a readable summary.
-Fixes AudioSet label display by importing labels correctly.
+Runs classification on many sessions and prints a readable summary
+including all 6 analysis dimensions (scene, spatial, noise sources,
+events, music, speaker count, quality issues).
 """
 
 import json
@@ -65,6 +66,50 @@ def get_speaker_info(session_dir: str) -> str:
         return ""
 
 
+def format_noise_sources(result: dict) -> str:
+    """Format noise sources for display."""
+    ns = result.get("noise_sources", [])
+    if not ns:
+        return "-"
+    return ", ".join(f"{n['label']}({n['confidence']:.2f})" for n in ns[:3])
+
+
+def format_events(result: dict) -> str:
+    """Format events for display."""
+    ev = result.get("events", [])
+    if not ev:
+        return "-"
+    return ", ".join(f"{e['label']}({e['confidence']:.2f})" for e in ev[:3])
+
+
+def format_music(result: dict) -> str:
+    """Format music detection for display."""
+    m = result.get("music", {})
+    if not m or not m.get("detected"):
+        return "-"
+    mtype = m.get("type_label") or m.get("type") or "?"
+    return f"{mtype}({m['confidence']:.2f})"
+
+
+def format_speaker_count(result: dict) -> str:
+    """Format speaker count estimate for display."""
+    sc = result.get("speaker_count", {})
+    if not sc or not sc.get("estimate"):
+        return "-"
+    return f"{sc['label']}({sc['confidence']:.2f})"
+
+
+def format_quality(result: dict) -> str:
+    """Format quality issues for display."""
+    q = result.get("quality_issues", [])
+    parts = []
+    if q:
+        parts.extend(f"{qi['label']}({qi['confidence']:.2f})" for qi in q[:2])
+    if result.get("clipping_detected"):
+        parts.append("CLIP!")
+    return ", ".join(parts) if parts else "-"
+
+
 def main():
     # Support running from host (tools/) or container (/app/)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -120,13 +165,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\nTesting {len(sampled)} sessions (device={device})", flush=True)
-    print("=" * 130, flush=True)
+    print("=" * 180, flush=True)
 
     classifier = AudioSceneClassifier(device=device, threshold=0.3, enabled=True)
 
-    header = f"{'Session':<28} {'Size':>6} {'Scene':<10} {'Conf':>5} {'Spatial':<16} {'Conf':>5} {'Time':>5}  Top-5 AudioSet Classes"
+    # Header
+    header = (
+        f"{'Session':<28} {'Size':>6} {'Scene':<10} {'Conf':>5} {'Spatial':<16} "
+        f"{'Speakers':<12} {'Music':<16} {'Time':>5}  "
+        f"Noise Sources / Events / Quality"
+    )
     print(header, flush=True)
-    print("-" * 130, flush=True)
+    print("-" * 180, flush=True)
 
     results = []
     for session_dir in sampled:
@@ -143,27 +193,37 @@ def main():
         elapsed = time.time() - t0
 
         if result is None:
-            scene = "None"
-            scene_conf = ""
-            spatial = "None"
-            spatial_conf = ""
-            top = ""
+            line = (
+                f"{session_rel:<28} {audio_size // 1024:>5}K "
+                f"{'None':<10} {'':>5} {'None':<16} "
+                f"{'-':<12} {'-':<16} {elapsed:>4.1f}s  -"
+            )
         else:
             scene = result.get("scene_label") or "None"
             scene_conf = f"{result['scene_confidence']:.2f}" if result.get("scene_confidence") else ""
             spatial = result.get("spatial") or "None"
-            spatial_conf = f"{result['spatial_confidence']:.2f}" if result.get("spatial_confidence") else ""
-            top_classes = result.get("top_classes", [])
-            top = ", ".join(f"{c['label']}({c['score']:.2f})" for c in top_classes[:5])
+            spk = format_speaker_count(result)
+            music = format_music(result)
+            noise = format_noise_sources(result)
+            events = format_events(result)
+            quality = format_quality(result)
 
-        line = (
-            f"{session_rel:<28} {audio_size // 1024:>5}K "
-            f"{scene:<10} {scene_conf:>5} "
-            f"{spatial:<16} {spatial_conf:>5} "
-            f"{elapsed:>4.1f}s  {top}"
-        )
+            detail_parts = []
+            if noise != "-":
+                detail_parts.append(f"NS:{noise}")
+            if events != "-":
+                detail_parts.append(f"EV:{events}")
+            if quality != "-":
+                detail_parts.append(f"QA:{quality}")
+            detail = " | ".join(detail_parts) if detail_parts else "-"
+
+            line = (
+                f"{session_rel:<28} {audio_size // 1024:>5}K "
+                f"{scene:<10} {scene_conf:>5} {spatial:<16} "
+                f"{spk:<12} {music:<16} {elapsed:>4.1f}s  {detail}"
+            )
+
         print(line, flush=True)
-
         results.append({
             "session": session_rel,
             "size_kb": audio_size // 1024,
@@ -173,9 +233,9 @@ def main():
 
     # Transcript previews
     print(flush=True)
-    print("=" * 130, flush=True)
-    print("Transcript Previews (with scene label):", flush=True)
-    print("-" * 130, flush=True)
+    print("=" * 180, flush=True)
+    print("Transcript Previews:", flush=True)
+    print("-" * 180, flush=True)
     for r in results:
         session_dir = os.path.join(recordings_dir, r["session"])
         preview = get_transcript_preview(session_dir)
@@ -187,20 +247,47 @@ def main():
 
     # Summary
     print(flush=True)
-    print("=" * 130, flush=True)
+    print("=" * 180, flush=True)
     print("Summary:", flush=True)
     print(f"  Total tested: {len(results)}", flush=True)
     print(f"  Avg time per session: {sum(r['elapsed'] for r in results) / max(len(results), 1):.2f}s", flush=True)
     print(flush=True)
 
+    # Scene distribution
     scene_counts = {}
     spatial_counts = {}
+    speaker_counts = {}
+    music_counts = {"detected": 0, "not_detected": 0}
+    noise_source_all = {}
+    event_all = {}
+    quality_all = {}
+
     for r in results:
         res = r["result"]
+        # Scene
         s = (res.get("scene_label_en") or "none") if res else "none"
         scene_counts[s] = scene_counts.get(s, 0) + 1
+        # Spatial
         sp = (res.get("spatial_en") or "none") if res else "none"
         spatial_counts[sp] = spatial_counts.get(sp, 0) + 1
+        if res:
+            # Speaker count
+            sc = (res.get("speaker_count") or {}).get("estimate") or "none"
+            speaker_counts[sc] = speaker_counts.get(sc, 0) + 1
+            # Music
+            if (res.get("music") or {}).get("detected"):
+                music_counts["detected"] += 1
+            else:
+                music_counts["not_detected"] += 1
+            # Noise sources
+            for ns in res.get("noise_sources", []):
+                noise_source_all[ns["type"]] = noise_source_all.get(ns["type"], 0) + 1
+            # Events
+            for ev in res.get("events", []):
+                event_all[ev["type"]] = event_all.get(ev["type"], 0) + 1
+            # Quality
+            for q in res.get("quality_issues", []):
+                quality_all[q["type"]] = quality_all.get(q["type"], 0) + 1
 
     print("  Scene distribution:", flush=True)
     for label, count in sorted(scene_counts.items(), key=lambda x: -x[1]):
@@ -209,6 +296,27 @@ def main():
     print("  Spatial distribution:", flush=True)
     for label, count in sorted(spatial_counts.items(), key=lambda x: -x[1]):
         print(f"    {label}: {count} ({count * 100 // len(results)}%)", flush=True)
+
+    print("  Speaker count distribution:", flush=True)
+    for label, count in sorted(speaker_counts.items(), key=lambda x: -x[1]):
+        print(f"    {label}: {count}", flush=True)
+
+    print(f"  Music: detected={music_counts['detected']}, not_detected={music_counts['not_detected']}", flush=True)
+
+    if noise_source_all:
+        print("  Noise sources detected:", flush=True)
+        for ns, count in sorted(noise_source_all.items(), key=lambda x: -x[1]):
+            print(f"    {ns}: {count} sessions", flush=True)
+
+    if event_all:
+        print("  Events detected:", flush=True)
+        for ev, count in sorted(event_all.items(), key=lambda x: -x[1]):
+            print(f"    {ev}: {count} sessions", flush=True)
+
+    if quality_all:
+        print("  Quality issues:", flush=True)
+        for q, count in sorted(quality_all.items(), key=lambda x: -x[1]):
+            print(f"    {q}: {count} sessions", flush=True)
 
     # Check if TV/media detection is working
     print(flush=True)

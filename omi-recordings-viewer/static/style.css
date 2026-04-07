@@ -1283,6 +1283,9 @@ main {
 .tag-badge.imp-low { background: #555; color: #aaa; }
 .tag-badge.ext-audio { background: #c0392b; color: #fff; }
 .tag-badge.audio-scene { background: #16a085; color: #fff; }
+.tag-badge.noise-source { background: #8e44ad; color: #fff; font-size: 0.7rem; }
+.tag-badge.event-tag { background: #d35400; color: #fff; font-size: 0.7rem; }
+.scene-sub { font-size: 0.85rem; margin-left: 1em; margin-top: 2px; }
 
 .session-summary {
     font-size: 0.8rem;

@@ -36,7 +36,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → faster-whi
 | マルチスピーカー声紋登録 | 複数話者の声紋を登録し、セグメントごとに話者タグ付け |
 | リアルタイム声紋フィルタ | is_user 声紋との比較で非ユーザー音声 (TV等) を自動除去 |
 | 話者タグ補正 | セグメント単位で話者タグを手動修正、自動学習でサンプル追加 |
-| 音響シーン分類 (PANNs CNN14) | AudioSet 527クラス事前学習モデルで音響環境を自動分類 (シーン + 空間、CPU 推論) |
+| 音響シーン分類 (PANNs CNN14) | AudioSet 527クラスモデルで6次元音響分析: シーン・空間・ノイズ源・イベント・音楽・話者数・品質 (CPU 推論) |
 | VibeVoice-ASR バッチ文字起こし | microsoft/VibeVoice-ASR-HF (9B, 4-bit NF4 量子化) による比較用バッチ文字起こし (デフォルト無効、API のみ。Viewer UI ボタンは削除済み) |
 | 深夜スケジューラ | 指定時刻に話者分離 + タグ付けを自動一括実行 (デフォルト: 毎日 4:00) |
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
@@ -402,7 +402,19 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `DIARIZATION_ENABLED` | `false` | セッション終了時の自動話者分離 |
 | `HOTWORDS_ENABLED` | `true` | Hotwords (デコーダバイアス) |
 
-### 音響シーン分類
+### 音響シーン分類 (6次元分析)
+
+1回の PANNs CNN14 推論 (527クラス) から以下6次元を抽出:
+
+| 次元 | 出力キー | 説明 |
+|------|---------|------|
+| シーン | `scene_label` | 電話 / TV・ラジオ / 会話 / 静寂 / 騒音環境 (優先度ベース判定) |
+| 空間 | `spatial` | 室内(小/大) / 公共空間 / 屋外(都市/自然) (max-score) |
+| ノイズ源 | `noise_sources` | 交通 / 空調 / ファン / タイピング / 風 / 雨 / 工事 / 衣擦れ / サイレン (多ラベル) |
+| イベント | `events` | 笑い / 泣き声 / 咳 / くしゃみ / 拍手・歓声 / 叫び / ため息 (多ラベル) |
+| 音楽 | `music` | 検出有無 + タイプ: 生演奏 / 録音・BGM / 歌唱 (Noisy OR + max比較) |
+| 話者数 | `speaker_count` | 独り言 / 会話 / 群衆 (max-score) |
+| 品質 | `quality_issues` | 歪み / ノイズ / ハム / エコー / 残響 / 風切り音 + クリッピング検出 (多ラベル) |
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
@@ -931,7 +943,7 @@ omi_whisper_transcribe/
 ├── sanitize_schema.py        # 匿名化 JSON Schema + KC 抽出スキーマ + 品質ゲート
 ├── sanitize_prompt.py        # 匿名化 + KC 抽出のプロンプト定義
 ├── sanitize_provider.py      # 匿名化プロバイダ抽象インターフェース
-├── audio_scene_classifier.py  # PANNs CNN14 音響シーン分類
+├── audio_scene_classifier.py  # PANNs CNN14 6次元音響分析
 ├── vibevoice_transcriber.py   # VibeVoice-ASR バッチ文字起こし (9B, 4-bit NF4, Prefetch)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理

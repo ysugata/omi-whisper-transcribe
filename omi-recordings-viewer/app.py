@@ -113,6 +113,7 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
     domain = request.query.get("domain", "").strip()
     importance_v2 = request.query.get("importance_v2", "").strip()
     audio_scene = request.query.get("audio_scene", "").strip()
+    audio_speaker_count = request.query.get("audio_speaker_count", "").strip()
 
     try:
         result = await indexer.get_sessions(
@@ -123,6 +124,7 @@ async def handle_api_sessions(request: web.Request) -> web.Response:
             conversation_type=conversation_type, outcome=outcome,
             domain=domain, importance_v2=importance_v2,
             audio_scene=audio_scene,
+            audio_speaker_count=audio_speaker_count,
         )
     except Exception as e:
         logger.exception("Failed to query sessions")
@@ -714,6 +716,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                 tags_decision_memo, tags_importance_v2, tags_version,
                 tags_external_audio,
                 tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                tags_audio_noise_sources, tags_audio_events,
+                tags_audio_music_detected, tags_audio_speaker_count,
                 tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
                 tags_review_outcome)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
@@ -728,6 +732,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
                        :tags_external_audio,
                        :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                       :tags_audio_noise_sources, :tags_audio_events,
+                       :tags_audio_music_detected, :tags_audio_speaker_count,
                        :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
                        :tags_review_outcome)""",
             info,
@@ -989,6 +995,8 @@ async def handle_review_accept(request: web.Request) -> web.Response:
                 tags_decision_memo, tags_importance_v2, tags_version,
                 tags_external_audio,
                 tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                tags_audio_noise_sources, tags_audio_events,
+                tags_audio_music_detected, tags_audio_speaker_count,
                 tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
                 tags_review_outcome)
                VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
@@ -1003,6 +1011,8 @@ async def handle_review_accept(request: web.Request) -> web.Response:
                        :tags_decision_memo, :tags_importance_v2, :tags_version,
                        :tags_external_audio,
                        :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                       :tags_audio_noise_sources, :tags_audio_events,
+                       :tags_audio_music_detected, :tags_audio_speaker_count,
                        :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
                        :tags_review_outcome)""",
             info,

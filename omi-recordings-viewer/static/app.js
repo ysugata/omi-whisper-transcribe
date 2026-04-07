@@ -331,17 +331,52 @@
             }
         }
 
-        // Audio scene section
-        if (s.tags_audio_scene) {
-            var sceneHtml = '<div class="detail-audio-scene"><div class="scene-row">';
-            sceneHtml += '<span class="scene-label">シーン:</span> ' + escapeHtml(s.tags_audio_scene);
-            if (s.tags_audio_scene_spatial) {
-                sceneHtml += ' <span class="scene-label">空間:</span> ' + escapeHtml(s.tags_audio_scene_spatial);
+        // Audio scene section (with extended dimensions)
+        if (s.tags_audio_scene || s.tags_audio_noise_sources || s.tags_audio_events || s.tags_audio_speaker_count) {
+            var sceneHtml = '<div class="detail-audio-scene">';
+            if (s.tags_audio_scene) {
+                sceneHtml += '<div class="scene-row">';
+                sceneHtml += '<span class="scene-label">シーン:</span> ' + escapeHtml(s.tags_audio_scene);
+                if (s.tags_audio_scene_spatial) {
+                    sceneHtml += ' <span class="scene-label">空間:</span> ' + escapeHtml(s.tags_audio_scene_spatial);
+                }
+                if (s.tags_audio_scene_confidence) {
+                    sceneHtml += ' <span style="color:#888">(' + Math.round(s.tags_audio_scene_confidence * 100) + '%)</span>';
+                }
+                sceneHtml += '</div>';
             }
-            if (s.tags_audio_scene_confidence) {
-                sceneHtml += ' <span style="color:#888">(' + Math.round(s.tags_audio_scene_confidence * 100) + '%)</span>';
+            if (s.tags_audio_speaker_count) {
+                var spkLabels = {monologue: '独り言', conversation: '会話', crowd: '群衆'};
+                sceneHtml += '<div class="scene-row scene-sub">';
+                sceneHtml += '<span class="scene-label">話者:</span> ' + escapeHtml(spkLabels[s.tags_audio_speaker_count] || s.tags_audio_speaker_count);
+                sceneHtml += '</div>';
             }
-            sceneHtml += '</div></div>';
+            if (s.tags_audio_noise_sources) {
+                var nsLabels = {vehicle_traffic:'交通',air_conditioning:'空調',mechanical_fan:'ファン',typing_keyboard:'タイピング',wind:'風',rain:'雨',construction:'工事',rustle:'衣擦れ',siren_emergency:'サイレン'};
+                var nsList = s.tags_audio_noise_sources.split(',');
+                sceneHtml += '<div class="scene-row scene-sub">';
+                sceneHtml += '<span class="scene-label">ノイズ:</span> ';
+                nsList.forEach(function(ns) {
+                    sceneHtml += '<span class="tag-badge noise-source">' + escapeHtml(nsLabels[ns] || ns) + '</span> ';
+                });
+                sceneHtml += '</div>';
+            }
+            if (s.tags_audio_events) {
+                var evLabels = {laughter:'笑い',crying:'泣き声',cough:'咳',sneeze:'くしゃみ',applause:'拍手・歓声',shout:'叫び',sigh:'ため息'};
+                var evList = s.tags_audio_events.split(',');
+                sceneHtml += '<div class="scene-row scene-sub">';
+                sceneHtml += '<span class="scene-label">イベント:</span> ';
+                evList.forEach(function(ev) {
+                    sceneHtml += '<span class="tag-badge event-tag">' + escapeHtml(evLabels[ev] || ev) + '</span> ';
+                });
+                sceneHtml += '</div>';
+            }
+            if (s.tags_audio_music_detected) {
+                sceneHtml += '<div class="scene-row scene-sub">';
+                sceneHtml += '<span class="scene-label">音楽:</span> 検出あり';
+                sceneHtml += '</div>';
+            }
+            sceneHtml += '</div>';
             detailHeader.innerHTML += sceneHtml;
         }
 

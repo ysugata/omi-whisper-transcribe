@@ -269,6 +269,44 @@ class SessionTagger:
                 spatial_conf = int(audio_scene.get("spatial_confidence", 0) * 100)
                 scene_line += f", 空間: {audio_scene['spatial_label']} ({spatial_conf}%)"
             lines.append(scene_line)
+
+            # Noise sources (top 3)
+            noise_sources = audio_scene.get("noise_sources", [])
+            if noise_sources:
+                ns_str = ", ".join(
+                    f"{ns['label']}({int(ns['confidence'] * 100)}%)" for ns in noise_sources[:3]
+                )
+                lines.append(f"  ノイズ源: {ns_str}")
+
+            # Events (top 3)
+            events = audio_scene.get("events", [])
+            if events:
+                ev_str = ", ".join(
+                    f"{ev['label']}({int(ev['confidence'] * 100)}%)" for ev in events[:3]
+                )
+                lines.append(f"  検出イベント: {ev_str}")
+
+            # Speaker count estimate
+            sc = audio_scene.get("speaker_count")
+            if sc and sc.get("estimate"):
+                lines.append(f"  話者数推定: {sc['label']}({int(sc['confidence'] * 100)}%)")
+
+            # Music detection
+            music = audio_scene.get("music")
+            if music and music.get("detected"):
+                music_str = f"  音楽検出: あり({int(music['confidence'] * 100)}%)"
+                if music.get("type_label"):
+                    music_str += f" [{music['type_label']}]"
+                lines.append(music_str)
+
+            # Quality issues
+            quality = audio_scene.get("quality_issues", [])
+            if quality:
+                q_str = ", ".join(
+                    f"{q['label']}({int(q['confidence'] * 100)}%)" for q in quality[:3]
+                )
+                lines.append(f"  品質: {q_str}")
+
             lines.append("")
 
         # Add speaker statistics preamble if voice tags exist

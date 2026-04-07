@@ -56,6 +56,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_audio_scene TEXT,
     tags_audio_scene_spatial TEXT,
     tags_audio_scene_confidence REAL,
+    tags_audio_noise_sources TEXT,
+    tags_audio_events TEXT,
+    tags_audio_music_detected INTEGER DEFAULT 0,
+    tags_audio_speaker_count TEXT,
     tags_tag_source TEXT,
     tags_rag_similarity REAL,
     tags_manually_corrected INTEGER DEFAULT 0,
@@ -78,6 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_decision_required ON sessions(tags_decis
 CREATE INDEX IF NOT EXISTS idx_sessions_conversation_type ON sessions(tags_conversation_type);
 CREATE INDEX IF NOT EXISTS idx_sessions_importance_v2 ON sessions(tags_importance_v2);
 CREATE INDEX IF NOT EXISTS idx_sessions_audio_scene ON sessions(tags_audio_scene);
+CREATE INDEX IF NOT EXISTS idx_sessions_audio_speaker_count ON sessions(tags_audio_speaker_count);
 CREATE INDEX IF NOT EXISTS idx_sessions_manually_corrected ON sessions(tags_manually_corrected);
 CREATE INDEX IF NOT EXISTS idx_sessions_tag_source ON sessions(tags_tag_source);
 """
@@ -113,6 +118,10 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene_spatial TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_audio_scene_confidence REAL",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_noise_sources TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_events TEXT",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_music_detected INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN tags_audio_speaker_count TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_tag_source TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_rag_similarity REAL",
     "ALTER TABLE sessions ADD COLUMN tags_manually_corrected INTEGER DEFAULT 0",
@@ -299,6 +308,18 @@ class Indexer:
             "tags_audio_scene": (session.get("audio_scene") or {}).get("scene_label"),
             "tags_audio_scene_spatial": (session.get("audio_scene") or {}).get("spatial_label"),
             "tags_audio_scene_confidence": (session.get("audio_scene") or {}).get("scene_confidence"),
+            "tags_audio_noise_sources": ",".join(
+                ns["type"] for ns in (session.get("audio_scene") or {}).get("noise_sources", [])
+            ) or None,
+            "tags_audio_events": ",".join(
+                ev["type"] for ev in (session.get("audio_scene") or {}).get("events", [])
+            ) or None,
+            "tags_audio_music_detected": 1 if (
+                (session.get("audio_scene") or {}).get("music", {}).get("detected")
+            ) else 0,
+            "tags_audio_speaker_count": (
+                (session.get("audio_scene") or {}).get("speaker_count", {}).get("estimate")
+            ),
             "tags_tag_source": tags.get("tag_source"),
             "tags_rag_similarity": tags.get("rag_similarity"),
             "tags_manually_corrected": 1 if tags.get("manually_corrected") else 0,
@@ -359,6 +380,8 @@ class Indexer:
                     tags_decision_memo, tags_importance_v2, tags_version,
                     tags_external_audio,
                     tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+                    tags_audio_noise_sources, tags_audio_events,
+                    tags_audio_music_detected, tags_audio_speaker_count,
                     tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
                     tags_review_outcome)
                    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
@@ -373,6 +396,8 @@ class Indexer:
                            :tags_decision_memo, :tags_importance_v2, :tags_version,
                            :tags_external_audio,
                            :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+                           :tags_audio_noise_sources, :tags_audio_events,
+                           :tags_audio_music_detected, :tags_audio_speaker_count,
                            :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
                            :tags_review_outcome)""",
                 info,
@@ -396,6 +421,7 @@ class Indexer:
         conversation_type: str = "", outcome: str = "",
         domain: str = "", importance_v2: str = "",
         audio_scene: str = "",
+        audio_speaker_count: str = "",
     ):
         """Get paginated sessions, optionally filtered by text query and tag filters."""
         offset = (page - 1) * per_page
@@ -455,6 +481,10 @@ class Indexer:
         if audio_scene:
             where_clauses.append("tags_audio_scene = ?")
             params.append(audio_scene)
+
+        if audio_speaker_count:
+            where_clauses.append("tags_audio_speaker_count = ?")
+            params.append(audio_speaker_count)
 
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
