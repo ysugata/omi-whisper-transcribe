@@ -196,7 +196,8 @@ class AudioSceneClassifier:
         """Load audio file using torchaudio, resample to target_sr, return numpy.
 
         Truncates to max_seconds to avoid excessive CPU time on long recordings.
-        Scene classification only needs a representative sample, not the full audio.
+        Normalizes loudness to -16 dBFS so that low-volume chest-mic recordings
+        produce meaningful PANNs scores (trained on YouTube audio at higher levels).
         """
         try:
             import torchaudio
@@ -212,7 +213,14 @@ class AudioSceneClassifier:
             if sr != target_sr:
                 resampler = torchaudio.transforms.Resample(sr, target_sr)
                 waveform = resampler(waveform)
-            return waveform.squeeze(0).numpy()
+            audio = waveform.squeeze(0).numpy()
+            # Loudness normalization to -16 dBFS
+            rms = np.sqrt(np.mean(audio**2))
+            if rms > 1e-10:
+                target_rms = 10 ** (-16.0 / 20)
+                audio = (audio * (target_rms / rms)).astype(np.float32)
+                audio = np.clip(audio, -1.0, 1.0)
+            return audio
         except Exception as e:
             log.warning("AudioSceneClassifier: audio load error: %s", e)
             return None
