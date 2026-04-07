@@ -101,6 +101,16 @@ _WORD_REPEAT_RE = re.compile(
     r'([\u3040-\u9fff]{2,6})[。、.,\s]+'
     r'(?:\1[。、.,\s]*){2,}'
 )
+# Interjection/aizuchi repeats without separators: はいはいはいはい → はい
+_AIZUCHI_REPEAT_RE = re.compile(
+    r'(はい|うん|ああ|えー|おー|そう|ねー|なー|へー){3,}'
+)
+
+# Sentence splitting for long Qwen3-ASR output
+_SENTENCE_SPLIT_RE = re.compile(
+    r'(?<=[。！？!?])\s*|'    # After sentence-ending punctuation
+    r'(?<=\n)\s*'              # After newline
+)
 
 SEGMENT_MAX_DURATION_DEFAULT = 15.0
 
@@ -301,35 +311,70 @@ class Qwen3ASRTranscriber:
             if hasattr(result, 'language'):
                 detected_lang = result.language
 
-            # Apply engine-agnostic filters
-            text = _filter_text(text, term_corrector, phonetic_corrector)
-            if not text:
+            # Qwen3-ASR returns one big text block for the entire audio.
+            # Split into sentences FIRST, then apply filters per-sentence.
+            # This prevents _has_repetitive_kana from discarding the entire
+            # text when only a small portion contains repetitions (e.g. "はいはいはいはい").
+            sentences = _split_into_sentences(text)
+            filtered_sentences = []
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                filtered = _filter_text(sent, term_corrector, phonetic_corrector)
+                if filtered:
+                    filtered_sentences.append(filtered)
+
+            if not filtered_sentences:
                 continue
 
-            # Qwen3-ASR returns a single text per audio input (no segment timestamps).
-            # Always split at sentence boundaries for better granularity.
-            seg_dict = {
-                "text": text,
-                "speaker": "SPEAKER_00",
-                "speaker_id": 0,
-                "start": round(session_offset, 2),
-                "end": round(session_offset + chunk_duration, 2),
-                "is_user": True,
-                "person_id": None,
-            }
-            if detected_lang:
-                seg_dict["language"] = detected_lang
+            # Distribute timestamps proportionally across sentences
+            chars_per_sentence = [len(s) for s in filtered_sentences]
+            total_chars = sum(chars_per_sentence)
+            if total_chars == 0:
+                continue
 
-            # Always split: Qwen3-ASR outputs one big text block.
-            # Use a tighter max_duration (10s) to match Whisper's granularity.
-            split_dur = min(segment_max_duration, 10.0) if segment_max_duration > 0 else 10.0
-            split_segs = _split_long_segment(seg_dict, split_dur)
-            segments_out.extend(split_segs)
+            cur_start = session_offset
+            for i, sent_text in enumerate(filtered_sentences):
+                ratio = chars_per_sentence[i] / total_chars
+                sent_dur = chunk_duration * ratio
+                sent_end = cur_start + sent_dur
+                if i == len(filtered_sentences) - 1:
+                    sent_end = session_offset + chunk_duration
+
+                seg_dict = {
+                    "text": sent_text,
+                    "speaker": "SPEAKER_00",
+                    "speaker_id": 0,
+                    "start": round(cur_start, 2),
+                    "end": round(sent_end, 2),
+                    "is_user": True,
+                    "person_id": None,
+                }
+                if detected_lang:
+                    seg_dict["language"] = detected_lang
+                segments_out.append(seg_dict)
+                cur_start = sent_end
 
         return segments_out
 
 
 # ---- Context leak detection ----
+
+def _split_into_sentences(text: str) -> list[str]:
+    """Split long text into sentences for per-sentence filtering.
+
+    Qwen3-ASR returns one big text block. Splitting before filtering
+    prevents partial repetitions (e.g. "はいはいはい" in one part)
+    from discarding the entire text.
+    """
+    parts = _SENTENCE_SPLIT_RE.split(text)
+    # If no sentence-ending punctuation, split by reasonable length
+    if len(parts) <= 1 and len(text) > 100:
+        # Fall back to splitting at commas/midpoints
+        parts = re.split(r'(?<=[、,])\s*', text)
+    return [p for p in parts if p.strip()]
+
 
 def _is_context_leak(text: str, context_terms: set) -> bool:
     """Detect if output is mostly context terms echoed back.
@@ -382,8 +427,9 @@ def _filter_text(text: str, term_corrector=None, phonetic_corrector=None) -> str
         log.debug("Single-char segment dropped: '%s'", text)
         return ""
 
-    # Repetitive kana (logprob-independent check)
-    if _has_repetitive_kana(text):
+    # Repetitive kana: for short text (<50 chars), drop entirely.
+    # For longer text, only flag — the word-repeat collapse below will clean it.
+    if len(text) < 50 and _has_repetitive_kana(text):
         log.info("Repetitive kana filtered: '%s'", text[:80])
         return ""
 
@@ -450,6 +496,8 @@ def _collapse_word_repeats(text: str) -> str:
     "高松。高松。高松ね。" → "高松ね。"
     """
     result = _WORD_REPEAT_RE.sub(r'\1。', text)
+    # Collapse aizuchi repeats: はいはいはいはい → はい
+    result = _AIZUCHI_REPEAT_RE.sub(r'\1', result)
     # If collapse reduced text to mostly nothing, return cleaned version
     stripped = result.strip()
     if not stripped:
