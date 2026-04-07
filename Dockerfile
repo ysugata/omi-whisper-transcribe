@@ -25,6 +25,9 @@ RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 torchvision==0.21
 RUN pip3 install --no-cache-dir --no-deps qwen-asr>=0.0.6 \
     && pip3 install --no-cache-dir qwen-omni-utils librosa nagisa
 
+# Phonetic correction + text normalization (CPU only, no GPU)
+RUN pip3 install --no-cache-dir pykakasi neologdn
+
 
 COPY omi_whisper_bridge.py .
 COPY model_manager.py .
@@ -50,6 +53,8 @@ COPY segment_screener.py .
 COPY audio_scene_classifier.py .
 COPY vibevoice_transcriber.py .
 COPY transcriber_qwen3asr.py .
+COPY phonetic_corrector.py .
+COPY text_normalizer.py .
 COPY correction_metrics.py .
 COPY sanitize_provider.py .
 COPY sanitize_schema.py .

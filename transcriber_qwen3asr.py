@@ -225,6 +225,7 @@ class Qwen3ASRTranscriber:
         language: str | None = "ja",
         term_corrector=None,
         segment_max_duration: float = SEGMENT_MAX_DURATION_DEFAULT,
+        phonetic_corrector=None,
     ) -> list[dict]:
         """Transcribe pre-loaded audio array.
 
@@ -301,7 +302,7 @@ class Qwen3ASRTranscriber:
                 detected_lang = result.language
 
             # Apply engine-agnostic filters
-            text = _filter_text(text, term_corrector)
+            text = _filter_text(text, term_corrector, phonetic_corrector)
             if not text:
                 continue
 
@@ -352,7 +353,7 @@ def _is_context_leak(text: str, context_terms: set) -> bool:
 
 # ---- Text filtering (engine-agnostic Layer 1 + Layer 2) ----
 
-def _filter_text(text: str, term_corrector=None) -> str:
+def _filter_text(text: str, term_corrector=None, phonetic_corrector=None) -> str:
     """Apply engine-agnostic text filters.
 
     Filters applied:
@@ -360,11 +361,13 @@ def _filter_text(text: str, term_corrector=None) -> str:
     - Unicode replacement char
     - Single-char drop
     - Repetitive kana detection
-    - Character rate (skipped here, needs duration)
+    - Word-level repeat collapse (Qwen3-ASR specific)
     - Hallucination removal
     - Trailing fragment cleanup
     - Punctuation normalization
+    - Text normalization (half/full-width, etc.)
     - Layer 2 term correction
+    - Phonetic similarity correction
     """
     if not text:
         return ""
@@ -405,9 +408,20 @@ def _filter_text(text: str, term_corrector=None) -> str:
     if not text:
         return ""
 
-    # Layer 2: Term correction
+    # Text normalization (half/full-width, duplicate chars, etc.)
+    try:
+        from text_normalizer import normalize as _normalize_text
+        text = _normalize_text(text)
+    except ImportError:
+        pass
+
+    # Layer 2: Term correction (dictionary-based)
     if term_corrector is not None:
         text = term_corrector.correct(text)
+
+    # Layer 2.5: Phonetic similarity correction
+    if phonetic_corrector is not None:
+        text = phonetic_corrector.correct(text)
 
     return text
 

@@ -461,6 +461,35 @@ def main():
     except Exception:
         pass
 
+    # Phonetic corrector (Layer 2.5 — pronunciation-based correction)
+    phonetic_corrector = None
+    try:
+        from phonetic_corrector import PhoneticCorrector
+        glossary = []
+        # Build glossary from hotwords custom + term correction targets
+        try:
+            from hotword_loader import HotwordLoader
+            hl = HotwordLoader(str(CONFIG_DIR))
+            glossary.extend(hl.get_custom_words())
+        except Exception:
+            pass
+        if term_corrector:
+            glossary.extend(term_corrector.list_corrections().values())
+        if glossary:
+            phonetic_corrector = PhoneticCorrector(glossary=glossary, threshold=0.75)
+            print(f"  Phonetic corrector: {len(glossary)} glossary terms")
+    except ImportError:
+        print(f"  {DIM}Phonetic corrector: not available (pykakasi not installed){RESET}")
+
+    # Text normalizer
+    text_normalize = None
+    try:
+        from text_normalizer import normalize as _tn
+        text_normalize = _tn
+        print(f"  Text normalizer: enabled")
+    except ImportError:
+        print(f"  {DIM}Text normalizer: not available{RESET}")
+
     # Process sessions
     results = []
     print(f"\n{BOLD}Processing sessions...{RESET}\n")
@@ -487,10 +516,20 @@ def main():
                 model, wav_path, context=context, language=lang,
             )
 
-            # Apply term correction
-            if term_corrector and qwen_segs:
+            # Apply post-processing pipeline to Qwen3-ASR output
+            if qwen_segs:
                 for seg in qwen_segs:
-                    seg["text"] = term_corrector.correct(seg["text"])
+                    t = seg["text"]
+                    # Text normalization (half/full-width, etc.)
+                    if text_normalize:
+                        t = text_normalize(t)
+                    # Term correction (dictionary)
+                    if term_corrector:
+                        t = term_corrector.correct(t)
+                    # Phonetic correction (pronunciation-based)
+                    if phonetic_corrector:
+                        t = phonetic_corrector.correct(t)
+                    seg["text"] = t
 
             # Compare
             whisper_text = segments_to_text(whisper_segs)
