@@ -271,12 +271,23 @@ class Qwen3ASRTranscriber:
             log.error("Qwen3-ASR transcription failed: %s", e, exc_info=True)
             return []
 
+        # Collect context terms for leak detection
+        context_terms = set()
+        if context:
+            context_terms = {t for t in context[0].split() if len(t) >= 2}
+
         # Parse results
         segments_out = []
         for result in results:
             text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
 
             if not text:
+                continue
+
+            # Context leak detection: if >50% of output chars match context terms,
+            # the model is echoing context instead of transcribing speech.
+            if context_terms and _is_context_leak(text, context_terms):
+                log.info("Context leak detected, dropping: '%s'", text[:80])
                 continue
 
             detected_lang = None
@@ -309,6 +320,28 @@ class Qwen3ASRTranscriber:
             segments_out.extend(split_segs)
 
         return segments_out
+
+
+# ---- Context leak detection ----
+
+def _is_context_leak(text: str, context_terms: set) -> bool:
+    """Detect if output is mostly context terms echoed back.
+
+    When Qwen3-ASR receives context but audio has no/little speech,
+    it sometimes outputs the context terms as transcription.
+    Returns True if >50% of the text (by char count) matches context terms.
+    """
+    if not context_terms or not text:
+        return False
+    matched_chars = 0
+    for term in context_terms:
+        count = text.count(term)
+        matched_chars += count * len(term)
+    text_chars = len(re.sub(r'\s+', '', text))
+    if text_chars == 0:
+        return False
+    ratio = matched_chars / text_chars
+    return ratio > 0.5
 
 
 # ---- Text filtering (engine-agnostic Layer 1 + Layer 2) ----

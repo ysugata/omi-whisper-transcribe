@@ -8,6 +8,7 @@ import pytest
 from transcriber_qwen3asr import (
     Qwen3ASRTranscriber,
     _filter_text,
+    _is_context_leak,
     _remove_hallucinations,
     _clean_trailing_fragments,
     _collapse_word_repeats,
@@ -92,6 +93,24 @@ class TestPunctuationNormalization:
     def test_decimal_preserved(self):
         result = _normalize_punctuation("3.14です")
         assert "3.14" in result
+
+
+class TestContextLeakDetection:
+    def test_full_context_leak(self):
+        terms = {"すき家", "吉野家", "ファミマ", "セブンイレブン"}
+        text = "すき家 吉野家 ファミマ セブンイレブン"
+        assert _is_context_leak(text, terms) is True
+
+    def test_partial_context_ok(self):
+        terms = {"Kubernetes", "Docker"}
+        text = "Kubernetesのデプロイメントを設定する方法について話しました"
+        assert _is_context_leak(text, terms) is False
+
+    def test_no_context(self):
+        assert _is_context_leak("普通のテキスト", set()) is False
+
+    def test_empty_text(self):
+        assert _is_context_leak("", {"term"}) is False
 
 
 class TestCollapseWordRepeats:

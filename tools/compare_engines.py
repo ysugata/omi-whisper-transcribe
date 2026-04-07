@@ -208,13 +208,33 @@ def convert_to_wav_16k(audio_path):
 # ---------------------------------------------------------------------------
 
 def build_hotwords_context():
-    """Build context string from hotwords config for Qwen3-ASR."""
+    """Build context string from hotwords config for Qwen3-ASR.
+
+    Only uses custom words + term correction targets (max 15 short terms)
+    to prevent context leak into transcription output.
+    """
     try:
         from hotword_loader import HotwordLoader
         hl = HotwordLoader(str(CONFIG_DIR))
-        words = hl.get_hotwords_list()
+        # Only custom words (user-curated, high-value terms)
+        words = hl.get_custom_words()
+
+        # Also add term correction targets
+        try:
+            from term_corrector import TermCorrector
+            tc_path = str(CONFIG_DIR / "term_corrections.json")
+            if os.path.exists(tc_path):
+                tc = TermCorrector(tc_path)
+                for v in tc.list_corrections().values():
+                    if v not in words:
+                        words.append(v)
+        except Exception:
+            pass
+
+        # Filter: 2-8 chars, max 10 terms (fewer = less risk of context leak)
+        words = [w for w in words if 2 <= len(w) <= 8][:10]
         if words:
-            return " ".join(words[:100])
+            return " ".join(words)
     except Exception:
         pass
     return ""
