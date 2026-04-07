@@ -192,14 +192,22 @@ class AudioSceneClassifier:
             return None
 
     @staticmethod
-    def _load_audio(audio_path: str, target_sr: int = 32000) -> Optional[np.ndarray]:
-        """Load audio file using torchaudio, resample to target_sr, return numpy."""
+    def _load_audio(audio_path: str, target_sr: int = 32000, max_seconds: int = 60) -> Optional[np.ndarray]:
+        """Load audio file using torchaudio, resample to target_sr, return numpy.
+
+        Truncates to max_seconds to avoid excessive CPU time on long recordings.
+        Scene classification only needs a representative sample, not the full audio.
+        """
         try:
             import torchaudio
             waveform, sr = torchaudio.load(audio_path)
             # Convert to mono
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
+            # Truncate to max_seconds before resampling (cheaper)
+            max_samples = sr * max_seconds
+            if waveform.shape[1] > max_samples:
+                waveform = waveform[:, :max_samples]
             # Resample if needed
             if sr != target_sr:
                 resampler = torchaudio.transforms.Resample(sr, target_sr)

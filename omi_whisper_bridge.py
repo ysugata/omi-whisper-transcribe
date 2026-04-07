@@ -1851,7 +1851,10 @@ async def _batch_combined_tag_task(force: bool = False):
                         with open(session_json, "w") as f:
                             json.dump(sess_data, f, ensure_ascii=False, indent=2)
                         log.info("Audio scene for %s: %s", os.path.basename(sess_dir), result.get("scene_label", "unknown"))
-                    st["audio_scene_processed"] += 1
+                        st["audio_scene_processed"] += 1
+                    else:
+                        log.warning("Audio scene for %s: no classification result", os.path.basename(sess_dir))
+                        st["audio_scene_failed"] += 1
                 except Exception as e:
                     log.error("Audio scene classification failed for %s: %s", sess_dir, e)
                     st["audio_scene_failed"] += 1
