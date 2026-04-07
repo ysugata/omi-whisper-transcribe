@@ -120,6 +120,7 @@ VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "false").lower() in ("tr
 
 # --- 深夜スケジューラ設定 ---
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
+BATCH_MAX_DAYS = int(os.environ.get("BATCH_MAX_DAYS", "7"))  # batch scan range in days (0=unlimited)
 
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
@@ -1247,6 +1248,18 @@ _batch_state = {
 }
 
 
+def _batch_cutoff_date() -> str | None:
+    """Return the earliest date dir name to scan for batch processing.
+
+    Returns None if BATCH_MAX_DAYS is 0 (unlimited).
+    """
+    if BATCH_MAX_DAYS <= 0:
+        return None
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(days=BATCH_MAX_DAYS)
+    return cutoff.strftime("%Y-%m-%d")
+
+
 def _find_undiarized_sessions(force: bool = False) -> list[dict]:
     """RECORDINGS_DIR 配下の未 diarize セッションを古い順に返す。
 
@@ -1256,9 +1269,12 @@ def _find_undiarized_sessions(force: bool = False) -> list[dict]:
     if not base.exists():
         return []
 
+    cutoff = _batch_cutoff_date()
     sessions = []
     for day_dir in sorted(base.iterdir()):
         if not day_dir.is_dir():
+            continue
+        if cutoff and day_dir.name < cutoff:
             continue
         for time_dir in sorted(day_dir.iterdir()):
             if not time_dir.is_dir():
@@ -1420,9 +1436,12 @@ def _find_untagged_sessions(force: bool = False) -> list[dict]:
     if not base.exists():
         return []
 
+    cutoff = _batch_cutoff_date()
     sessions = []
     for day_dir in sorted(base.iterdir()):
         if not day_dir.is_dir():
+            continue
+        if cutoff and day_dir.name < cutoff:
             continue
         for time_dir in sorted(day_dir.iterdir()):
             if not time_dir.is_dir():
@@ -1588,8 +1607,11 @@ def _find_untagged_session_tag_sessions(force: bool = False) -> list[dict]:
     if not recordings.is_dir():
         return sessions
 
+    cutoff = _batch_cutoff_date()
     for day_dir in sorted(recordings.iterdir()):
         if not day_dir.is_dir():
+            continue
+        if cutoff and day_dir.name < cutoff:
             continue
         for time_dir in sorted(day_dir.iterdir()):
             if not time_dir.is_dir():
@@ -1626,8 +1648,11 @@ def _find_unscene_classified_sessions(force: bool = False) -> list[tuple]:
     if not recordings.is_dir():
         return results
 
+    cutoff = _batch_cutoff_date()
     for day_dir in sorted(recordings.iterdir()):
         if not day_dir.is_dir():
+            continue
+        if cutoff and day_dir.name < cutoff:
             continue
         for time_dir in sorted(day_dir.iterdir()):
             if not time_dir.is_dir():
@@ -1647,6 +1672,17 @@ def _find_unscene_classified_sessions(force: bool = False) -> list[tuple]:
 
             if not force and "audio_scene" in sess_data:
                 continue
+
+            # Legacy sessions: already classified before session.json was introduced
+            if not force and not session_json.exists():
+                try:
+                    with open(transcript_path, encoding="utf-8") as f:
+                        tdata = json.load(f)
+                    tags = tdata.get("session", {}).get("tags", {})
+                    if tags.get("external_audio_ratio") is not None:
+                        continue
+                except (json.JSONDecodeError, OSError):
+                    pass
 
             results.append((str(time_dir), sess_data))
 
@@ -1686,9 +1722,18 @@ async def _batch_session_tag_task(force: bool = False):
 
             try:
                 segments = sess["data"].get("segments", [])
+                # Load audio_scene from session.json if available
+                _sess_json_path = Path(sess["transcript_path"]).parent / "session.json"
+                _audio_scene = None
+                if _sess_json_path.exists():
+                    try:
+                        with open(_sess_json_path, encoding="utf-8") as _sf:
+                            _audio_scene = json.load(_sf).get("audio_scene")
+                    except (json.JSONDecodeError, OSError):
+                        pass
                 tags = await loop.run_in_executor(
                     None,
-                    lambda segs=segments: session_tagger.tag_session(segs),
+                    lambda segs=segments, asc=_audio_scene: session_tagger.tag_session(segs, audio_scene=asc),
                 )
 
                 if tags:
@@ -1805,59 +1850,57 @@ async def _batch_combined_tag_task(force: bool = False):
             if voice_sessions:
                 loop = asyncio.get_running_loop()
 
-                for sess in voice_sessions:
-                    if st["cancel_requested"]:
-                        log.info("Combined tag cancelled by user (voice tag phase)")
-                        break
-
-                    st["current_session"] = sess["path"]
+                # Load model once for entire batch
+                async with model_manager.gpu_lock:
+                    inference = await loop.run_in_executor(
+                        None, speaker_filter._load_model
+                    )
                     try:
-                        original_segments = sess["data"]["segments"]
-                        # Voice embedding model (~50MB) coexists with Whisper (~5GB)
-                        # on RTX 3060 12GB, so no need to unload Whisper.
-                        # gpu_lock blocks new WS sessions during processing.
-                        async with model_manager.gpu_lock:
-                            inference = await loop.run_in_executor(
-                                None, speaker_filter._load_model
-                            )
+                        for sess in voice_sessions:
+                            if st["cancel_requested"]:
+                                log.info("Combined tag cancelled by user (voice tag phase)")
+                                break
+
+                            st["current_session"] = sess["path"]
                             try:
+                                original_segments = sess["data"]["segments"]
                                 updated = await loop.run_in_executor(
                                     None,
                                     lambda s=sess: speaker_filter.tag_segments_with_model(
                                         inference, str(s["audio"]), s["data"]["segments"]
                                     ),
                                 )
-                            finally:
-                                await loop.run_in_executor(
-                                    None, lambda: speaker_filter._unload_model(inference)
-                                )
 
-                        # Preserve manually_tagged segments
-                        for i, orig in enumerate(original_segments):
-                            if orig.get("manually_tagged") and i < len(updated):
-                                updated[i] = orig
+                                # Preserve manually_tagged segments
+                                for i, orig in enumerate(original_segments):
+                                    if orig.get("manually_tagged") and i < len(updated):
+                                        updated[i] = orig
 
-                        bak_path = str(sess["transcript_path"]) + ".bak"
-                        shutil.copy2(sess["transcript_path"], bak_path)
+                                bak_path = str(sess["transcript_path"]) + ".bak"
+                                shutil.copy2(sess["transcript_path"], bak_path)
 
-                        data = sess["data"]
-                        data["segments"] = updated
-                        data["session"]["speaker_tagged"] = True
+                                data = sess["data"]
+                                data["segments"] = updated
+                                data["session"]["speaker_tagged"] = True
 
-                        with open(sess["transcript_path"], "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                                with open(sess["transcript_path"], "w", encoding="utf-8") as f:
+                                    json.dump(data, f, ensure_ascii=False, indent=2)
 
-                        st["voice_tag_processed"] += 1
-                        st["processed"] += 1
+                                st["voice_tag_processed"] += 1
+                                st["processed"] += 1
 
-                    except Exception as e:
-                        st["voice_tag_failed"] += 1
-                        st["failed"] += 1
-                        err_msg = f"{sess['path']}: {e}"
-                        st["errors"].append(err_msg)
-                        log.error(f"Combined tag voice-tag error: {err_msg}", exc_info=True)
+                            except Exception as e:
+                                st["voice_tag_failed"] += 1
+                                st["failed"] += 1
+                                err_msg = f"{sess['path']}: {e}"
+                                st["errors"].append(err_msg)
+                                log.error(f"Combined tag voice-tag error: {err_msg}", exc_info=True)
 
-                    await asyncio.sleep(0)
+                            await asyncio.sleep(0)
+                    finally:
+                        await loop.run_in_executor(
+                            None, lambda: speaker_filter._unload_model(inference)
+                        )
         else:
             log.info("Combined tag Phase 1 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
 
@@ -2337,7 +2380,7 @@ async def _nightly_scheduler():
     _nightly_state["enabled"] = True
     _nightly_state["hour"] = hour
     _nightly_state["next_run"] = _calc_next_nightly(hour)
-    log.info("Nightly scheduler: enabled (hour=%d, next=%s)", hour, _nightly_state["next_run"])
+    log.info("Nightly scheduler: enabled (hour=%d, batch_max_days=%d, next=%s)", hour, BATCH_MAX_DAYS, _nightly_state["next_run"])
 
     while True:
         # Sleep until next target time
@@ -2367,29 +2410,44 @@ async def _nightly_scheduler():
         _nightly_state["running"] = True
         _nightly_state["error"] = None
 
+        phase_errors = []
         try:
             # Phase 1: Diarize
             if diarizer is not None:
-                _nightly_state["phase"] = "diarize"
-                log.info("Nightly scheduler: Phase 1 — diarize")
-                await _batch_diarize_task(force=False)
+                try:
+                    _nightly_state["phase"] = "diarize"
+                    log.info("Nightly scheduler: Phase 1 — diarize")
+                    await _batch_diarize_task(force=False)
+                except Exception as e:
+                    log.error("Nightly scheduler: Phase 1 (diarize) error: %s", e, exc_info=True)
+                    phase_errors.append(f"diarize: {e}")
 
-            # Phase 2: Combined tag (voice tag + session tag)
-            _nightly_state["phase"] = "tag"
-            log.info("Nightly scheduler: Phase 2 — combined tag (voice → session)")
-            await _batch_combined_tag_task(force=False)
+            # Phase 2: Combined tag (voice tag + audio scene + session tag)
+            try:
+                _nightly_state["phase"] = "tag"
+                log.info("Nightly scheduler: Phase 2 — combined tag (voice → audio scene → session)")
+                await _batch_combined_tag_task(force=False)
+            except Exception as e:
+                log.error("Nightly scheduler: Phase 2 (combined tag) error: %s", e, exc_info=True)
+                phase_errors.append(f"combined_tag: {e}")
 
             # Phase 3: Monthly taxonomy refinement (1st of month only)
             now_after_tag = datetime.now()
             if taxonomy_refiner and now_after_tag.day == 1:
-                _nightly_state["phase"] = "taxonomy_refine"
-                log.info("Nightly scheduler: Phase 3 — monthly taxonomy refinement")
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, taxonomy_refiner.run)
+                try:
+                    _nightly_state["phase"] = "taxonomy_refine"
+                    log.info("Nightly scheduler: Phase 3 — monthly taxonomy refinement")
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, taxonomy_refiner.run)
+                except Exception as e:
+                    log.error("Nightly scheduler: Phase 3 (taxonomy) error: %s", e, exc_info=True)
+                    phase_errors.append(f"taxonomy: {e}")
 
-            _nightly_state["last_result"] = "success"
+            _nightly_state["last_result"] = "error" if phase_errors else "success"
+            if phase_errors:
+                _nightly_state["error"] = "; ".join(phase_errors)
         except Exception as e:
-            log.error("Nightly scheduler: error: %s", e, exc_info=True)
+            log.error("Nightly scheduler: fatal error: %s", e, exc_info=True)
             _nightly_state["last_result"] = "error"
             _nightly_state["error"] = str(e)
         finally:
