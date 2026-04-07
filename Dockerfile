@@ -16,7 +16,7 @@ RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https
 RUN pip3 install --no-cache-dir --no-deps "pyannote.audio>=4.0.0" whisperx
 # Install their non-torch dependencies
 RUN pip3 install --no-cache-dir pyannote.core pyannote.database pyannote.pipeline pyannote.metrics \
-    asteroid-filterbanks lightning torchmetrics semver \
+    asteroid-filterbanks lightning torchmetrics semver einops \
     av ctranslate2 faster-whisper nltk pandas triton
 
 COPY requirements-docker.txt .
