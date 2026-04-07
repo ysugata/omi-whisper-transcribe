@@ -101,9 +101,18 @@ class SpeakerFilter:
             model = Model.from_pretrained(EMBEDDING_MODEL, token=self._hf_token)
         else:
             model = Model.from_pretrained(EMBEDDING_MODEL, use_auth_token=self._hf_token)
+        # Try requested device, fall back to CPU on driver incompatibility
         device = torch.device(self._device)
-        inference = Inference(model, window="whole", device=device)
-        log.info("Embedding model loaded")
+        try:
+            inference = Inference(model, window="whole", device=device)
+        except RuntimeError as e:
+            if "driver" in str(e).lower() or "cuda" in str(e).lower():
+                log.warning("Embedding model: GPU failed (%s), falling back to CPU", e)
+                device = torch.device("cpu")
+                inference = Inference(model, window="whole", device=device)
+            else:
+                raise
+        log.info("Embedding model loaded (device=%s)", device)
         return inference
 
     @staticmethod
