@@ -205,14 +205,24 @@ QUALITY_CATEGORIES = {
     },
 }
 
-# Default thresholds per dimension
+# Default thresholds per dimension.
+# Tuned for OMI chest-mic recordings (low-volume, speech-dominant).
+# PANNs was trained on YouTube 10s clips — domain mismatch means most extended
+# dimension scores are much lower than for clean studio audio.
+# Empirical score distributions (50-session sample, median/p75/max):
+#   noise_source: 0.031 / 0.072 / 0.406  → threshold 0.15 catches meaningful cases
+#   event:        0.015 / 0.043 / 0.182  → threshold 0.10 catches top ~10%
+#   music:        Noisy OR works well     → 0.40 is fine
+#   speaker_count(conversation=4): max 0.046 → essentially unusable
+#   speaker_count(crowd=68-70):   max 0.389 → only crowd is detectable
+#   quality_issue: max 0.011              → too low, only clipping detection is useful
 DEFAULT_DIMENSION_THRESHOLDS = {
-    "noise_source": 0.25,
-    "event": 0.30,
+    "noise_source": 0.15,
+    "event": 0.10,
     "music_detection": 0.40,
     "music_type": 0.20,
-    "speaker_count": 0.25,
-    "quality_issue": 0.20,
+    "speaker_count": 0.15,
+    "quality_issue": 0.08,
     "clipping_ratio": 0.005,
 }
 
@@ -367,7 +377,10 @@ class AudioSceneClassifier:
     def _load_audio(
         audio_path: str, target_sr: int = 32000, max_seconds: int = 60,
     ) -> Optional[tuple]:
-        """Load audio file using torchaudio, resample to target_sr, return numpy.
+        """Load audio file, resample to target_sr, return numpy.
+
+        Uses soundfile (libsndfile) for I/O — avoids torchaudio/torchcodec
+        FFmpeg compatibility issues. Falls back to librosa if soundfile fails.
 
         Truncates to max_seconds to avoid excessive CPU time on long recordings.
         Normalizes loudness to -16 dBFS so that low-volume chest-mic recordings
@@ -377,23 +390,36 @@ class AudioSceneClassifier:
         metadata_dict contains clipping_ratio measured before normalization.
         """
         try:
-            import torchaudio
-            waveform, sr = torchaudio.load(audio_path)
+            import soundfile as sf
+            audio, sr = sf.read(audio_path, dtype="float32")
+        except Exception:
+            try:
+                import librosa
+                audio, sr = librosa.load(audio_path, sr=None, mono=True)
+            except Exception as e:
+                log.warning("AudioSceneClassifier: audio load error: %s", e)
+                return None
+
+        try:
             # Convert to mono
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+
             # Truncate to max_seconds before resampling (cheaper)
             max_samples = sr * max_seconds
-            if waveform.shape[1] > max_samples:
-                waveform = waveform[:, :max_samples]
-            # Resample if needed
-            if sr != target_sr:
-                resampler = torchaudio.transforms.Resample(sr, target_sr)
-                waveform = resampler(waveform)
-            audio = waveform.squeeze(0).numpy()
+            if len(audio) > max_samples:
+                audio = audio[:max_samples]
 
             # Measure clipping BEFORE loudness normalization
             clipping_ratio = float(np.mean(np.abs(audio) > 0.99))
+
+            # Resample if needed
+            if sr != target_sr:
+                from math import gcd
+                g = gcd(sr, target_sr)
+                up, down = target_sr // g, sr // g
+                from scipy.signal import resample_poly
+                audio = resample_poly(audio, up, down).astype(np.float32)
 
             # Loudness normalization to -16 dBFS
             rms = np.sqrt(np.mean(audio**2))
@@ -405,7 +431,7 @@ class AudioSceneClassifier:
             meta = {"clipping_ratio": clipping_ratio}
             return audio, meta
         except Exception as e:
-            log.warning("AudioSceneClassifier: audio load error: %s", e)
+            log.warning("AudioSceneClassifier: audio processing error: %s", e)
             return None
 
     # ------------------------------------------------------------------

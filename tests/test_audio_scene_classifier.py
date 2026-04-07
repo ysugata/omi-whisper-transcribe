@@ -467,7 +467,7 @@ class TestEvents:
 
     def test_below_threshold_excluded(self):
         classifier = AudioSceneClassifier(enabled=True, threshold=0.3)
-        scores = _make_scores({0: 0.5, 16: 0.2})  # Laughter below 0.3
+        scores = _make_scores({0: 0.5, 16: 0.05})  # Laughter well below 0.10 default
         result = classifier._interpret_scores(scores)
 
         assert result["events"] == []
