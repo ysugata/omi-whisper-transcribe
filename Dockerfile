@@ -20,6 +20,11 @@ RUN pip3 install --no-cache-dir -r requirements-docker.txt
 # Restore torch to cu124 if any dependency overwrote it
 RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
+# Qwen3-ASR: install with --no-deps to avoid pulling conflicting transformers/gradio/flask
+# Only qwen-omni-utils is needed as runtime dependency
+RUN pip3 install --no-cache-dir --no-deps qwen-asr>=0.0.6 \
+    && pip3 install --no-cache-dir qwen-omni-utils librosa
+
 
 COPY omi_whisper_bridge.py .
 COPY model_manager.py .

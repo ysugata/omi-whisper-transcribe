@@ -121,7 +121,7 @@
             <div class="settings-layout">
             <nav class="settings-nav">
                 <div class="settings-nav-category">システム情報</div>
-                <button class="settings-nav-item active" data-tab="whisper-tab">Whisper</button>
+                <button class="settings-nav-item active" data-tab="whisper-tab">ASR Engine</button>
                 <div class="settings-nav-category">文字起こし</div>
                 <button class="settings-nav-item" data-tab="terms-tab">Term Corrections</button>
                 <button class="settings-nav-item" data-tab="hotwords-tab">Hotwords</button>
@@ -138,12 +138,29 @@
 
             <div class="settings-content">
 
-            <!-- Whisper config tab (read-only) -->
+            <!-- ASR Engine config tab -->
             <div id="whisper-tab" class="tab-content active">
-                <h3 style="font-size:1rem;margin-bottom:12px;">Whisper Configuration</h3>
+                <h3 style="font-size:1rem;margin-bottom:12px;">ASR Engine</h3>
+
+                <!-- Engine switcher -->
+                <div style="margin-bottom:16px;padding:12px;border:1px solid var(--border);border-radius:6px;">
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+                        <label style="font-weight:600;font-size:0.9em;">Engine:</label>
+                        <select id="engine-select" style="padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:0.9em;">
+                            <option value="whisper">Whisper (large-v3)</option>
+                            <option value="qwen3asr">Qwen3-ASR 1.7B</option>
+                        </select>
+                        <button id="engine-switch-btn" class="btn btn-primary btn-sm" style="font-size:0.85em;">切り替え</button>
+                        <span id="engine-switch-status" class="save-status" style="font-size:0.85em;"></span>
+                    </div>
+                    <div id="engine-desc" class="text-dim" style="font-size:0.8em;"></div>
+                </div>
+
+                <!-- Config display -->
                 <div id="whisper-loading" class="text-dim" style="padding:12px 0;">読み込み中...</div>
                 <div id="whisper-info" class="hidden">
                     <table class="whisper-config-table" style="width:100%;font-size:0.9em;">
+                        <tr><td>Engine</td><td id="whisper-engine">-</td></tr>
                         <tr><td>Model</td><td id="whisper-model-name">-</td></tr>
                         <tr><td>Compute Type</td><td id="whisper-compute-type">-</td></tr>
                         <tr><td>Status</td><td id="whisper-loaded">-</td></tr>

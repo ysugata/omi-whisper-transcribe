@@ -813,6 +813,11 @@
 
     // --- Whisper config (read-only) ---
 
+    var ENGINE_DESCRIPTIONS = {
+        whisper: "faster-whisper large-v3 — 高精度・Hotwords デコーダバイアス対応 (~5 GB VRAM)",
+        qwen3asr: "Qwen3-ASR 1.7B — 軽量・52言語対応・context boost (~3.4 GB VRAM)"
+    };
+
     function loadWhisperConfig() {
         var loading = document.getElementById("whisper-loading");
         var info = document.getElementById("whisper-info");
@@ -822,6 +827,15 @@
             if (loading) loading.style.display = "none";
             if (info) info.classList.remove("hidden");
             var set = function (id, val) { var el = document.getElementById(id); if (el) el.textContent = val; };
+
+            // Update engine selector
+            var engineSelect = document.getElementById("engine-select");
+            var engineDesc = document.getElementById("engine-desc");
+            var currentEngine = d.engine || "whisper";
+            if (engineSelect) engineSelect.value = currentEngine;
+            if (engineDesc) engineDesc.textContent = ENGINE_DESCRIPTIONS[currentEngine] || "";
+
+            set("whisper-engine", currentEngine);
             set("whisper-model-name", d.model_name || "-");
             set("whisper-compute-type", d.compute_type || "-");
             var statusEl = document.getElementById("whisper-loaded");
@@ -839,8 +853,70 @@
             set("whisper-seg-max", d.segment_max_duration != null ? d.segment_max_duration + "s" : "-");
             set("whisper-normalize", d.normalize_enabled ? "Enabled" : "Disabled");
             set("whisper-noise-reduce", d.noise_reduce_enabled ? "Enabled" : "Disabled");
+
+            // Show/hide Whisper-specific rows based on engine
+            var whisperOnlyRows = ["whisper-compute-type", "whisper-beam-size",
+                "whisper-vad-filter", "whisper-ngram", "whisper-patience", "whisper-logprob"];
+            whisperOnlyRows.forEach(function (id) {
+                var el = document.getElementById(id);
+                if (el && el.parentElement) {
+                    el.parentElement.style.display = (currentEngine === "whisper") ? "" : "none";
+                }
+            });
         }).catch(function () {
-            if (loading) loading.textContent = "Whisper 設定を取得できませんでした";
+            if (loading) loading.textContent = "ASR 設定を取得できませんでした";
+        });
+    }
+
+    // Engine switch button
+    var engineSwitchBtn = document.getElementById("engine-switch-btn");
+    if (engineSwitchBtn) {
+        engineSwitchBtn.addEventListener("click", function () {
+            var select = document.getElementById("engine-select");
+            var status = document.getElementById("engine-switch-status");
+            if (!select) return;
+            var newEngine = select.value;
+
+            if (status) { status.textContent = "切り替え中..."; status.style.color = ""; }
+            engineSwitchBtn.disabled = true;
+
+            fetch("/api/engine/switch", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ engine: newEngine }),
+            })
+            .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+            .then(function (result) {
+                engineSwitchBtn.disabled = false;
+                if (result.ok) {
+                    if (status) {
+                        status.textContent = result.data.message || "切り替え完了";
+                        status.style.color = "#4caf50";
+                    }
+                    // Reload config to reflect new engine
+                    setTimeout(loadWhisperConfig, 500);
+                } else {
+                    if (status) {
+                        status.textContent = result.data.error || "切り替え失敗";
+                        status.style.color = "#f44336";
+                    }
+                }
+                setTimeout(function () { if (status) status.textContent = ""; }, 4000);
+            })
+            .catch(function () {
+                engineSwitchBtn.disabled = false;
+                if (status) { status.textContent = "接続エラー"; status.style.color = "#f44336"; }
+                setTimeout(function () { if (status) status.textContent = ""; }, 4000);
+            });
+        });
+    }
+
+    // Update description on engine select change
+    var engineSelect = document.getElementById("engine-select");
+    if (engineSelect) {
+        engineSelect.addEventListener("change", function () {
+            var desc = document.getElementById("engine-desc");
+            if (desc) desc.textContent = ENGINE_DESCRIPTIONS[this.value] || "";
         });
     }
 

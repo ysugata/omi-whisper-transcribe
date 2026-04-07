@@ -867,6 +867,10 @@ async def handle_whisper_config(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "GET", "/whisper/config")
 
 
+async def handle_engine_switch(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/engine/switch")
+
+
 # ============================================================
 # RAG Classifier プロキシ API
 # ============================================================
@@ -1318,6 +1322,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/audio-scene-labels", handle_audio_scene_labels)
     app.router.add_get("/api/audio-scene/status", handle_audio_scene_status)
     app.router.add_get("/api/whisper/config", handle_whisper_config)
+    app.router.add_post("/api/engine/switch", handle_engine_switch)
     app.router.add_get("/api/sessions/{date}/{time}", handle_api_session_detail)
     app.router.add_get("/audio/{date}/{time}/", handle_audio_auto)
     app.router.add_get("/audio/{date}/{time}/{filename}", handle_audio)

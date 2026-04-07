@@ -2915,8 +2915,9 @@ async def main():
         return web.json_response(model_manager.status())
 
     async def handle_whisper_config(request):
-        return web.json_response({
-            "model_name": WHISPER_MODEL,
+        config = {
+            "engine": ENGINE,
+            "model_name": WHISPER_MODEL if ENGINE == "whisper" else "Qwen/Qwen3-ASR-1.7B",
             "compute_type": COMPUTE_TYPE,
             "language": LANGUAGE or "auto",
             "beam_size": BEAM_SIZE,
@@ -2929,6 +2930,69 @@ async def main():
             "noise_reduce_enabled": NOISE_REDUCE_ENABLED,
             "loaded": model_manager.loaded,
             "session_count": model_manager.session_count,
+        }
+        if ENGINE == "qwen3asr":
+            config["engine_info"] = {
+                "vram_estimate": "~3.4 GB (bfloat16)",
+                "context_boost": HOTWORDS_ENABLED,
+                "prompt_carry": False,
+            }
+        return web.json_response(config)
+
+    async def handle_engine_switch(request):
+        """Switch ASR engine (requires restart to take effect)."""
+        global ENGINE
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        new_engine = body.get("engine", "").lower()
+        if new_engine not in ("whisper", "qwen3asr"):
+            return web.json_response(
+                {"error": f"Invalid engine: {new_engine}. Use 'whisper' or 'qwen3asr'"},
+                status=400,
+            )
+
+        if new_engine == ENGINE:
+            return web.json_response({
+                "status": "no_change",
+                "engine": ENGINE,
+                "message": f"Already using {ENGINE}",
+            })
+
+        if model_manager.session_count > 0:
+            return web.json_response(
+                {"error": "Cannot switch engine while sessions are active"},
+                status=409,
+            )
+
+        old_engine = ENGINE
+
+        # Unload current model
+        if model_manager.loaded:
+            unloaded = await model_manager.unload_model()
+            if not unloaded:
+                return web.json_response(
+                    {"error": "Failed to unload current model"},
+                    status=500,
+                )
+
+        # Switch engine
+        ENGINE = new_engine
+        model_manager._engine = new_engine
+        if new_engine == "whisper":
+            model_manager._model_name = WHISPER_MODEL
+        else:
+            model_manager._model_name = "Qwen/Qwen3-ASR-1.7B"
+
+        log.info(f"Engine switched: {old_engine} -> {new_engine}")
+
+        return web.json_response({
+            "status": "switched",
+            "engine": ENGINE,
+            "message": f"Switched from {old_engine} to {new_engine}. "
+                       "Model will load on next connection.",
         })
 
     async def handle_batch_start(request):
@@ -3876,6 +3940,7 @@ async def main():
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)
     mgmt_app.router.add_get("/whisper/config", handle_whisper_config)
+    mgmt_app.router.add_post("/engine/switch", handle_engine_switch)
     mgmt_app.router.add_post("/diarize/start", handle_batch_start)
     mgmt_app.router.add_get("/diarize/status", handle_batch_status)
     mgmt_app.router.add_post("/diarize/cancel", handle_batch_cancel)
