@@ -1321,6 +1321,7 @@ def _find_undiarized_sessions(force: bool = False) -> list[dict]:
 
 async def _batch_diarize_task(force: bool = False):
     """バッチ話者分離タスク。asyncio.create_task で起動する。"""
+    import gc
     import shutil
 
     _batch_state["running"] = True
@@ -1349,6 +1350,16 @@ async def _batch_diarize_task(force: bool = False):
 
         # Load pyannote pipeline once for entire batch
         async with model_manager.gpu_lock:
+            # OOM対策: バッチ実行中は Whisper を unload して RAM/VRAM を解放。
+            # gpu_lock 保持中なので新規セッションは入ってこない。失敗
+            # (アクティブセッションあり) は無視して続行する。
+            try:
+                await model_manager.unload_model()
+                gc.collect()
+                log.info("Batch diarize: Whisper unloaded to free memory")
+            except Exception as e:
+                log.warning("Batch diarize: Whisper unload skipped: %s", e)
+
             pipeline = await loop.run_in_executor(None, diarizer.load_pipeline)
             try:
                 for sess in sessions:
@@ -1395,9 +1406,13 @@ async def _batch_diarize_task(force: bool = False):
                         _batch_state["errors"].append(err_msg)
                         log.error(f"Batch diarize error: {err_msg}", exc_info=True)
 
+                    # OOM対策: 各セッションで読み込んだ音声バッファ等を即解放
+                    sess["data"] = None
+                    gc.collect()
                     await asyncio.sleep(0)
             finally:
                 await loop.run_in_executor(None, lambda: diarizer.unload_pipeline(pipeline))
+                gc.collect()
 
     except Exception as e:
         log.error(f"Batch diarization task error: {e}", exc_info=True)
@@ -2370,10 +2385,42 @@ _nightly_state = {
     "error": None,
 }
 
+# Persistent state path — survives container restart so missed nightly
+# batches can be detected and caught up.
+_NIGHTLY_STATE_PATH = os.path.join(CONFIG_DIR, "nightly_state.json")
 
-def _calc_next_nightly(hour: int) -> str:
+
+def _load_nightly_persisted_state() -> dict:
+    """Load persisted nightly state from disk. Returns {} if missing/invalid."""
+    try:
+        with open(_NIGHTLY_STATE_PATH, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_nightly_persisted_state() -> None:
+    """Persist last_run / last_result / last_completed_date to disk."""
+    payload = {
+        "last_run": _nightly_state.get("last_run"),
+        "last_result": _nightly_state.get("last_result"),
+        "last_completed_date": _nightly_state.get("last_completed_date"),
+        "error": _nightly_state.get("error"),
+    }
+    try:
+        os.makedirs(os.path.dirname(_NIGHTLY_STATE_PATH), exist_ok=True)
+        tmp = _NIGHTLY_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _NIGHTLY_STATE_PATH)
+    except OSError as e:
+        log.warning("Nightly scheduler: failed to persist state: %s", e)
+
+
+def _calc_next_nightly(hour: int, now: datetime | None = None) -> str:
     """Calculate the next run datetime for the given hour (local time)."""
-    now = datetime.now()
+    if now is None:
+        now = datetime.now()
     today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     if now >= today_target:
         from datetime import timedelta
@@ -2383,30 +2430,73 @@ def _calc_next_nightly(hour: int) -> str:
     return next_run.isoformat()
 
 
+def _should_catch_up_nightly(hour: int, persisted: dict, now: datetime | None = None) -> bool:
+    """Return True if today's nightly window has passed but no successful run
+    is recorded for today — i.e., we missed it (e.g., due to crash/restart).
+
+    A run counts as "done for today" if `last_completed_date` equals today's
+    date in YYYY-MM-DD form.
+    """
+    if now is None:
+        now = datetime.now()
+    today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if now < today_target:
+        return False  # window hasn't opened yet
+    today_str = now.strftime("%Y-%m-%d")
+    return persisted.get("last_completed_date") != today_str
+
+
 async def _nightly_scheduler():
-    """Background task: run diarize + combined tag at NIGHTLY_SCHEDULE_HOUR."""
+    """Background task: run diarize + combined tag at NIGHTLY_SCHEDULE_HOUR.
+
+    Catch-up: on startup, if today's window has already passed and the
+    persisted state shows no completion for today, run immediately. This
+    guarantees that a missed nightly (e.g., container OOM-killed mid-run)
+    is recovered as soon as the bridge comes back up.
+    """
     hour = NIGHTLY_SCHEDULE_HOUR
     if hour <= 0 or hour > 23:
         return
 
+    persisted = _load_nightly_persisted_state()
     _nightly_state["enabled"] = True
     _nightly_state["hour"] = hour
+    _nightly_state["last_run"] = persisted.get("last_run")
+    _nightly_state["last_result"] = persisted.get("last_result")
+    _nightly_state["last_completed_date"] = persisted.get("last_completed_date")
     _nightly_state["next_run"] = _calc_next_nightly(hour)
-    log.info("Nightly scheduler: enabled (hour=%d, batch_max_days=%d, next=%s)", hour, BATCH_MAX_DAYS, _nightly_state["next_run"])
 
+    catch_up = _should_catch_up_nightly(hour, persisted)
+    log.info(
+        "Nightly scheduler: enabled (hour=%d, batch_max_days=%d, next=%s, catch_up=%s, last_completed_date=%s)",
+        hour, BATCH_MAX_DAYS, _nightly_state["next_run"], catch_up,
+        persisted.get("last_completed_date"),
+    )
+
+    first_iteration = True
     while True:
-        # Sleep until next target time
-        now = datetime.now()
-        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if now >= target:
-            from datetime import timedelta
-            target = target + timedelta(days=1)
+        if first_iteration and catch_up:
+            log.info(
+                "Nightly scheduler: catch-up triggered (last_completed_date=%s, now=%s)",
+                persisted.get("last_completed_date"),
+                datetime.now().isoformat(),
+            )
+            sleep_seconds = 0.0
+        else:
+            # Sleep until next target time
+            now = datetime.now()
+            target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if now >= target:
+                from datetime import timedelta
+                target = target + timedelta(days=1)
 
-        _nightly_state["next_run"] = target.isoformat()
-        sleep_seconds = (target - now).total_seconds()
-        log.debug("Nightly scheduler: sleeping %.0f seconds until %s", sleep_seconds, target.isoformat())
+            _nightly_state["next_run"] = target.isoformat()
+            sleep_seconds = (target - now).total_seconds()
+            log.debug("Nightly scheduler: sleeping %.0f seconds until %s", sleep_seconds, target.isoformat())
 
-        await asyncio.sleep(sleep_seconds)
+        first_iteration = False
+        if sleep_seconds > 0:
+            await asyncio.sleep(sleep_seconds)
 
         # Check if any batch is already running
         if (_batch_state.get("running")
@@ -2465,11 +2555,18 @@ async def _nightly_scheduler():
         finally:
             _nightly_state["running"] = False
             _nightly_state["phase"] = None
-            _nightly_state["last_run"] = datetime.now().isoformat()
-            _nightly_state["next_run"] = _calc_next_nightly(hour)
+            now_done = datetime.now()
+            _nightly_state["last_run"] = now_done.isoformat()
+            # Mark today as completed regardless of phase_errors — partial
+            # success still counts so we don't loop catch-up forever on a
+            # persistent failure (next day's run will retry).
+            _nightly_state["last_completed_date"] = now_done.strftime("%Y-%m-%d")
+            _nightly_state["next_run"] = _calc_next_nightly(hour, now_done)
+            _save_nightly_persisted_state()
             log.info(
-                "Nightly scheduler: finished (result=%s, next=%s)",
+                "Nightly scheduler: finished (result=%s, next=%s, completed_date=%s)",
                 _nightly_state["last_result"], _nightly_state["next_run"],
+                _nightly_state["last_completed_date"],
             )
 
 

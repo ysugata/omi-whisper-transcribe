@@ -211,8 +211,14 @@ open http://localhost:8092
 
 | メソッド | パス | 説明 |
 |----------|------|------|
-| GET | `/nightly/status` | スケジューラ状態 (next_run, last_run, running, phase) |
+| GET | `/nightly/status` | スケジューラ状態 (next_run, last_run, running, phase, last_completed_date) |
 | POST | `/nightly/trigger` | 手動即時実行 (話者分離 + タグ付け) |
+
+最後に完了した日付は `config/nightly_state.json` に永続化される。コンテナが
+深夜バッチ実行中にクラッシュ／OOM 等で再起動した場合、起動時に「当日のウィンドウ
+を過ぎているのに今日まだ完了していない」状態を検知して即時 catch-up 実行する。
+バッチ diarize 開始時には Whisper モデルを unload して RAM/VRAM を解放する
+(OOM 対策)。
 
 ### Safe Training Data (匿名化エクスポート)
 

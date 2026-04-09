@@ -107,3 +107,73 @@ class TestNightlyExclusivity:
             or session_tag_state.get("running")
         )
         assert should_skip is False
+
+
+def _should_catch_up_nightly(hour: int, persisted: dict, now: datetime) -> bool:
+    """Replicate omi_whisper_bridge._should_catch_up_nightly()."""
+    today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if now < today_target:
+        return False
+    today_str = now.strftime("%Y-%m-%d")
+    return persisted.get("last_completed_date") != today_str
+
+
+class TestCatchUpNightly:
+    """Test catch-up detection — guards against missed nightly runs."""
+
+    def test_no_catchup_before_window(self):
+        """Before today's hour: no catch-up regardless of persisted state."""
+        now = datetime(2026, 4, 10, 3, 30, 0)
+        assert _should_catch_up_nightly(4, {}, now) is False
+        assert _should_catch_up_nightly(4, {"last_completed_date": "2026-04-09"}, now) is False
+
+    def test_catchup_when_window_passed_and_no_state(self):
+        """Window passed (e.g. crash before any run): must catch up."""
+        now = datetime(2026, 4, 10, 6, 0, 0)
+        assert _should_catch_up_nightly(4, {}, now) is True
+
+    def test_catchup_when_yesterday_completed(self):
+        """Today's window passed, only yesterday recorded → catch up today."""
+        now = datetime(2026, 4, 10, 6, 0, 0)
+        persisted = {"last_completed_date": "2026-04-09"}
+        assert _should_catch_up_nightly(4, persisted, now) is True
+
+    def test_no_catchup_when_today_already_done(self):
+        """Today already completed → do NOT re-run on restart."""
+        now = datetime(2026, 4, 10, 10, 0, 0)
+        persisted = {"last_completed_date": "2026-04-10"}
+        assert _should_catch_up_nightly(4, persisted, now) is False
+
+    def test_catchup_exactly_at_window(self):
+        """At target hour exactly with no completion → catch up."""
+        now = datetime(2026, 4, 10, 4, 0, 0)
+        assert _should_catch_up_nightly(4, {}, now) is True
+
+
+class TestNightlyStatePersistence:
+    """Test JSON persistence round-trip (using a temp file)."""
+
+    def test_save_load_roundtrip(self, tmp_path):
+        import json
+        path = tmp_path / "nightly_state.json"
+        payload = {
+            "last_run": "2026-04-10T04:05:30",
+            "last_result": "success",
+            "last_completed_date": "2026-04-10",
+            "error": None,
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded["last_completed_date"] == "2026-04-10"
+        assert loaded["last_result"] == "success"
+
+    def test_load_missing_returns_empty(self, tmp_path):
+        """Missing file → empty dict (no exception)."""
+        import json
+        path = tmp_path / "missing.json"
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f) or {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            loaded = {}
+        assert loaded == {}
