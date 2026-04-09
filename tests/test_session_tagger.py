@@ -37,7 +37,110 @@ def _make_tagger(mock_openai, response_content, taxonomy=None):
     tagger._taxonomy = taxonomy or dict(_DEFAULT_TAXONOMY)
     tagger._prefilter_enabled = True
     tagger._prefilter_min_matches = 1
+    tagger._rag = None
     return tagger
+
+
+# ---------------------------------------------------------------------------
+# voice_quality + PANNs-blended external_audio_ratio
+# ---------------------------------------------------------------------------
+
+class TestVoiceprintQuality:
+    """Test _compute_voiceprint_quality — the reliability signal."""
+
+    def test_no_similarities_returns_zero(self):
+        """No speaker_similarity fields → quality 0 (voiceprint unavailable)."""
+        segs = [{"text": "a"}, {"text": "b"}]
+        assert SessionTagger._compute_voiceprint_quality(segs) == 0.0
+
+    def test_noise_level_returns_zero(self):
+        """Similarities all in noise floor (~0.1) → quality 0."""
+        segs = [{"speaker_similarity": 0.08}, {"speaker_similarity": 0.12}, {"speaker_similarity": 0.15}]
+        assert SessionTagger._compute_voiceprint_quality(segs) == 0.0
+
+    def test_high_similarity_returns_one(self):
+        """p75 above 0.50 → full quality 1.0."""
+        segs = [{"speaker_similarity": s} for s in [0.55, 0.62, 0.71, 0.68]]
+        assert SessionTagger._compute_voiceprint_quality(segs) == 1.0
+
+    def test_mid_similarity_interpolates(self):
+        """p75 around 0.375 (midpoint) → quality 0.5."""
+        segs = [{"speaker_similarity": s} for s in [0.30, 0.35, 0.375, 0.40]]
+        # p75 idx = max(0, round(4*0.75)-1) = 2 → sorted[2] = 0.375
+        q = SessionTagger._compute_voiceprint_quality(segs)
+        assert abs(q - 0.5) < 0.01
+
+
+class TestExternalAudioBlend:
+    """Test the dynamic blending of voiceprint + PANNs."""
+
+    def _stats(self, unknown_ratio, has_voice=True, voice_quality=0.0, total=10):
+        return {
+            "total": total,
+            "user": int(total * (1 - unknown_ratio)),
+            "unknown": int(total * unknown_ratio),
+            "unknown_ratio": unknown_ratio,
+            "has_voice_tags": has_voice,
+            "voice_quality": voice_quality,
+        }
+
+    def test_no_signals_returns_none(self):
+        stats = self._stats(0.0, has_voice=False)
+        assert SessionTagger._compute_external_audio_ratio(stats, None) is None
+
+    def test_voiceprint_unavailable_panns_media(self):
+        """No voiceprint but PANNs says media → external = 1.0."""
+        stats = self._stats(0.0, has_voice=False)
+        scene = {"scene_label_en": "media"}
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 1.0
+
+    def test_voiceprint_unavailable_panns_conversation(self):
+        """No voiceprint but PANNs says conversation → external = 0.0."""
+        stats = self._stats(0.0, has_voice=False)
+        scene = {"scene_label_en": "conversation"}
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 0.0
+
+    def test_high_quality_voiceprint_dominates(self):
+        """High voice_quality → trust voiceprint even if PANNs disagrees."""
+        stats = self._stats(unknown_ratio=1.0, voice_quality=1.0)
+        scene = {"scene_label_en": "conversation"}
+        # Fully weighted on voiceprint (w_voice=1.0)
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 1.0
+
+    def test_low_quality_voiceprint_yields_to_panns(self):
+        """Broken voiceprint (quality=0) + PANNs=conversation → external = 0.
+        This is the real-world bug: voiceprint falsely marks everything as
+        unknown but PANNs correctly identifies it as a conversation."""
+        stats = self._stats(unknown_ratio=1.0, voice_quality=0.0)
+        scene = {"scene_label_en": "conversation"}
+        # w_voice=0 → fully weighted on PANNs which says 0.0
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 0.0
+
+    def test_low_quality_voiceprint_agrees_with_panns_media(self):
+        """Broken voiceprint + PANNs=media → both agree → 1.0."""
+        stats = self._stats(unknown_ratio=1.0, voice_quality=0.0)
+        scene = {"scene_label_en": "media"}
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 1.0
+
+    def test_mid_quality_blends(self):
+        """voice_quality=0.5, unknown_ratio=1.0, PANNs=conversation → 0.5."""
+        stats = self._stats(unknown_ratio=1.0, voice_quality=0.5)
+        scene = {"scene_label_en": "conversation"}
+        # 0.5*1.0 + 0.5*0.0 = 0.5
+        assert SessionTagger._compute_external_audio_ratio(stats, scene) == 0.5
+
+    def test_no_audio_scene_trusts_voiceprint(self):
+        """If audio_scene missing, we can only use voiceprint → unknown_ratio."""
+        stats = self._stats(unknown_ratio=0.3)
+        result = SessionTagger._compute_external_audio_ratio(stats, None)
+        assert result == 0.3
+
+    def test_audio_scene_without_scene_en(self):
+        """audio_scene with no scene_label_en → treated as unavailable."""
+        stats = self._stats(unknown_ratio=0.4)
+        scene = {"scene_label": "something"}
+        result = SessionTagger._compute_external_audio_ratio(stats, scene)
+        assert result == 0.4
 
 
 VALID_RESPONSE = json.dumps({

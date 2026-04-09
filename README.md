@@ -382,7 +382,20 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 
 **Correction-driven Learning**: Viewer でセッションのドメインタグを手動修正すると、そのセッションの文字起こしテキストと entities から新しいキーワード候補を自動抽出し `config/pending_keyword_suggestions.json` に蓄積します。同じキーワードが複数セッションで検出されると occurrences がインクリメントされます。候補は Settings > Taxonomy の「キーワード候補」セクションで一覧表示され、承認すると `keyword_anchors` に即座に追加、拒否すると非表示になります。
 
-Voice タグ (話者識別) が利用可能な場合、各セグメントの話者情報 (自分/登録者/unknown) を LLM プロンプトに含めて分類精度を向上させます。また、unknown 話者比率 (`external_audio_ratio`) を自動計算し、80% 以上のセッションには「TV/外部音声」バッジを表示し、ドメイン分類を空配列に強制します (TV/ラジオの事業キーワード誤タグ防止)。
+Voice タグ (話者識別) が利用可能な場合、各セグメントの話者情報 (自分/登録者/unknown) を LLM プロンプトに含めて分類精度を向上させます。
+
+**外部音声比率の動的判定**: `external_audio_ratio` は声紋 (voiceprint) と PANNs シーン分類 (`audio_scene`) を動的にブレンドして算出します。
+
+1. セッション内の `speaker_similarity` の p75 から `voice_quality` (0〜1) を計算：
+   - p75 ≥ 0.50 → 1.0 (声紋が確実に user を識別)
+   - p75 ≤ 0.25 → 0.0 (ノイズレベル、声紋が機能していない — 例: 古いモデルのエンロール残り)
+   - 中間は線形補間
+2. PANNs の `scene_label_en` を参照 (`media` → 1.0, `conversation` 等 → 0.0)
+3. 両シグナルを `voice_quality` で重み付け: `ratio = w_voice * unknown_ratio + (1 - w_voice) * pann_media`
+
+これにより、声紋モデルの入れ替え等で声紋比較が壊れていても、PANNs が「会話」と判定したセッションに「TV/外部音声」バッジが誤って付くことはなくなります。`external_audio_ratio >= 0.8` のセッションは従来通り「TV/外部音声」バッジを表示し、ドメイン分類を空配列に強制します。
+
+**声紋モデル変更後の再エンロール**: 声紋の埋め込みモデルを変更した場合、`tools/auto_reenroll_user.py` で自動再エンロールできます。PANNs=会話 かつ single speaker かつ music 未検出のセッションを候補として自動抽出し、既存サンプルをクリアして新モデルで再生成します。
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|

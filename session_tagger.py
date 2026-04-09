@@ -221,7 +221,10 @@ class SessionTagger:
         """Compute speaker statistics from segments."""
         total = len(segments)
         if total == 0:
-            return {"total": 0, "user": 0, "unknown": 0, "unknown_ratio": 0.0, "has_voice_tags": False}
+            return {
+                "total": 0, "user": 0, "unknown": 0, "unknown_ratio": 0.0,
+                "has_voice_tags": False, "voice_quality": 0.0,
+            }
         has_voice = any(s.get("person_name") for s in segments)
         user = sum(1 for s in segments if s.get("is_user"))
         unknown = sum(1 for s in segments if s.get("person_name") == "unknown")
@@ -231,7 +234,88 @@ class SessionTagger:
             "unknown": unknown,
             "unknown_ratio": unknown / total if total > 0 else 0.0,
             "has_voice_tags": has_voice,
+            "voice_quality": SessionTagger._compute_voiceprint_quality(segments),
         }
+
+    @staticmethod
+    def _compute_voiceprint_quality(segments: list[dict]) -> float:
+        """Estimate how well the voiceprint model is identifying speakers
+        in this session.
+
+        Returns a 0..1 score based on the distribution of `speaker_similarity`
+        values across segments. High p75 similarity → voiceprint clearly
+        identifies the user. Near-zero p75 → voiceprint output is essentially
+        noise (e.g., stale enrollment, wrong model, no enrolled speakers).
+
+        Mapping (cosine similarity → quality):
+          p75 >= 0.50  → 1.0  (definitely working)
+          p75 == 0.25  → 0.0  (noise floor)
+          linearly interpolated between
+        """
+        sims = [
+            s.get("speaker_similarity") for s in segments
+            if s.get("speaker_similarity") is not None
+        ]
+        if not sims:
+            return 0.0
+        sims_sorted = sorted(sims)
+        p75_idx = max(0, int(round(len(sims_sorted) * 0.75)) - 1)
+        p75 = sims_sorted[p75_idx]
+        # Map [0.25, 0.50] → [0, 1]
+        if p75 <= 0.25:
+            return 0.0
+        if p75 >= 0.50:
+            return 1.0
+        return (p75 - 0.25) / 0.25
+
+    @staticmethod
+    def _compute_external_audio_ratio(
+        stats: dict,
+        audio_scene: dict | None,
+    ) -> float | None:
+        """Decide the external_audio_ratio for a session by blending the
+        voiceprint signal with the PANNs scene classification.
+
+        Logic:
+          - voice_quality high (>= 0.7): trust voiceprint → unknown_ratio
+          - voice_quality low (<= 0.3):  trust PANNs → 1.0 if media else 0.0
+          - in-between: weighted blend so the more reliable signal dominates
+
+        This is robust against stale/broken voiceprint enrollments — when the
+        cosine similarities are essentially noise, we fall back to PANNs and
+        avoid the catastrophic "tag everything as TV" failure mode.
+
+        Returns None if neither signal is available.
+        """
+        has_voice = stats.get("has_voice_tags", False)
+        voice_quality = stats.get("voice_quality", 0.0)
+        unknown_ratio = stats.get("unknown_ratio", 0.0)
+
+        # Extract PANNs media signal
+        pann_media = None
+        if audio_scene:
+            scene_en = audio_scene.get("scene_label_en")
+            if scene_en in ("media", "conversation", "telephone", "silence", "noise"):
+                pann_media = 1.0 if scene_en == "media" else 0.0
+
+        # Neither signal available
+        if not has_voice and pann_media is None:
+            return None
+
+        # Voiceprint unavailable → trust PANNs alone
+        if not has_voice:
+            return pann_media
+
+        # PANNs unavailable → trust voiceprint alone
+        if pann_media is None:
+            return round(unknown_ratio, 2)
+
+        # Both available — blend based on voiceprint quality
+        # voice_quality 1.0 → fully voiceprint, 0.0 → fully PANNs
+        w_voice = max(0.0, min(1.0, voice_quality))
+        w_pann = 1.0 - w_voice
+        blended = w_voice * unknown_ratio + w_pann * pann_media
+        return round(blended, 2)
 
     @staticmethod
     def _apply_monologue_heuristic(tags: dict, stats: dict) -> dict:
@@ -511,14 +595,14 @@ class SessionTagger:
             tags["rag_similarity"] = round(rag_result["top_similarity"], 4)
             # Apply speaker-derived metadata
             stats = self._compute_speaker_stats(segments)
-            if stats["has_voice_tags"]:
-                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
-                if stats["unknown_ratio"] >= 0.8:
-                    tags["domains"] = []
-                # Monologue heuristic: user_ratio >= 0.8 → 独り言・メモ
+            ext_ratio = self._compute_external_audio_ratio(stats, audio_scene)
+            tags["external_audio_ratio"] = ext_ratio
+            if ext_ratio is not None and ext_ratio >= 0.8:
+                tags["domains"] = []
+            # Monologue heuristic: user_ratio >= 0.8 → 独り言・メモ
+            # (only meaningful when voiceprint is reliable)
+            if stats["has_voice_tags"] and stats.get("voice_quality", 0.0) >= 0.5:
                 tags = self._apply_monologue_heuristic(tags, stats)
-            else:
-                tags["external_audio_ratio"] = None
             # RAG does not produce summary/entities/decision_memo
             tags.setdefault("summary", "")
             tags.setdefault("entities", [])
@@ -562,13 +646,11 @@ class SessionTagger:
 
             # Add speaker-derived metadata
             stats = self._compute_speaker_stats(segments)
-            if stats["has_voice_tags"]:
-                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
-                # Force empty domains for external audio sessions
-                if stats["unknown_ratio"] >= 0.8:
-                    tags["domains"] = []
-            else:
-                tags["external_audio_ratio"] = None
+            ext_ratio = self._compute_external_audio_ratio(stats, audio_scene)
+            tags["external_audio_ratio"] = ext_ratio
+            # Force empty domains for external audio sessions
+            if ext_ratio is not None and ext_ratio >= 0.8:
+                tags["domains"] = []
 
             log.info(
                 f"SessionTagger[LLM]: type={tags['conversation_type']}, "
@@ -599,7 +681,7 @@ class SessionTagger:
         system_prompt = self._build_system_prompt()
         return (system_prompt, session_text)
 
-    def validate_and_save_tags(self, raw_json: str, segments: list[dict] | None = None) -> Optional[dict]:
+    def validate_and_save_tags(self, raw_json: str, segments: list[dict] | None = None, audio_scene: dict | None = None) -> Optional[dict]:
         """Parse and validate raw JSON from Batch API response.
 
         Returns validated tags dict with tagged_at, or None on parse error.
@@ -614,13 +696,11 @@ class SessionTagger:
         # Add speaker-derived metadata if segments provided
         if segments:
             stats = self._compute_speaker_stats(segments)
-            if stats["has_voice_tags"]:
-                tags["external_audio_ratio"] = round(stats["unknown_ratio"], 2)
-                # Force empty domains for external audio sessions
-                if stats["unknown_ratio"] >= 0.8:
-                    tags["domains"] = []
-            else:
-                tags["external_audio_ratio"] = None
+            ext_ratio = self._compute_external_audio_ratio(stats, audio_scene)
+            tags["external_audio_ratio"] = ext_ratio
+            # Force empty domains for external audio sessions
+            if ext_ratio is not None and ext_ratio >= 0.8:
+                tags["domains"] = []
         else:
             tags["external_audio_ratio"] = None
 
