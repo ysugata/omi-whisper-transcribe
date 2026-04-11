@@ -2673,8 +2673,9 @@
                 var renamed = data.renamed || 0;
                 taxonomyStatusEl.textContent = "Saved!" + (renamed > 0 ? " (" + renamed + " セッション更新)" : "");
                 taxonomyStatusEl.style.color = "#2ecc71";
-                // Refresh filter dropdowns
+                // Refresh filter dropdowns and session list
                 loadTaxonomy();
+                loadPage(currentPage);
                 // Check impact (truly deleted values, not renames)
                 if (data.impact && Object.keys(data.impact).length > 0) {
                     var impactMsg = "以下のタグ値が使用中のセッションから削除されました:\n";
