@@ -1165,14 +1165,13 @@ def transcribe_audio(
         if not text:
             continue
 
-        # Layer 2: 用語補正
-        text = term_corrector.correct(text)
-
-        # Layer 2.5: テキスト正規化 + 音韻補正
+        # Layer 2: テキスト正規化のみ (半角/全角統一)
+        # 用語補正 (term_corrector) と音韻補正 (phonetic_corrector) はLLM前から
+        # 削除。文脈なしの辞書置換はLLMの入力を汚染し、ドメイン推論を妨害する。
+        # 用語情報は session_glossary としてLLMプロンプトに渡され、LLMが文脈を
+        # 見て適用するかどうかを判断する。
         if text_normalizer_fn is not None:
             text = text_normalizer_fn(text)
-        if phonetic_corrector_instance is not None:
-            text = phonetic_corrector_instance.correct(text)
 
         seg_dict = {
             "text": text,
