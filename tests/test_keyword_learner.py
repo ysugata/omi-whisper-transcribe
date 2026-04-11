@@ -77,8 +77,9 @@ class TestExtractCandidates:
     def test_extract_candidates_katakana(self, tmp_env):
         learner, _, _, _ = tmp_env
         all_anchors = {"水中超音波": ["超音波"]}
+        # Words must appear 2+ times to pass frequency filter
         candidates = learner._extract_candidates(
-            text="キャビテーションが発生し、インピーダンスが変化した",
+            text="キャビテーションが発生し、インピーダンスが変化した。キャビテーションとインピーダンスの関係",
             entities=[],
             target_domain="水中超音波",
             all_anchors=all_anchors,
@@ -89,13 +90,14 @@ class TestExtractCandidates:
     def test_extract_candidates_english(self, tmp_env):
         learner, _, _, _ = tmp_env
         all_anchors = {"AI": ["ChatGPT"]}
+        # Proper nouns (capitalized, 4+ chars), appearing 2+ times
         candidates = learner._extract_candidates(
-            text="We used RAG with BERT model",
+            text="We used Llama with Llama model for fine-tuning",
             entities=[],
             target_domain="AI",
             all_anchors=all_anchors,
         )
-        assert "RAG" in candidates or "BERT" in candidates
+        assert "Llama" in candidates
 
     def test_extract_excludes_existing_anchors(self, tmp_env):
         learner, _, _, _ = tmp_env

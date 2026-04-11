@@ -18,14 +18,51 @@ from typing import List, Optional
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Stop-words: common katakana particles / filler that are not domain keywords
+# Stop-words: generic words that are NOT useful as domain-specific keywords
 # ---------------------------------------------------------------------------
 _KATAKANA_STOPWORDS = {
+    # Filler / particles
     "デス", "マス", "ナイ", "ダケ", "タチ", "コト", "モノ", "トコロ",
     "ソレ", "コレ", "アレ", "ドコ", "ナニ", "ダレ", "イツ", "ドウ",
     "ヤッパリ", "チョット", "スゴイ", "スゴク", "ホント", "ホントウ",
     "タブン", "ゼンゼン", "ゼッタイ", "マジ", "ケド", "ダカラ",
     "ソウ", "アノ", "エット", "ネー", "ハイ", "ウン",
+    # Generic katakana words (technology, business, daily)
+    "プラス", "マイナス", "メイン", "メール", "リンク", "サーバー",
+    "システム", "データ", "ファイル", "フォルダ", "ダウンロード",
+    "アップロード", "アクセス", "チャンネル", "コントロール",
+    "パスワード", "アカウント", "プロフィール", "コメント",
+    "グループ", "メンバー", "リスト", "ページ", "サイト",
+    "ボタン", "クリック", "チェック", "スタート", "ストップ",
+    "オープン", "クローズ", "セット", "リセット", "アップデート",
+    "バージョン", "パーセンテージ", "コスト", "プラン", "プラム",
+    "フレンド", "ワット", "クォーター", "デイラリー",
+    "ポイント", "レベル", "タイプ", "モード", "ステータス",
+    "エラー", "イベント", "テスト", "サンプル", "ケース",
+    "プロセス", "メソッド", "パターン", "モデル", "ルール",
+    "インポイント", "コンソール", "サーブ", "リロード", "リリース",
+}
+
+_ENGLISH_STOPWORDS = {
+    # Common English words that slip through from ASR
+    "the", "and", "for", "that", "this", "with", "from", "have", "has",
+    "not", "are", "was", "were", "been", "being", "will", "would", "could",
+    "should", "can", "may", "might", "shall", "must", "need",
+    "get", "got", "set", "let", "put", "run", "use", "try", "ask",
+    "say", "said", "see", "saw", "take", "took", "make", "made",
+    "all", "any", "some", "many", "much", "more", "most", "other",
+    "also", "just", "only", "very", "really", "actually", "basically",
+    "like", "well", "then", "than", "when", "where", "what", "which",
+    "who", "how", "why", "about", "after", "before", "into", "over",
+    # Generic tech words not domain-specific
+    "http", "https", "www", "com", "org", "net", "html", "css",
+    "api", "url", "app", "web", "log", "dev", "src", "bin",
+    "system", "server", "client", "user", "data", "file", "code",
+    "test", "debug", "error", "null", "true", "false", "type",
+    "click", "link", "page", "site", "view", "list", "item",
+    "start", "stop", "open", "close", "save", "load", "send",
+    "Chrome", "Google", "YouTube", "Facebook", "Twitter", "Amazon",
+    "activate", "download", "upload", "update", "install",
 }
 
 
@@ -178,18 +215,27 @@ class KeywordLearner:
         target_domain: str,
         all_anchors: dict,
     ) -> List[str]:
-        """Extract keyword candidates for *target_domain* from text/entities."""
+        """Extract keyword candidates for *target_domain* from text/entities.
+
+        Quality filters:
+        - Katakana words must be 4+ chars (3-char katakana is almost always noise)
+        - English words must be 4+ chars and start with uppercase (proper nouns)
+        - Must appear 2+ times in the text (frequency filter)
+        - Excluded by stop-word lists and cross-domain check
+        """
         existing = set(all_anchors.get(target_domain, []))
-        # Build set of all keywords across ALL domains for cross-domain check
         other_domain_keywords: set = set()
         for dom, kws in all_anchors.items():
             if dom != target_domain:
                 other_domain_keywords.update(kws)
 
+        # Pre-compute word frequencies for quality filtering
+        text_lower = text.lower()
+
         candidates: list = []
         seen: set = set()
 
-        def _add(word: str):
+        def _add(word: str, min_occurrences: int = 2):
             w = word.strip()
             if not w or len(w) <= 2:
                 return
@@ -199,28 +245,34 @@ class KeywordLearner:
                 return
             if w in _KATAKANA_STOPWORDS:
                 return
+            if w.lower() in _ENGLISH_STOPWORDS or w in _ENGLISH_STOPWORDS:
+                return
+            # Frequency check: must appear at least min_occurrences times
+            if min_occurrences > 1 and text.count(w) < min_occurrences:
+                return
             seen.add(w)
             candidates.append(w)
 
-        # 1. Entities
+        # 1. Entities (trusted source — lower threshold)
         for ent in entities:
-            if isinstance(ent, str):
-                _add(ent)
+            if isinstance(ent, str) and len(ent) >= 3:
+                _add(ent, min_occurrences=1)
 
-        # 2. Text scan — katakana words (3+ chars)
-        for m in re.findall(r"[\u30A0-\u30FF]{3,}", text):
+        # 2. Katakana words (4+ chars to avoid noise like プラス, メイン)
+        for m in re.findall(r"[\u30A0-\u30FF]{4,}", text):
             _add(m)
 
-        # 3. Text scan — English words (3+ chars)
-        for m in re.findall(r"[A-Za-z]{3,}", text):
+        # 3. English proper nouns (capitalized, 4+ chars)
+        for m in re.findall(r"[A-Z][a-zA-Z]{3,}", text):
             _add(m)
 
-        # 4. Kanji + katakana / katakana + kanji compound words
+        # 4. Kanji + katakana compound words (likely domain-specific)
         for m in re.findall(
-            r"[\u4E00-\u9FFF]+[\u30A0-\u30FF]+|[\u30A0-\u30FF]+[\u4E00-\u9FFF]+",
+            r"[\u4E00-\u9FFF]+[\u30A0-\u30FF]{2,}|[\u30A0-\u30FF]{2,}[\u4E00-\u9FFF]+",
             text,
         ):
-            _add(m)
+            if len(m) >= 4:
+                _add(m)
 
         return candidates
 
