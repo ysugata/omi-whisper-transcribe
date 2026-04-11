@@ -582,7 +582,7 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
                     except Exception:
                         pass
 
-    # Apply renames to existing sessions in DB
+    # Apply renames to transcript.json files (source of truth) and DB
     renames = body.get("renames", {})
     renamed_count = 0
     if renames and isinstance(renames, dict):
@@ -593,6 +593,7 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
             "domains": "tags_domains",
             "importance": "tags_importance_v2",
         }
+        # Collect affected sessions from DB, then update JSON + DB together
         for axis, mapping in renames.items():
             col = axis_col_map.get(axis)
             if not col or not isinstance(mapping, dict):
@@ -601,19 +602,59 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
                 if not old_val or not new_val or old_val == new_val:
                     continue
                 try:
+                    # Find affected sessions
                     if axis in ("outcomes", "domains"):
-                        # Multi-select: stored as comma-separated, use REPLACE
                         cursor = await indexer._db.execute(
+                            f"SELECT date, time FROM sessions WHERE {col} LIKE ?",
+                            ["%" + old_val + "%"],
+                        )
+                    else:
+                        cursor = await indexer._db.execute(
+                            f"SELECT date, time FROM sessions WHERE {col} = ?",
+                            [old_val],
+                        )
+                    rows = await cursor.fetchall()
+
+                    # Update each transcript.json
+                    for row in rows:
+                        tpath = Path(RECORDINGS_DIR) / row["date"] / row["time"] / "transcript.json"
+                        if not tpath.exists():
+                            continue
+                        try:
+                            with open(tpath, "r", encoding="utf-8") as f:
+                                tdata = json.load(f)
+                            tags = tdata.get("session", {}).get("tags", {})
+                            changed = False
+                            if axis in ("outcomes", "domains"):
+                                vals = tags.get(axis, [])
+                                if isinstance(vals, list) and old_val in vals:
+                                    tags[axis] = [new_val if v == old_val else v for v in vals]
+                                    changed = True
+                            else:
+                                # conversation_type / importance: single string
+                                if tags.get(axis) == old_val:
+                                    tags[axis] = new_val
+                                    changed = True
+                            if changed:
+                                tmp = str(tpath) + ".tmp"
+                                with open(tmp, "w", encoding="utf-8") as f:
+                                    json.dump(tdata, f, ensure_ascii=False, indent=2)
+                                os.replace(tmp, str(tpath))
+                                renamed_count += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to update {tpath}: {e}")
+
+                    # Also update DB for immediate consistency
+                    if axis in ("outcomes", "domains"):
+                        await indexer._db.execute(
                             f"UPDATE sessions SET {col} = REPLACE({col}, ?, ?) WHERE {col} LIKE ?",
                             [old_val, new_val, "%" + old_val + "%"],
                         )
                     else:
-                        # Single-select: exact match
-                        cursor = await indexer._db.execute(
+                        await indexer._db.execute(
                             f"UPDATE sessions SET {col} = ? WHERE {col} = ?",
                             [new_val, old_val],
                         )
-                    renamed_count += cursor.rowcount
                 except Exception as e:
                     logger.warning(f"Failed to rename {axis} '{old_val}' -> '{new_val}': {e}")
         if renamed_count > 0:
