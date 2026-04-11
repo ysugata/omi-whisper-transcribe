@@ -320,14 +320,13 @@ class LLMPipeline:
             return CandidateResult(candidates=[])
 
         # Build user message
+        # Use only session_glossary (text-matched terms) to avoid domain bias.
+        # known_terms are NOT added here — they are already reflected in
+        # session_glossary via _build_session_glossary() which filters by
+        # substring match against actual segment text.
         parts = []
-        all_terms = list(session_glossary or [])
-        if known_terms:
-            for t in known_terms:
-                if t not in all_terms:
-                    all_terms.append(t)
-        if all_terms:
-            parts.append(f"参考用語リスト: {', '.join(all_terms[:50])}")
+        if session_glossary:
+            parts.append(f"参考用語リスト: {', '.join(session_glossary[:50])}")
         parts.append(numbered_text)
         user_msg = "\n\n".join(parts)
 
@@ -382,14 +381,9 @@ class LLMPipeline:
         # Build user message
         parts = []
 
-        # Glossary
-        all_terms = list(session_glossary or [])
-        if known_terms:
-            for t in known_terms:
-                if t not in all_terms:
-                    all_terms.append(t)
-        if all_terms:
-            parts.append(f"参考用語リスト: {', '.join(all_terms[:50])}")
+        # Glossary — only text-matched terms to avoid domain bias
+        if session_glossary:
+            parts.append(f"参考用語リスト: {', '.join(session_glossary[:50])}")
 
         # 3-A candidates
         if candidates and candidates.candidates:

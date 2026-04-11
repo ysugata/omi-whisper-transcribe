@@ -599,6 +599,7 @@ class TestProcessSegments:
 
 class TestSessionGlossary:
     def test_glossary_in_message(self):
+        """Only session_glossary (text-matched terms) should appear in prompt."""
         resp_b = json.dumps({"corrections": []})
         pipeline = _make_pipeline([resp_b], stages="B")
         segs = _make_segments(["テストテキスト"])
@@ -611,22 +612,22 @@ class TestSessionGlossary:
         user_msg = call_args[1]["messages"][1]["content"]
         assert "Kubernetes" in user_msg
         assert "Grafana" in user_msg
-        assert "Docker" in user_msg
+        # known_terms NOT in session_glossary should NOT appear (avoid domain bias)
+        assert "Docker" not in user_msg
 
-    def test_dedup_terms(self):
-        """known_terms already in glossary should not duplicate."""
+    def test_no_glossary(self):
+        """No glossary when session_glossary is empty."""
         resp_b = json.dumps({"corrections": []})
         pipeline = _make_pipeline([resp_b], stages="B")
         segs = _make_segments(["テスト"])
         pipeline.correct_notation(
             segs,
             known_terms=["Docker", "Grafana"],
-            session_glossary=["Docker", "Kubernetes"],
+            session_glossary=[],
         )
         call_args = pipeline._client.chat.completions.create.call_args
         user_msg = call_args[1]["messages"][1]["content"]
-        # Docker should appear once
-        assert user_msg.count("Docker") == 1
+        assert "参考用語リスト" not in user_msg
 
 
 # ---------------------------------------------------------------------------
