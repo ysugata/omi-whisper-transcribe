@@ -2267,7 +2267,6 @@
     // ============================================================
 
     var taxonomyEditCache = null;
-    var taxonomyRenames = {};  // { axis: { oldVal: newVal, ... } }
 
     var taxonomyLoadingEl = document.getElementById("taxonomy-loading");
     var taxonomyErrorEl = document.getElementById("taxonomy-error");
@@ -2289,7 +2288,6 @@
             return r.json();
         }).then(function (data) {
             taxonomyEditCache = JSON.parse(JSON.stringify(data));
-            taxonomyRenames = {};
             if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
             if (taxonomyEditorEl) taxonomyEditorEl.classList.remove("hidden");
             renderTaxonomySettings();
@@ -2382,36 +2380,7 @@
 
                         // Save immediately to server
                         renderTaxonomySettings();
-                        if (taxonomyStatusEl) {
-                            taxonomyStatusEl.textContent = "保存中...";
-                            taxonomyStatusEl.style.color = "";
-                        }
-                        fetch("/api/tag-taxonomy", {
-                            method: "PUT",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ taxonomy: taxonomyEditCache, renames: renames }),
-                        }).then(function (r) { return r.json(); }).then(function (data) {
-                            if (data.error) {
-                                if (taxonomyStatusEl) {
-                                    taxonomyStatusEl.textContent = "Error: " + data.error;
-                                    taxonomyStatusEl.style.color = "#e74c3c";
-                                }
-                                return;
-                            }
-                            var renamed = data.renamed || 0;
-                            if (taxonomyStatusEl) {
-                                taxonomyStatusEl.textContent = oldVal + " → " + newVal + " に変更" + (renamed > 0 ? " (" + renamed + " セッション更新)" : "");
-                                taxonomyStatusEl.style.color = "#2ecc71";
-                                setTimeout(function () { taxonomyStatusEl.textContent = ""; }, 5000);
-                            }
-                            loadTaxonomy();
-                            loadPage(currentPage);
-                        }).catch(function (err) {
-                            if (taxonomyStatusEl) {
-                                taxonomyStatusEl.textContent = "Error: " + err.message;
-                                taxonomyStatusEl.style.color = "#e74c3c";
-                            }
-                        });
+                        saveTaxonomyNow(oldVal + " → " + newVal, renames);
                     }
 
                     itemDiv.querySelector(".taxonomy-edit-ok").addEventListener("click", applyEdit);
@@ -2430,6 +2399,7 @@
                 delBtns[i].addEventListener("click", function () {
                     var ak = this.getAttribute("data-axis");
                     var ai = parseInt(this.getAttribute("data-idx"), 10);
+                    var removed = taxonomyEditCache[ak][ai];
                     taxonomyEditCache[ak].splice(ai, 1);
                     // If a domain was removed, also remove its keyword_anchors entry
                     if (ak === "domains" && taxonomyEditCache.keyword_anchors) {
@@ -2439,6 +2409,7 @@
                         removedDomain.forEach(function (d) { delete taxonomyEditCache.keyword_anchors[d]; });
                     }
                     renderTaxonomySettings();
+                    saveTaxonomyNow(removed + " を削除");
                 });
             }
         });
@@ -2621,10 +2592,12 @@
             delBtns[i].addEventListener("click", function () {
                 var d = this.getAttribute("data-domain");
                 var idx = parseInt(this.getAttribute("data-idx"), 10);
+                var removedKw = (taxonomyEditCache.keyword_anchors[d] || [])[idx];
                 if (taxonomyEditCache.keyword_anchors[d]) {
                     taxonomyEditCache.keyword_anchors[d].splice(idx, 1);
                 }
                 renderKeywordAnchors();
+                saveTaxonomyNow(d + ": " + removedKw + " を削除");
             });
         }
 
@@ -2643,6 +2616,7 @@
                 }
                 input.value = "";
                 renderKeywordAnchors();
+                saveTaxonomyNow(d + ": " + val + " を追加");
             });
         }
 
@@ -2680,59 +2654,64 @@
             }
             input.value = "";
             renderTaxonomySettings();
+            saveTaxonomyNow(val + " を追加");
         });
     }
 
-    // Save button
-    var taxonomySaveBtn = document.getElementById("taxonomy-save-btn");
+    // Common save function for all taxonomy mutations
     var taxonomyStatusEl = document.getElementById("taxonomy-status");
-    if (taxonomySaveBtn) {
-        taxonomySaveBtn.addEventListener("click", function () {
-            if (!taxonomyEditCache) return;
-            taxonomySaveBtn.disabled = true;
-            taxonomyStatusEl.textContent = "Saving...";
+    function saveTaxonomyNow(statusMsg, renames) {
+        if (!taxonomyEditCache) return;
+        if (taxonomyStatusEl) {
+            taxonomyStatusEl.textContent = "保存中...";
             taxonomyStatusEl.style.color = "";
-            fetch("/api/tag-taxonomy", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ taxonomy: taxonomyEditCache, renames: taxonomyRenames }),
-            }).then(function (r) { return r.json(); }).then(function (data) {
-                if (data.error) {
+        }
+        var payload = { taxonomy: taxonomyEditCache };
+        if (renames) payload.renames = renames;
+        fetch("/api/tag-taxonomy", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            if (data.error) {
+                if (taxonomyStatusEl) {
                     taxonomyStatusEl.textContent = "Error: " + data.error;
                     taxonomyStatusEl.style.color = "#e74c3c";
-                    return;
                 }
-                taxonomyRenames = {};
-                var renamed = data.renamed || 0;
-                taxonomyStatusEl.textContent = "Saved!" + (renamed > 0 ? " (" + renamed + " セッション更新)" : "");
+                return;
+            }
+            var renamed = data.renamed || 0;
+            var msg = statusMsg || "保存しました";
+            if (renamed > 0) msg += " (" + renamed + " セッション更新)";
+            if (taxonomyStatusEl) {
+                taxonomyStatusEl.textContent = msg;
                 taxonomyStatusEl.style.color = "#2ecc71";
-                // Refresh filter dropdowns and session list
-                loadTaxonomy();
-                loadPage(currentPage);
-                // Check impact (truly deleted values, not renames)
-                if (data.impact && Object.keys(data.impact).length > 0) {
-                    var impactMsg = "以下のタグ値が使用中のセッションから削除されました:\n";
-                    for (var k in data.impact) {
-                        impactMsg += "  " + k + ": " + data.impact[k] + " セッション\n";
-                    }
-                    impactMsg += "\nこれらのセッションを新しいタクソノミーで再タグ付けしますか？";
-                    if (confirm(impactMsg)) {
-                        fetch("/api/session-tags/start", {
-                            method: "POST",
-                        }).then(function (r) { return r.json(); }).then(function (rd) {
-                            taxonomyStatusEl.textContent = "Saved + retag started!";
+                setTimeout(function () { taxonomyStatusEl.textContent = ""; }, 5000);
+            }
+            loadTaxonomy();
+            loadPage(currentPage);
+            // Impact: truly deleted values
+            if (data.impact && Object.keys(data.impact).length > 0) {
+                var impactMsg = "以下のタグ値が使用中のセッションから削除されました:\n";
+                for (var k in data.impact) {
+                    impactMsg += "  " + k + ": " + data.impact[k] + " セッション\n";
+                }
+                impactMsg += "\nこれらのセッションを新しいタクソノミーで再タグ付けしますか？";
+                if (confirm(impactMsg)) {
+                    fetch("/api/session-tags/start", { method: "POST" })
+                        .then(function (r) { return r.json(); })
+                        .then(function () {
+                            if (taxonomyStatusEl) taxonomyStatusEl.textContent = "再タグ付け開始";
                             showBatchPanel("tags", { running: true, total: 0, processed: 0 });
                             startBatchPolling("tags");
                         });
-                    }
                 }
-                setTimeout(function () { taxonomyStatusEl.textContent = ""; }, 3000);
-            }).catch(function (err) {
+            }
+        }).catch(function (err) {
+            if (taxonomyStatusEl) {
                 taxonomyStatusEl.textContent = "Error: " + err.message;
                 taxonomyStatusEl.style.color = "#e74c3c";
-            }).finally(function () {
-                taxonomySaveBtn.disabled = false;
-            });
+            }
         });
     }
 
