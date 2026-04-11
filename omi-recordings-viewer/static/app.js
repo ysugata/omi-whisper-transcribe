@@ -2193,6 +2193,14 @@
         if (maxPerClass && parseInt(maxPerClass.value, 10) > 0) {
             params += "&max_per_class=" + encodeURIComponent(maxPerClass.value);
         }
+        var minClassSamples = document.getElementById("export-min-class-samples");
+        if (minClassSamples && parseInt(minClassSamples.value, 10) > 0) {
+            params += "&min_class_samples=" + encodeURIComponent(minClassSamples.value);
+        }
+        var valRatio = document.getElementById("export-val-ratio");
+        if (valRatio && parseFloat(valRatio.value) > 0) {
+            params += "&val_ratio=" + encodeURIComponent(valRatio.value);
+        }
         return params;
     }
 
@@ -2227,12 +2235,16 @@
                         bdKeys.forEach(function (cls) {
                             var info = bd[cls];
                             var capped = info.sampled < info.total;
-                            previewHtml += '<div class="text-dim" style="font-size:0.75rem;">' +
-                                escapeHtml(cls) + ': ' + info.sampled + '/' + info.total +
-                                (capped ? ' <span style="color:#e67e22;">(capped)</span>' : '') +
-                                '</div>';
+                            var excluded = info.excluded;
+                            var label = escapeHtml(cls) + ': ' + info.sampled + '/' + info.total;
+                            if (excluded) label += ' <span style="color:#e74c3c;">(除外: 件数不足)</span>';
+                            else if (capped) label += ' <span style="color:#e67e22;">(capped)</span>';
+                            previewHtml += '<div class="text-dim" style="font-size:0.75rem;">' + label + '</div>';
                         });
                         previewHtml += '</div>';
+                    }
+                    if (data.train_sessions != null) {
+                        previewHtml += '<div class="export-preview-line" style="margin-top:4px;">Train: <strong>' + data.train_sessions + '</strong> / Val: <strong>' + data.val_sessions + '</strong></div>';
                     }
                     exportPreviewContent.innerHTML = previewHtml;
                     var effectiveSessions = data.balanced_sessions != null ? data.balanced_sessions : data.sessions;

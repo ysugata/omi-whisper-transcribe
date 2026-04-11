@@ -1177,6 +1177,8 @@ def _parse_export_params(request: web.Request) -> dict:
         "min_segments": int(request.query.get("min_segments", "3")),
         "include_monologue": include_monologue,
         "max_per_class": int(request.query.get("max_per_class", "0")),
+        "val_ratio": float(request.query.get("val_ratio", "0")),
+        "min_class_samples": int(request.query.get("min_class_samples", "0")),
     }
 
 
@@ -1205,11 +1207,26 @@ async def handle_export_stats(request: web.Request) -> web.Response:
         logger.exception("Export stats failed")
         return web.json_response({"error": str(e)}, status=500)
 
+    # Annotate classes that would be excluded by min_class_samples
+    min_cls = params["min_class_samples"]
+    if min_cls > 0 and "class_breakdown" in stats:
+        for cls, info in stats["class_breakdown"].items():
+            info["excluded"] = info["sampled"] < min_cls
+    val_ratio = params["val_ratio"]
+    if 0 < val_ratio < 1:
+        effective = stats.get("balanced_sessions", stats["sessions"])
+        stats["val_sessions"] = max(1, int(effective * val_ratio))
+        stats["train_sessions"] = effective - stats["val_sessions"]
+
     return web.json_response(stats)
 
 
 async def handle_export_training(request: web.Request) -> web.Response:
-    """GET /api/export/training — stream JSONL download."""
+    """GET /api/export/training — stream JSONL or ZIP (train/val split) download."""
+    import io
+    import random
+    import zipfile
+
     try:
         params = _parse_export_params(request)
     except web.HTTPBadRequest as e:
@@ -1236,32 +1253,85 @@ async def handle_export_training(request: web.Request) -> web.Response:
     fmt = params["format"]
     speaker_mode = params["speaker_mode"]
     include_monologue = params["include_monologue"]
+    val_ratio = params["val_ratio"]
+    min_class_samples = params["min_class_samples"]
 
-    response = web.StreamResponse(
-        status=200,
-        reason="OK",
-        headers={
-            "Content-Type": "application/x-ndjson",
-            "Content-Disposition": f'attachment; filename="training_{fmt}.jsonl"',
-        },
-    )
-    await response.prepare(request)
-
-    for date, time in session_pairs:
+    # Build all export lines first (needed for split & filtering)
+    lines: list[tuple[str, str]] = []  # (line_json, conversation_type)
+    for date, time_val in session_pairs:
         try:
-            transcript = await indexer.get_transcript(date, time)
+            transcript = await indexer.get_transcript(date, time_val)
             if not transcript:
                 continue
-            session_id = f"{date}/{time}"
+            session_id = f"{date}/{time_val}"
             line = export_session(fmt, session_id, transcript, speaker_mode,
                                   include_monologue=include_monologue)
             if line:
-                await response.write((line + "\n").encode("utf-8"))
+                ct = (transcript.get("session", {}).get("tags", {})
+                      .get("conversation_type", "_untagged"))
+                lines.append((line, ct))
         except Exception:
-            logger.exception("Export error for %s/%s", date, time)
+            logger.exception("Export error for %s/%s", date, time_val)
             continue
 
-    await response.write_eof()
+    # Filter out classes with too few samples
+    if min_class_samples > 0:
+        class_counts: dict[str, int] = {}
+        for _, ct in lines:
+            class_counts[ct] = class_counts.get(ct, 0) + 1
+        excluded = {ct for ct, n in class_counts.items() if n < min_class_samples}
+        if excluded:
+            logger.info("Export: excluding classes with < %d samples: %s",
+                        min_class_samples, excluded)
+            lines = [(l, ct) for l, ct in lines if ct not in excluded]
+
+    # No train/val split: stream JSONL as before
+    if val_ratio <= 0 or val_ratio >= 1:
+        response = web.StreamResponse(
+            status=200, reason="OK",
+            headers={
+                "Content-Type": "application/x-ndjson",
+                "Content-Disposition": f'attachment; filename="training_{fmt}.jsonl"',
+            },
+        )
+        await response.prepare(request)
+        for line, _ in lines:
+            await response.write((line + "\n").encode("utf-8"))
+        await response.write_eof()
+        return response
+
+    # Train/val split: stratified by conversation_type, output as ZIP
+    random.shuffle(lines)
+    class_indices: dict[str, list[int]] = {}
+    for i, (_, ct) in enumerate(lines):
+        class_indices.setdefault(ct, []).append(i)
+
+    val_set: set[int] = set()
+    for ct, indices in class_indices.items():
+        n_val = max(1, int(len(indices) * val_ratio))
+        # Ensure at least 1 train sample remains
+        n_val = min(n_val, len(indices) - 1) if len(indices) > 1 else 0
+        val_set.update(indices[:n_val])
+
+    train_lines = [lines[i][0] for i in range(len(lines)) if i not in val_set]
+    val_lines = [lines[i][0] for i in range(len(lines)) if i in val_set]
+
+    # Build ZIP in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"train_{fmt}.jsonl",
+                     "\n".join(train_lines) + "\n" if train_lines else "")
+        zf.writestr(f"val_{fmt}.jsonl",
+                     "\n".join(val_lines) + "\n" if val_lines else "")
+    buf.seek(0)
+
+    return web.Response(
+        body=buf.read(),
+        content_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="training_{fmt}.zip"',
+        },
+    )
     return response
 
 

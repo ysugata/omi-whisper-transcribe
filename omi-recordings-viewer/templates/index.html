@@ -456,7 +456,21 @@
                         <label>Max Per Class</label>
                         <div style="display:flex;align-items:center;gap:8px;">
                             <input type="number" id="export-max-per-class" value="0" min="0" max="10000" style="width:80px">
-                            <span class="text-dim" style="font-size:0.75rem;">0=無制限。conversation_type ごとの最大件数。クラス均等化に使用。</span>
+                            <span class="text-dim" style="font-size:0.75rem;">0=無制限。conversation_type ごとの最大件数。</span>
+                        </div>
+                    </div>
+                    <div class="export-row">
+                        <label>Min Class Samples</label>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <input type="number" id="export-min-class-samples" value="0" min="0" max="1000" style="width:80px">
+                            <span class="text-dim" style="font-size:0.75rem;">0=無制限。件数が足りないクラスを除外して過学習を防止。</span>
+                        </div>
+                    </div>
+                    <div class="export-row">
+                        <label>Validation Split</label>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <input type="number" id="export-val-ratio" value="0" min="0" max="0.5" step="0.05" style="width:80px">
+                            <span class="text-dim" style="font-size:0.75rem;">0=分割なし。0.2=20%を検証用に分離。ZIP (train + val) で出力。</span>
                         </div>
                     </div>
                 </div>
