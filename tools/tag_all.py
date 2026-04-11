@@ -72,7 +72,7 @@ def main():
         print("Error: GEMINI_API_KEY not set")
         sys.exit(1)
 
-    model = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
+    model = os.environ.get("TAGGING_MODEL", "gemini-3.1-flash-lite-preview")
 
     sessions = find_sessions(args.recordings_dir, force=args.force)
     print(f"Found {len(sessions)} session(s) to tag")

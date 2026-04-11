@@ -85,12 +85,12 @@ LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "B")        # Pipeline stages to run (A/B/C)
 LLM_SCREENING_ENABLED = os.environ.get("LLM_SCREENING_ENABLED", "true").lower() in ("true", "1", "yes")
 STAGE_C_AUTO = os.environ.get("STAGE_C_AUTO", "true").lower() in ("true", "1", "yes")  # Auto-trigger 3-C
-LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "sync")              # "sync" (standard API) or "batch" (Gemini Batch API, slow)
+LLM_BATCH_MODE = os.environ.get("LLM_BATCH_MODE", "batch")             # "sync" (standard API) or "batch" (Gemini Batch API, 50% cheaper)
 RECOVERY_SCAN_DAYS = int(os.environ.get("RECOVERY_SCAN_DAYS", "7"))     # Startup scan: recover unprocessed sessions from last N days (0=disabled)
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
-TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-2.5-flash-lite")
+TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-3.1-flash-lite-preview")
 DOMAIN_PREFILTER_ENABLED = os.environ.get("DOMAIN_PREFILTER_ENABLED", "true").lower() in ("true", "1", "yes")
 DOMAIN_PREFILTER_MIN_MATCHES = int(os.environ.get("DOMAIN_PREFILTER_MIN_MATCHES", "1"))
 
@@ -104,7 +104,7 @@ RAG_MIN_SESSIONS = int(os.environ.get("RAG_MIN_SESSIONS", "20"))
 TAXONOMY_REFINE_ENABLED = os.environ.get("TAXONOMY_REFINE_ENABLED", "true").lower() in ("true", "1", "yes")
 TAXONOMY_SAMPLE_RATIO = float(os.environ.get("TAXONOMY_SAMPLE_RATIO", "0.2"))
 TAXONOMY_PROPOSAL_MODEL = os.environ.get("TAXONOMY_PROPOSAL_MODEL", "gemini-2.5-flash")
-TAXONOMY_VALIDATION_MODEL = os.environ.get("TAXONOMY_VALIDATION_MODEL", "gemini-2.5-flash-lite")
+TAXONOMY_VALIDATION_MODEL = os.environ.get("TAXONOMY_VALIDATION_MODEL", "gemini-3.1-flash-lite-preview")
 
 # --- 音響シーン分類設定 ---
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")

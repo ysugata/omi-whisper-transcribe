@@ -136,7 +136,7 @@ class SessionTagger:
         self,
         api_key: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.1-flash-lite-preview",
         temperature: float = 0,
         max_tokens: int = 768,
         timeout: int = 15,

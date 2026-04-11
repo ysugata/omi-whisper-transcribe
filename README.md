@@ -363,7 +363,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 | `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
-| `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API) |
+| `LLM_BATCH_MODE` | `batch` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引) |
 | `RECOVERY_SCAN_DAYS` | `7` | 起動時リカバリ: 直近N日の未処理セッションを自動エンキュー (0=無効) |
 | `LLM_BASE_URL` | Gemini OpenAI 互換 | LLM API のベース URL |
 | `CONFIDENCE_LOGPROB_THRESHOLD` | `-0.5` | 信頼度スクリーニング閾値 (低信頼度→dirty) |
@@ -400,7 +400,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
-| `TAGGING_MODEL` | `gemini-2.5-flash-lite` | タグ付け用 LLM モデル名 |
+| `TAGGING_MODEL` | `gemini-3.1-flash-lite-preview` | タグ付け用 LLM モデル名 |
 | `DOMAIN_PREFILTER_ENABLED` | `true` | ドメイン事前フィルタ (keyword_anchors によるキーワード走査) |
 | `DOMAIN_PREFILTER_MIN_MATCHES` | `1` | 候補ドメインとなる最小キーワードヒット数 |
 | `RAG_ENABLED` | `true` | RAG 分類 (過去セッション埋め込みベースの k-NN 加重投票) |
@@ -415,7 +415,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `TAXONOMY_REFINE_ENABLED` | `true` | タクソノミー自動精緻化機能の有効/無効 |
 | `TAXONOMY_SAMPLE_RATIO` | `0.2` | サンプリング率 (各 conversation_type から何割抽出するか) |
 | `TAXONOMY_PROPOSAL_MODEL` | `gemini-2.5-flash` | Step 3 (提案生成) に使う LLM モデル |
-| `TAXONOMY_VALIDATION_MODEL` | `gemini-2.5-flash-lite` | Step 4 (検証) に使う LLM モデル |
+| `TAXONOMY_VALIDATION_MODEL` | `gemini-3.1-flash-lite-preview` | Step 4 (検証) に使う LLM モデル |
 
 ### 深夜スケジューラ
 

@@ -90,7 +90,7 @@ class BatchCorrector:
         min_text_length: int = 20,
         mode: str = "sync",
         gemini_api_key: str = "",
-        gemini_model: str = "gemini-2.5-flash-lite",
+        gemini_model: str = "gemini-3.1-flash-lite-preview",
         batch_poll_interval: int = 60,
         segment_screener=None,
         recovery_scan_days: int = 7,

@@ -86,7 +86,7 @@ class LLMPipeline:
         self,
         api_key: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.1-flash-lite-preview",
         temperature: float = 0,
         timeout: int = 10,
         stages: str = "ABC",
