@@ -363,7 +363,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 | `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
-| `LLM_BATCH_MODE` | `batch` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引) |
+| `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引) |
 | `RECOVERY_SCAN_DAYS` | `7` | 起動時リカバリ: 直近N日の未処理セッションを自動エンキュー (0=無効) |
 | `LLM_BASE_URL` | Gemini OpenAI 互換 | LLM API のベース URL |
 | `CONFIDENCE_LOGPROB_THRESHOLD` | `-0.5` | 信頼度スクリーニング閾値 (低信頼度→dirty) |
