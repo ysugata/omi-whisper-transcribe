@@ -2363,9 +2363,10 @@
                         var oldVal = currentVal;
                         taxonomyEditCache[ak][ai] = newVal;
 
-                        // Track rename for DB update
-                        if (!taxonomyRenames[ak]) taxonomyRenames[ak] = {};
-                        taxonomyRenames[ak][oldVal] = newVal;
+                        // Build rename mapping for this edit
+                        var renames = {};
+                        renames[ak] = {};
+                        renames[ak][oldVal] = newVal;
 
                         // If domain renamed, update keyword_anchors and domain_descriptions keys
                         if (ak === "domains") {
@@ -2378,7 +2379,39 @@
                                 delete taxonomyEditCache.domain_descriptions[oldVal];
                             }
                         }
+
+                        // Save immediately to server
                         renderTaxonomySettings();
+                        if (taxonomyStatusEl) {
+                            taxonomyStatusEl.textContent = "保存中...";
+                            taxonomyStatusEl.style.color = "";
+                        }
+                        fetch("/api/tag-taxonomy", {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ taxonomy: taxonomyEditCache, renames: renames }),
+                        }).then(function (r) { return r.json(); }).then(function (data) {
+                            if (data.error) {
+                                if (taxonomyStatusEl) {
+                                    taxonomyStatusEl.textContent = "Error: " + data.error;
+                                    taxonomyStatusEl.style.color = "#e74c3c";
+                                }
+                                return;
+                            }
+                            var renamed = data.renamed || 0;
+                            if (taxonomyStatusEl) {
+                                taxonomyStatusEl.textContent = oldVal + " → " + newVal + " に変更" + (renamed > 0 ? " (" + renamed + " セッション更新)" : "");
+                                taxonomyStatusEl.style.color = "#2ecc71";
+                                setTimeout(function () { taxonomyStatusEl.textContent = ""; }, 5000);
+                            }
+                            loadTaxonomy();
+                            loadPage(currentPage);
+                        }).catch(function (err) {
+                            if (taxonomyStatusEl) {
+                                taxonomyStatusEl.textContent = "Error: " + err.message;
+                                taxonomyStatusEl.style.color = "#e74c3c";
+                            }
+                        });
                     }
 
                     itemDiv.querySelector(".taxonomy-edit-ok").addEventListener("click", applyEdit);
