@@ -44,6 +44,7 @@ class TermCandidate:
 @dataclass
 class CandidateResult:
     candidates: list
+    inferred_domain: str = ""
     raw_response: str = ""
 
 
@@ -356,8 +357,9 @@ class LLMPipeline:
                     suggested_form=c.get("suggested_form", ""),
                     confidence=c.get("confidence", "low"),
                 ))
-            log.info("3-A: Extracted %d candidate(s)", len(candidates))
-            return CandidateResult(candidates=candidates, raw_response=raw)
+            inferred_domain = data.get("inferred_domain", "")
+            log.info("3-A: Extracted %d candidate(s), domain=%s", len(candidates), inferred_domain or "unknown")
+            return CandidateResult(candidates=candidates, inferred_domain=inferred_domain, raw_response=raw)
         except (json.JSONDecodeError, TypeError) as e:
             log.warning("3-A: JSON parse failed: %s", e)
             return None
@@ -388,6 +390,10 @@ class LLMPipeline:
 
         # Build user message
         parts = []
+
+        # Inferred domain from 3-A
+        if candidates and candidates.inferred_domain:
+            parts.append(f"inferred_domain: {candidates.inferred_domain}")
 
         # Glossary — only text-matched terms to avoid domain bias
         if session_glossary:

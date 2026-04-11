@@ -26,6 +26,7 @@ def wrap_openai_schema(name: str, schema: dict) -> dict:
 CANDIDATE_OBJECT_SCHEMA = {
     "type": "object",
     "properties": {
+        "inferred_domain": {"type": "string"},
         "candidates": {
             "type": "array",
             "items": {
@@ -59,7 +60,7 @@ CANDIDATE_OBJECT_SCHEMA = {
             },
         },
     },
-    "required": ["candidates"],
+    "required": ["inferred_domain", "candidates"],
     "additionalProperties": False,
 }
 
