@@ -559,6 +559,46 @@ class SessionTagger:
 
         return result
 
+    def tag_session_rag_only(self, segments: list[dict], audio_scene: dict | None = None) -> Optional[dict]:
+        """Try RAG classification only (no LLM API call).
+
+        Returns tags if RAG is confident, None otherwise.
+        Used by batch pipeline to separate RAG-handled sessions from LLM-needed ones.
+        """
+        if not self._enabled or not segments:
+            return None
+
+        if self._rag and self._rag.is_ready():
+            try:
+                from rag_classifier import RagClassifier
+                plain_text = RagClassifier._extract_plain_text(segments)
+                rag_result = self._rag.classify(plain_text)
+            except Exception as e:
+                log.warning("RAG classify failed: %s", e)
+                return None
+
+            if rag_result and rag_result["confident"]:
+                tags = self._validate_tags(rag_result["tags"])
+                tags["tagged_at"] = datetime.now().isoformat()
+                tags["tag_version"] = 2
+                tags["tag_source"] = "rag"
+                tags["rag_similarity"] = round(rag_result["top_similarity"], 4)
+                stats = self._compute_speaker_stats(segments)
+                ext_ratio = self._compute_external_audio_ratio(stats, audio_scene)
+                tags["external_audio_ratio"] = ext_ratio
+                if ext_ratio is not None and ext_ratio >= 0.8:
+                    tags["domains"] = []
+                if stats["has_voice_tags"] and stats.get("voice_quality", 0.0) >= 0.5:
+                    tags = self._apply_monologue_heuristic(tags, stats)
+                tags.setdefault("summary", "")
+                tags.setdefault("entities", [])
+                tags.setdefault("decision_memo", None)
+                log.info("SessionTagger[RAG]: type=%s, domains=%s, sim=%.3f",
+                         tags["conversation_type"], tags["domains"], rag_result["top_similarity"])
+                return tags
+
+        return None
+
     def tag_session(self, segments: list[dict], audio_scene: dict | None = None) -> Optional[dict]:
         """Tag a session's segments and return tags dict.
 
@@ -703,5 +743,86 @@ class SessionTagger:
                 tags["domains"] = []
         else:
             tags["external_audio_ratio"] = None
+
+        return tags
+
+    # ------------------------------------------------------------------
+    # Batch API support
+    # ------------------------------------------------------------------
+
+    def build_batch_request(
+        self,
+        segments: list[dict],
+        audio_scene: dict | None = None,
+    ) -> dict | None:
+        """Build a Gemini Batch API request for a single session.
+
+        Returns a dict suitable for genai.Client.batches.create(src=[...]),
+        or None if the session should be skipped (RAG confident, too short, etc.).
+        """
+        if not self._enabled or not segments:
+            return None
+
+        session_text = self._build_input(segments, audio_scene=audio_scene)
+        if not session_text or len(session_text) < 10:
+            return None
+
+        # If RAG is confident, no need for Batch API
+        if self._rag and self._rag.is_ready():
+            try:
+                from rag_classifier import RagClassifier
+                plain_text = RagClassifier._extract_plain_text(segments)
+                rag_result = self._rag.classify(plain_text)
+                if rag_result and rag_result["confident"]:
+                    return None  # RAG handles this session
+            except Exception:
+                pass
+
+        prefilter_hint = ""
+        if self._prefilter_enabled:
+            scan_result = self._scan_domain_keywords(session_text)
+            prefilter_hint = self._format_prefilter_hint(scan_result)
+
+        system_prompt = self._build_system_prompt()
+        user_message = session_text + prefilter_hint
+
+        return {
+            "contents": [{
+                "parts": [{"text": user_message}],
+                "role": "user",
+            }],
+            "config": {
+                "system_instruction": {"parts": [{"text": system_prompt}]},
+                "response_mime_type": "application/json",
+            },
+        }
+
+    def parse_batch_response(
+        self,
+        raw_text: str,
+        segments: list[dict],
+        audio_scene: dict | None = None,
+    ) -> dict | None:
+        """Parse a Batch API response and return finalized tags.
+
+        Same post-processing as tag_session (validation, speaker stats, etc.).
+        """
+        parsed = self._parse_response(raw_text)
+        if parsed is None:
+            return None
+
+        tags = self._validate_tags(parsed)
+        tags["tagged_at"] = datetime.now().isoformat()
+        tags["tag_version"] = 2
+        tags["tag_source"] = "llm"
+
+        stats = self._compute_speaker_stats(segments)
+        ext_ratio = self._compute_external_audio_ratio(stats, audio_scene)
+        tags["external_audio_ratio"] = ext_ratio
+        if ext_ratio is not None and ext_ratio >= 0.8:
+            tags["domains"] = []
+
+        if stats["has_voice_tags"] and stats.get("voice_quality", 0.0) >= 0.5:
+            tags = self._apply_monologue_heuristic(tags, stats)
 
         return tags

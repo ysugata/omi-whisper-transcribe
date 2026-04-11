@@ -1993,6 +1993,7 @@ async def _batch_combined_tag_task(force: bool = False):
 
         # --- Phase 2: Session Tag (LLM) ---
         # 声紋タグ済みのセグメントを使って LLM タグ付けを実行する。
+        # Gemini Batch API が利用可能なら一括投入し、なければ sync で逐次処理。
         if st["cancel_requested"]:
             return
 
@@ -2006,19 +2007,18 @@ async def _batch_combined_tag_task(force: bool = False):
 
         if session_tag_sessions and session_tagger is not None:
             loop = asyncio.get_running_loop()
+
+            # Prepare: load segments/audio_scene, handle RAG-confident sessions sync
+            batch_candidates = []  # (sess, fresh_data, segments, audio_scene)
             for sess in session_tag_sessions:
                 if st["cancel_requested"]:
-                    log.info("Combined tag cancelled by user (session tag phase)")
                     break
-
                 st["current_session"] = sess["path"]
                 try:
-                    # Re-read transcript to pick up voice tags from Phase 1
                     with open(sess["transcript_path"], "r", encoding="utf-8") as f:
                         fresh_data = json.load(f)
                     segments = fresh_data.get("segments", [])
 
-                    # Load audio_scene from session.json if available
                     _sess_json_path = Path(sess["transcript_path"]).parent / "session.json"
                     _audio_scene = None
                     if _sess_json_path.exists():
@@ -2028,38 +2028,159 @@ async def _batch_combined_tag_task(force: bool = False):
                         except (json.JSONDecodeError, OSError):
                             pass
 
+                    # Try RAG first (sync, no API cost)
                     tags = await loop.run_in_executor(
                         None,
-                        lambda segs=segments, asc=_audio_scene: session_tagger.tag_session(segs, audio_scene=asc),
+                        lambda segs=segments, asc=_audio_scene: session_tagger.tag_session_rag_only(segs, audio_scene=asc),
                     )
-
                     if tags:
+                        # RAG confident — apply immediately
                         fresh_data["session"]["tags"] = tags
                         fresh_data["session"]["session_tagged"] = True
-
                         tmp_path = str(sess["transcript_path"]) + ".tmp"
                         with open(tmp_path, "w", encoding="utf-8") as f:
                             json.dump(fresh_data, f, ensure_ascii=False, indent=2)
                         os.replace(tmp_path, str(sess["transcript_path"]))
-
-                        # Update RAG index
                         _update_rag_index(sess["path"], segments, tags)
-
                         st["session_tag_processed"] += 1
                         st["processed"] += 1
                     else:
-                        st["session_tag_failed"] += 1
-                        st["failed"] += 1
-                        st["errors"].append(f"{sess['path']}: tagger returned None")
-
+                        batch_candidates.append((sess, fresh_data, segments, _audio_scene))
                 except Exception as e:
                     st["session_tag_failed"] += 1
                     st["failed"] += 1
-                    err_msg = f"{sess['path']}: {e}"
-                    st["errors"].append(err_msg)
-                    log.error(f"Combined tag session-tag error: {err_msg}", exc_info=True)
-
+                    st["errors"].append(f"{sess['path']}: {e}")
+                    log.error(f"Combined tag session-tag prep error: {sess['path']}: {e}")
                 await asyncio.sleep(0)
+
+            # Try Gemini Batch API for remaining LLM-needed sessions
+            genai_client = None
+            if batch_candidates and GEMINI_API_KEY:
+                try:
+                    from google import genai
+                    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+                except Exception as e:
+                    log.warning(f"Gemini genai init failed for session tag batch, falling back to sync: {e}")
+
+            if batch_candidates and genai_client and not st["cancel_requested"]:
+                # Build batch requests
+                batch_requests = []
+                batch_session_map = []  # parallel list: (sess, fresh_data, segments, audio_scene)
+                for sess, fresh_data, segments, audio_scene in batch_candidates:
+                    req = session_tagger.build_batch_request(segments, audio_scene=audio_scene)
+                    if req:
+                        batch_requests.append(req)
+                        batch_session_map.append((sess, fresh_data, segments, audio_scene))
+
+                if batch_requests:
+                    log.info(f"Combined tag: submitting {len(batch_requests)} session(s) to Batch API")
+                    try:
+                        batch_result = await loop.run_in_executor(
+                            None,
+                            lambda: genai_client.batches.create(
+                                model=TAGGING_MODEL,
+                                src=batch_requests,
+                                config={"display_name": f"omi-tag-{datetime.now().strftime('%Y%m%d-%H%M%S')}"},
+                            ),
+                        )
+                        log.info(f"Combined tag: Batch API submitted → {batch_result.name}")
+
+                        # Poll for completion
+                        while not st["cancel_requested"]:
+                            await asyncio.sleep(30)
+                            batch_job = await loop.run_in_executor(
+                                None,
+                                lambda: genai_client.batches.get(name=batch_result.name),
+                            )
+                            state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
+                            if state == "JOB_STATE_SUCCEEDED":
+                                log.info(f"Combined tag: Batch API completed → {batch_result.name}")
+                                # Process results
+                                responses = list(genai_client.batches.list_results(name=batch_result.name))
+                                for i, resp in enumerate(responses):
+                                    if i >= len(batch_session_map):
+                                        break
+                                    sess, fresh_data, segments, audio_scene = batch_session_map[i]
+                                    try:
+                                        raw_text = resp.response.candidates[0].content.parts[0].text
+                                        tags = session_tagger.parse_batch_response(raw_text, segments, audio_scene=audio_scene)
+                                        if tags:
+                                            fresh_data["session"]["tags"] = tags
+                                            fresh_data["session"]["session_tagged"] = True
+                                            tmp_path = str(sess["transcript_path"]) + ".tmp"
+                                            with open(tmp_path, "w", encoding="utf-8") as f:
+                                                json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+                                            os.replace(tmp_path, str(sess["transcript_path"]))
+                                            _update_rag_index(sess["path"], segments, tags)
+                                            st["session_tag_processed"] += 1
+                                            st["processed"] += 1
+                                        else:
+                                            st["session_tag_failed"] += 1
+                                            st["failed"] += 1
+                                            st["errors"].append(f"{sess['path']}: batch response parse failed")
+                                    except Exception as e:
+                                        st["session_tag_failed"] += 1
+                                        st["failed"] += 1
+                                        st["errors"].append(f"{sess['path']}: {e}")
+                                break
+                            elif state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
+                                log.error(f"Combined tag: Batch API failed ({state})")
+                                # Fall back to sync for all remaining
+                                for sess, fresh_data, segments, audio_scene in batch_session_map:
+                                    try:
+                                        tags = session_tagger.tag_session(segments, audio_scene=audio_scene)
+                                        if tags:
+                                            fresh_data["session"]["tags"] = tags
+                                            fresh_data["session"]["session_tagged"] = True
+                                            tmp_path = str(sess["transcript_path"]) + ".tmp"
+                                            with open(tmp_path, "w", encoding="utf-8") as f:
+                                                json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+                                            os.replace(tmp_path, str(sess["transcript_path"]))
+                                            _update_rag_index(sess["path"], segments, tags)
+                                            st["session_tag_processed"] += 1
+                                            st["processed"] += 1
+                                        else:
+                                            st["session_tag_failed"] += 1
+                                            st["failed"] += 1
+                                    except Exception as e:
+                                        st["session_tag_failed"] += 1
+                                        st["failed"] += 1
+                                    await asyncio.sleep(0)
+                                break
+                            # Still pending — continue polling
+                    except Exception as e:
+                        log.error(f"Combined tag: Batch API submit failed: {e}, falling back to sync")
+                        genai_client = None  # fall through to sync
+
+            # Sync fallback for sessions that weren't batch-processed
+            if not genai_client and batch_candidates and not st["cancel_requested"]:
+                for sess, fresh_data, segments, audio_scene in batch_candidates:
+                    if st["cancel_requested"]:
+                        break
+                    st["current_session"] = sess["path"]
+                    try:
+                        tags = await loop.run_in_executor(
+                            None,
+                            lambda segs=segments, asc=audio_scene: session_tagger.tag_session(segs, audio_scene=asc),
+                        )
+                        if tags:
+                            fresh_data["session"]["tags"] = tags
+                            fresh_data["session"]["session_tagged"] = True
+                            tmp_path = str(sess["transcript_path"]) + ".tmp"
+                            with open(tmp_path, "w", encoding="utf-8") as f:
+                                json.dump(fresh_data, f, ensure_ascii=False, indent=2)
+                            os.replace(tmp_path, str(sess["transcript_path"]))
+                            _update_rag_index(sess["path"], segments, tags)
+                            st["session_tag_processed"] += 1
+                            st["processed"] += 1
+                        else:
+                            st["session_tag_failed"] += 1
+                            st["failed"] += 1
+                    except Exception as e:
+                        st["session_tag_failed"] += 1
+                        st["failed"] += 1
+                        st["errors"].append(f"{sess['path']}: {e}")
+                    await asyncio.sleep(0)
 
     except Exception as e:
         log.error(f"Combined tag task error: {e}", exc_info=True)
