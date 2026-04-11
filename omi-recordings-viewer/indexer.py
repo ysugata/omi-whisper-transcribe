@@ -550,6 +550,43 @@ class Indexer:
         data = await loop.run_in_executor(None, path.read_text, "utf-8")
         return json.loads(data)
 
+    async def get_taxonomy_label_counts(self) -> dict:
+        """Get session counts per taxonomy label for all 4 axes."""
+        result = {}
+
+        # Single-select axes: direct GROUP BY
+        for axis, col in [
+            ("conversation_type", "tags_conversation_type"),
+            ("importance", "tags_importance_v2"),
+        ]:
+            cursor = await self._db.execute(
+                f"SELECT {col}, COUNT(*) as cnt FROM sessions "
+                f"WHERE {col} IS NOT NULL AND {col} != '' "
+                f"GROUP BY {col}"
+            )
+            rows = await cursor.fetchall()
+            result[axis] = {r[0]: r[1] for r in rows}
+
+        # Multi-select axes: comma-separated, split in Python
+        for axis, col in [
+            ("outcomes", "tags_outcomes"),
+            ("domains", "tags_domains"),
+        ]:
+            cursor = await self._db.execute(
+                f"SELECT {col} FROM sessions "
+                f"WHERE {col} IS NOT NULL AND {col} != ''"
+            )
+            rows = await cursor.fetchall()
+            counts: dict[str, int] = {}
+            for r in rows:
+                for val in r[0].split(","):
+                    val = val.strip()
+                    if val:
+                        counts[val] = counts.get(val, 0) + 1
+            result[axis] = counts
+
+        return result
+
     async def get_export_stats(
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,

@@ -271,7 +271,7 @@
 
             <!-- Taxonomy tab -->
             <div id="taxonomy-tab" class="tab-content">
-                <p class="text-dim">セッションタグの分類軸を編集できます。各軸の項目を追加・編集・削除できます。項目名を変更すると既存セッションのタグも自動で更新されます。</p>
+                <p class="text-dim">セッションタグの分類軸を編集できます。項目名を変更すると既存セッションのタグも自動更新されます。<br>ファインチューニングの精度を保つため、各軸 <strong>5-20 項目</strong>、<strong>短いラベル名</strong> (2-6文字) を推奨します。</p>
                 <div id="taxonomy-loading" class="text-dim" style="padding:12px 0;">読み込み中...</div>
                 <div id="taxonomy-error" class="text-dim hidden" style="padding:12px 0;color:#e74c3c;">
                     タクソノミーの読み込みに失敗しました。<a href="#" id="taxonomy-retry-link">再読み込み</a>
@@ -279,6 +279,7 @@
                 <div id="taxonomy-editor" class="hidden">
                     <div class="taxonomy-section">
                         <h3>会話の種類 (conversation_type) <span id="taxonomy-conv-type-count" class="badge">0</span></h3>
+                        <p class="text-dim taxonomy-axis-desc">単一選択・必須。Export の system message に使用。セッションごとに1つ選択されます。</p>
                         <div id="taxonomy-conv-type-list" class="taxonomy-list"></div>
                         <div class="term-add-row">
                             <input type="text" id="taxonomy-conv-type-input" placeholder="新しい種類を追加">
@@ -287,6 +288,7 @@
                     </div>
                     <div class="taxonomy-section">
                         <h3>成果物 (outcomes) <span id="taxonomy-outcomes-count" class="badge">0</span></h3>
+                        <p class="text-dim taxonomy-axis-desc">複数選択 (1-4)。会話の成果物。Export メタデータに含まれます。</p>
                         <div id="taxonomy-outcomes-list" class="taxonomy-list"></div>
                         <div class="term-add-row">
                             <input type="text" id="taxonomy-outcomes-input" placeholder="新しい成果物を追加">
@@ -295,6 +297,7 @@
                     </div>
                     <div class="taxonomy-section">
                         <h3>事業領域 (domains) <span id="taxonomy-domains-count" class="badge">0</span></h3>
+                        <p class="text-dim taxonomy-axis-desc">複数選択 (0-3)。Knowledge/SOP の category に使用。Export の system message にも含まれます。</p>
                         <div id="taxonomy-domains-list" class="taxonomy-list"></div>
                         <div class="term-add-row">
                             <input type="text" id="taxonomy-domains-input" placeholder="新しい事業領域を追加">
@@ -313,6 +316,7 @@
                     </div>
                     <div class="taxonomy-section">
                         <h3>重要度 (importance) <span id="taxonomy-importance-count" class="badge">0</span></h3>
+                        <p class="text-dim taxonomy-axis-desc">単一選択。Export の system message に使用。通常は 高/中/低 の3段階。</p>
                         <div id="taxonomy-importance-list" class="taxonomy-list"></div>
                         <div class="term-add-row">
                             <input type="text" id="taxonomy-importance-input" placeholder="新しい重要度を追加">

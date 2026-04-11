@@ -536,6 +536,13 @@ async def handle_get_tag_taxonomy(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+async def handle_get_taxonomy_label_counts(request: web.Request) -> web.Response:
+    """GET /api/taxonomy-label-counts — session counts per taxonomy label."""
+    indexer: Indexer = request.app["indexer"]
+    counts = await indexer.get_taxonomy_label_counts()
+    return web.json_response(counts)
+
+
 async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
     """PUT /api/tag-taxonomy — update taxonomy + optionally retag affected sessions."""
     body = await request.json()
@@ -1459,6 +1466,7 @@ def create_app() -> web.Application:
 
     # Tag taxonomy API
     app.router.add_get("/api/tag-taxonomy", handle_get_tag_taxonomy)
+    app.router.add_get("/api/taxonomy-label-counts", handle_get_taxonomy_label_counts)
     app.router.add_put("/api/tag-taxonomy", handle_put_tag_taxonomy)
 
     # Session tag correction + keyword suggestion API

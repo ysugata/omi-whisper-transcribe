@@ -2267,6 +2267,7 @@
     // ============================================================
 
     var taxonomyEditCache = null;
+    var taxonomyLabelCounts = {};  // { axis: { label: count } }
 
     var taxonomyLoadingEl = document.getElementById("taxonomy-loading");
     var taxonomyErrorEl = document.getElementById("taxonomy-error");
@@ -2292,6 +2293,10 @@
             if (taxonomyEditorEl) taxonomyEditorEl.classList.remove("hidden");
             renderTaxonomySettings();
             renderKeywordSuggestions();
+            // Fetch label counts in parallel (non-blocking)
+            fetch("/api/taxonomy-label-counts").then(function (r) { return r.json(); })
+                .then(function (counts) { taxonomyLabelCounts = counts; renderTaxonomySettings(); })
+                .catch(function () {});
         }).catch(function (err) {
             if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
             if (taxonomyErrorEl) {
@@ -2317,14 +2322,22 @@
             // Update count badge
             var countEl = document.getElementById(axis.countId);
             if (countEl) countEl.textContent = items.length;
+            var axisCounts = (taxonomyLabelCounts || {})[axis.key] || {};
             var html = "";
             items.forEach(function (item, idx) {
+                var cnt = axisCounts[item] || 0;
+                var cntClass = cnt === 0 ? "taxonomy-cnt-zero" : "taxonomy-cnt";
                 html += '<div class="taxonomy-item">';
                 html += '<span class="taxonomy-item-text">' + escapeHtml(item) + '</span>';
+                html += '<span class="' + cntClass + '">' + cnt + '</span>';
                 html += '<button class="btn-sm btn-xs taxonomy-edit" data-axis="' + axis.key + '" data-idx="' + idx + '">Edit</button>';
                 html += '<button class="btn-danger btn-xs taxonomy-del" data-axis="' + axis.key + '" data-idx="' + idx + '">Del</button>';
                 html += '</div>';
             });
+            // Warning if item count > 20
+            if (items.length > 20) {
+                html += '<div class="taxonomy-warn">項目数が多すぎます (' + items.length + ')。ファインチューニング精度のため 20 以下を推奨。</div>';
+            }
             listEl.innerHTML = html || '<div class="text-dim">項目がありません</div>';
 
             // Edit handlers

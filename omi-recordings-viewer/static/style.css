@@ -1370,6 +1370,10 @@ main {
     background: var(--bg-secondary, var(--surface2)); color: var(--text-primary, inherit);
     border: 1px solid var(--accent, #3498db); border-radius: 3px; outline: none;
 }
+.taxonomy-axis-desc { font-size: 0.75rem; margin: 0 0 6px 0; }
+.taxonomy-cnt { font-size: 0.65rem; color: var(--text-dim); min-width: 24px; text-align: right; }
+.taxonomy-cnt-zero { font-size: 0.65rem; color: #e74c3c; min-width: 24px; text-align: right; }
+.taxonomy-warn { font-size: 0.75rem; color: #e67e22; padding: 4px 0; }
 .taxonomy-actions { margin-top: 16px; display: flex; gap: 8px; align-items: center; }
 .btn-xs { font-size: 0.65rem; padding: 1px 6px; }
 
