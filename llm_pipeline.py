@@ -232,13 +232,28 @@ class LLMPipeline:
     def _filter_corrections(
         corrections: list,
         original_texts: dict,
+        candidates: Optional["CandidateResult"] = None,
+        session_glossary: Optional[list] = None,
     ) -> list:
-        """Post-filter corrections: remove no-ops, punct-only, empty snippets."""
+        """Post-filter corrections: remove no-ops, punct-only, empty snippets,
+        and unauthorized changes (corrected text not backed by glossary or 3-A)."""
+        # Build set of authorized target forms from glossary + 3-A candidates
+        authorized_forms: set[str] = set()
+        if session_glossary:
+            authorized_forms.update(session_glossary)
+        candidate_map: dict[tuple, str] = {}  # (line, text_span) -> suggested_form
+        if candidates:
+            for c in candidates.candidates:
+                if c.suggested_form:
+                    authorized_forms.add(c.suggested_form)
+                    candidate_map[(c.line, c.text_span)] = c.suggested_form
+
         filtered = []
         for c in corrections:
             line = c.get("line", 0)
             original_snippet = c.get("original_snippet", "").strip()
             corrected = c.get("corrected", "").strip()
+            source = c.get("source", "")
 
             # Empty original_snippet is invalid
             if not original_snippet:
@@ -271,6 +286,29 @@ class LLMPipeline:
                     line, original_snippet[:40],
                 )
                 continue
+
+            # Guard: reject unauthorized changes not backed by glossary or 3-A.
+            # Allow: source=glossary/candidate_3a, dictionary corrections (common
+            # words/idioms), and small edits (truncation fix, typo).
+            # Reject: large substitutions where corrected text is completely
+            # different and not in any authorized source.
+            if source == "context" and authorized_forms:
+                # Check if the corrected text (or a key part) is authorized
+                is_authorized = any(
+                    form in corrected or corrected in form
+                    for form in authorized_forms
+                )
+                # Small edit (<=3 char diff) is likely truncation fix, allow
+                len_diff = abs(len(corrected) - len(original_snippet))
+                is_small_edit = len_diff <= 3 and len(original_snippet) >= 3
+
+                if not is_authorized and not is_small_edit:
+                    log.info(
+                        "Filter: unauthorized context change on line %d: "
+                        "'%s' → '%s' (not in glossary/candidates)",
+                        line, original_snippet[:40], corrected[:40],
+                    )
+                    continue
 
             filtered.append(c)
         return filtered
@@ -440,7 +478,9 @@ class LLMPipeline:
         try:
             data = json.loads(raw)
             corrections = data.get("corrections", [])
-            corrections = self._filter_corrections(corrections, original_by_line)
+            corrections = self._filter_corrections(
+                corrections, original_by_line, candidates, session_glossary,
+            )
             log.info("3-B: %d correction(s) after filter", len(corrections))
             return self._apply_corrections(
                 segments, corrections, line_to_seg_idx, original_by_line,
