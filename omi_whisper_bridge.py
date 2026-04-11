@@ -1078,7 +1078,6 @@ def transcribe_audio(
         log_prob_threshold=LOG_PROB_THRESHOLD,
         no_speech_threshold=NO_SPEECH_THRESHOLD,
         repetition_penalty=REPETITION_PENALTY,
-        temperature=0,  # beam_search with temperature=0 for deterministic output
     )
     if HALLUCINATION_SILENCE_THRESHOLD is not None:
         transcribe_kwargs["hallucination_silence_threshold"] = HALLUCINATION_SILENCE_THRESHOLD
