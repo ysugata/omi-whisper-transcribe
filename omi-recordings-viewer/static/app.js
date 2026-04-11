@@ -2267,6 +2267,7 @@
     // ============================================================
 
     var taxonomyEditCache = null;
+    var taxonomyRenames = {};  // { axis: { oldVal: newVal, ... } }
 
     var taxonomyLoadingEl = document.getElementById("taxonomy-loading");
     var taxonomyErrorEl = document.getElementById("taxonomy-error");
@@ -2288,6 +2289,7 @@
             return r.json();
         }).then(function (data) {
             taxonomyEditCache = JSON.parse(JSON.stringify(data));
+            taxonomyRenames = {};
             if (taxonomyLoadingEl) taxonomyLoadingEl.classList.add("hidden");
             if (taxonomyEditorEl) taxonomyEditorEl.classList.remove("hidden");
             renderTaxonomySettings();
@@ -2321,10 +2323,74 @@
             items.forEach(function (item, idx) {
                 html += '<div class="taxonomy-item">';
                 html += '<span class="taxonomy-item-text">' + escapeHtml(item) + '</span>';
+                html += '<button class="btn-sm btn-xs taxonomy-edit" data-axis="' + axis.key + '" data-idx="' + idx + '">Edit</button>';
                 html += '<button class="btn-danger btn-xs taxonomy-del" data-axis="' + axis.key + '" data-idx="' + idx + '">Del</button>';
                 html += '</div>';
             });
             listEl.innerHTML = html || '<div class="text-dim">項目がありません</div>';
+
+            // Edit handlers
+            var editBtns = listEl.querySelectorAll(".taxonomy-edit");
+            for (var ei = 0; ei < editBtns.length; ei++) {
+                editBtns[ei].addEventListener("click", function () {
+                    var ak = this.getAttribute("data-axis");
+                    var ai = parseInt(this.getAttribute("data-idx"), 10);
+                    var itemDiv = this.closest(".taxonomy-item");
+                    var textSpan = itemDiv.querySelector(".taxonomy-item-text");
+                    var currentVal = taxonomyEditCache[ak][ai];
+
+                    // Replace text and buttons with input + OK/Cancel
+                    itemDiv.innerHTML =
+                        '<input type="text" class="taxonomy-item-edit-input" value="' + escapeHtml(currentVal) + '">' +
+                        '<button class="btn-primary btn-xs taxonomy-edit-ok" data-axis="' + ak + '" data-idx="' + ai + '">OK</button>' +
+                        '<button class="btn-sm btn-xs taxonomy-edit-cancel">Cancel</button>';
+
+                    var input = itemDiv.querySelector(".taxonomy-item-edit-input");
+                    input.focus();
+                    input.select();
+
+                    function applyEdit() {
+                        var newVal = input.value.trim();
+                        if (!newVal || newVal === currentVal) {
+                            renderTaxonomySettings();
+                            return;
+                        }
+                        // Check for duplicates
+                        if (taxonomyEditCache[ak].indexOf(newVal) !== -1) {
+                            input.style.borderColor = "#e74c3c";
+                            return;
+                        }
+                        var oldVal = currentVal;
+                        taxonomyEditCache[ak][ai] = newVal;
+
+                        // Track rename for DB update
+                        if (!taxonomyRenames[ak]) taxonomyRenames[ak] = {};
+                        taxonomyRenames[ak][oldVal] = newVal;
+
+                        // If domain renamed, update keyword_anchors and domain_descriptions keys
+                        if (ak === "domains") {
+                            if (taxonomyEditCache.keyword_anchors && taxonomyEditCache.keyword_anchors[oldVal]) {
+                                taxonomyEditCache.keyword_anchors[newVal] = taxonomyEditCache.keyword_anchors[oldVal];
+                                delete taxonomyEditCache.keyword_anchors[oldVal];
+                            }
+                            if (taxonomyEditCache.domain_descriptions && taxonomyEditCache.domain_descriptions[oldVal]) {
+                                taxonomyEditCache.domain_descriptions[newVal] = taxonomyEditCache.domain_descriptions[oldVal];
+                                delete taxonomyEditCache.domain_descriptions[oldVal];
+                            }
+                        }
+                        renderTaxonomySettings();
+                    }
+
+                    itemDiv.querySelector(".taxonomy-edit-ok").addEventListener("click", applyEdit);
+                    itemDiv.querySelector(".taxonomy-edit-cancel").addEventListener("click", function () {
+                        renderTaxonomySettings();
+                    });
+                    input.addEventListener("keydown", function (e) {
+                        if (e.key === "Enter") applyEdit();
+                        if (e.key === "Escape") renderTaxonomySettings();
+                    });
+                });
+            }
 
             var delBtns = listEl.querySelectorAll(".taxonomy-del");
             for (var i = 0; i < delBtns.length; i++) {
@@ -2596,14 +2662,16 @@
             fetch("/api/tag-taxonomy", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ taxonomy: taxonomyEditCache }),
+                body: JSON.stringify({ taxonomy: taxonomyEditCache, renames: taxonomyRenames }),
             }).then(function (r) { return r.json(); }).then(function (data) {
                 if (data.error) {
                     taxonomyStatusEl.textContent = "Error: " + data.error;
                     taxonomyStatusEl.style.color = "#e74c3c";
                     return;
                 }
-                taxonomyStatusEl.textContent = "Saved!";
+                taxonomyRenames = {};
+                var renamed = data.renamed || 0;
+                taxonomyStatusEl.textContent = "Saved!" + (renamed > 0 ? " (" + renamed + " セッション更新)" : "");
                 taxonomyStatusEl.style.color = "#2ecc71";
                 // Refresh filter dropdowns
                 loadTaxonomy();

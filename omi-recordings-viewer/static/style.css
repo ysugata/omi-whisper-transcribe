@@ -1365,6 +1365,11 @@ main {
     padding: 3px 0;
 }
 .taxonomy-item-text { flex: 1; font-size: 0.85rem; }
+.taxonomy-item-edit-input {
+    flex: 1; font-size: 0.85rem; padding: 1px 4px;
+    background: var(--bg-secondary, var(--surface2)); color: var(--text-primary, inherit);
+    border: 1px solid var(--accent, #3498db); border-radius: 3px; outline: none;
+}
 .taxonomy-actions { margin-top: 16px; display: flex; gap: 8px; align-items: center; }
 .btn-xs { font-size: 0.65rem; padding: 1px 6px; }
 

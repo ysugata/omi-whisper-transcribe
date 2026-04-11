@@ -582,6 +582,43 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
                     except Exception:
                         pass
 
+    # Apply renames to existing sessions in DB
+    renames = body.get("renames", {})
+    renamed_count = 0
+    if renames and isinstance(renames, dict):
+        indexer: Indexer = request.app["indexer"]
+        axis_col_map = {
+            "conversation_type": "tags_conversation_type",
+            "outcomes": "tags_outcomes",
+            "domains": "tags_domains",
+            "importance": "tags_importance_v2",
+        }
+        for axis, mapping in renames.items():
+            col = axis_col_map.get(axis)
+            if not col or not isinstance(mapping, dict):
+                continue
+            for old_val, new_val in mapping.items():
+                if not old_val or not new_val or old_val == new_val:
+                    continue
+                try:
+                    if axis in ("outcomes", "domains"):
+                        # Multi-select: stored as comma-separated, use REPLACE
+                        cursor = await indexer._db.execute(
+                            f"UPDATE sessions SET {col} = REPLACE({col}, ?, ?) WHERE {col} LIKE ?",
+                            [old_val, new_val, "%" + old_val + "%"],
+                        )
+                    else:
+                        # Single-select: exact match
+                        cursor = await indexer._db.execute(
+                            f"UPDATE sessions SET {col} = ? WHERE {col} = ?",
+                            [new_val, old_val],
+                        )
+                    renamed_count += cursor.rowcount
+                except Exception as e:
+                    logger.warning(f"Failed to rename {axis} '{old_val}' -> '{new_val}': {e}")
+        if renamed_count > 0:
+            await indexer._db.commit()
+
     # Save new taxonomy
     new_taxonomy["version"] = (old_taxonomy or {}).get("version", 0) + 1
     _write_json(_TAG_TAXONOMY_PATH, new_taxonomy)
@@ -607,6 +644,7 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "impact": impact,
+        "renamed": renamed_count,
         "retag_started": retag_started,
     })
 
