@@ -770,17 +770,18 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 
 | フォーマット | 用途 | 出力内容 |
 |---|---|---|
-| **OpenAI Fine-tuning** | GPT ファインチューニング | `messages` 形式 (system/user/assistant) |
-| **ShareGPT / LLaMA-Factory** | オープンモデルのファインチューニング | `conversations` 形式 (human/gpt) |
-| **Comprehensive** | 全メタデータ付き生データ | session + tags + turns |
-| **Knowledge Base** | ナレッジ蓄積 | title, body, category, importance |
+| **OpenAI Fine-tuning** | GPT ファインチューニング | `messages` 形式 (system/user/assistant)。system message に V2 タクソノミー (会話の種類, 事業領域, 成果物, 重要度) を含む |
+| **ShareGPT / LLaMA-Factory** | オープンモデルのファインチューニング | `conversations` 形式 (human/gpt)。metadata に V2 タクソノミーを含む |
+| **Comprehensive** | 全メタデータ付き生データ | session + tags (V2 タクソノミー含む) + turns |
+| **Knowledge Base** | ナレッジ蓄積 | title, body, category (V2 domains), importance |
 | **Decision Log** | 意思決定記録 | decision, reason, action_items, outcome |
-| **SOP** | 手順書 / TODO 抽出 | steps, context, domain |
+| **SOP** | 手順書 / TODO 抽出 | steps, context, domain (V2 domains) |
 
 - OpenAI / ShareGPT 形式では**独白セッションをデフォルトで除外** (Include Monologue チェックで変更可)
 - Knowledge は `summary` のあるセッションのみ出力
 - Decision Log は `decision_required=true` のセッションのみ出力
 - SOP は `action_items` があり `casual_chat` でないセッションのみ出力
+- V2 タクソノミー未設定のセッションは V1 タグ (activity, topics, mood, business_domain) にフォールバック
 
 ### フィルタ
 

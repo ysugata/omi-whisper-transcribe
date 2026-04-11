@@ -48,6 +48,15 @@ TAGS = {
     "summary": "AIについて議論した",
 }
 
+TAGS_V2 = {
+    "conversation_type": "社内ミーティング",
+    "outcomes": ["意思決定あり", "TODO発生"],
+    "domains": ["AI", "経営"],
+    "importance": "高",
+    "summary": "AI戦略について議論した",
+    "decision_memo": "来期のAI投資を増やす",
+}
+
 TAGS_EXTENDED = {
     **TAGS,
     "source_type": "meeting",
@@ -60,6 +69,16 @@ TAGS_EXTENDED = {
     "action_items": ["技術検証を行う", "チームに共有する"],
     "outcome": "pending",
     "next_action": "来週までにPoCを完成させる",
+}
+
+TAGS_V2_EXTENDED = {
+    **TAGS_V2,
+    "decision_required": True,
+    "decision_summary": "AI投資を倍増する",
+    "reasoning_summary": "競合に差をつけるため",
+    "action_items": ["予算案を作成する", "取締役会に提出する"],
+    "outcome": "approved",
+    "next_action": "来月までに予算確定",
 }
 
 
@@ -138,6 +157,16 @@ class TestComprehensive:
         assert result["tags"]["outcome"] == "pending"
         assert result["tags"]["next_action"] == "来週までにPoCを完成させる"
 
+    def test_v2_tags_included(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
+        result = to_comprehensive("id", transcript)
+        assert result is not None
+        assert result["tags"]["conversation_type"] == "社内ミーティング"
+        assert result["tags"]["outcomes"] == ["意思決定あり", "TODO発生"]
+        assert result["tags"]["domains"] == ["AI", "経営"]
+        assert result["tags"]["importance"] == "高"
+        assert result["tags"]["decision_memo"] == "来期のAI投資を増やす"
+
 
 # ---------------------------------------------------------------------------
 # openai format tests
@@ -189,6 +218,20 @@ class TestOpenAI:
         non_system = [m for m in result["messages"] if m["role"] != "system"]
         assert all(m["role"] == "assistant" for m in non_system)
 
+    def test_v2_system_message(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
+        result = to_openai("id", transcript)
+        assert result is not None
+        sys_msg = result["messages"][0]["content"]
+        assert "会話の種類: 社内ミーティング" in sys_msg
+        assert "事業領域: AI, 経営" in sys_msg
+        assert "成果物: 意思決定あり, TODO発生" in sys_msg
+        assert "重要度: 高" in sys_msg
+        # V1 fallbacks should NOT appear when V2 present
+        assert "状況:" not in sys_msg
+        assert "話題:" not in sys_msg
+        assert "ムード:" not in sys_msg
+
 
 # ---------------------------------------------------------------------------
 # conversation (ShareGPT) format tests
@@ -223,6 +266,15 @@ class TestConversation:
         assert "activity" in result["metadata"]
         assert "quality" in result["metadata"]
 
+    def test_v2_metadata_included(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
+        result = to_conversation("id", transcript)
+        assert result is not None
+        assert result["metadata"]["conversation_type"] == "社内ミーティング"
+        assert result["metadata"]["outcomes"] == ["意思決定あり", "TODO発生"]
+        assert result["metadata"]["domains"] == ["AI", "経営"]
+        assert result["metadata"]["importance"] == "高"
+
 
 # ---------------------------------------------------------------------------
 # knowledge format tests
@@ -249,6 +301,21 @@ class TestKnowledge:
         transcript = _make_transcript(SEGMENTS_CONVERSATION)
         result = to_knowledge("id", transcript)
         assert result is None
+
+    def test_v2_uses_domains_as_category(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
+        result = to_knowledge("id", transcript)
+        assert result is not None
+        assert result["category"] == "AI, 経営"
+        assert result["importance"] == "高"
+
+    def test_v2_fallback_to_business_domain(self):
+        tags = {**TAGS_V2, "domains": []}
+        tags["business_domain"] = "technology"
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags)
+        result = to_knowledge("id", transcript)
+        assert result is not None
+        assert result["category"] == "technology"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +377,12 @@ class TestSop:
         transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_casual)
         result = to_sop("id", transcript)
         assert result is None
+
+    def test_v2_uses_domains(self):
+        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2_EXTENDED)
+        result = to_sop("id", transcript)
+        assert result is not None
+        assert result["domain"] == "AI, 経営"
 
 
 # ---------------------------------------------------------------------------

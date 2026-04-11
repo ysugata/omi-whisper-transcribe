@@ -36,20 +36,39 @@ def merge_turns(segments: list[dict]) -> list[dict]:
 
 
 def _build_system_message(tags: dict, is_monologue: bool = False) -> str:
-    """Build a system message from session tags."""
+    """Build a system message from session tags.
+
+    Prefers V2 taxonomy (conversation_type, domains, outcomes, importance)
+    with fallback to V1 tags (activity, topics, mood) for older sessions.
+    """
     parts = []
     if is_monologue:
         parts.append("あなたは事業経営者です。以下は独り言/思考です。")
     else:
         parts.append("あなたは事業経営者です。")
 
-    if tags.get("activity"):
+    # V2 taxonomy (preferred)
+    if tags.get("conversation_type"):
+        parts.append(f"会話の種類: {tags['conversation_type']}")
+    elif tags.get("activity"):
         parts.append(f"状況: {tags['activity']}")
-    if tags.get("topics"):
+
+    domains = tags.get("domains", [])
+    if domains and isinstance(domains, list):
+        parts.append(f"事業領域: {', '.join(domains)}")
+    elif tags.get("topics"):
         topics = tags["topics"] if isinstance(tags["topics"], list) else [tags["topics"]]
         parts.append(f"話題: {', '.join(topics)}")
-    if tags.get("mood"):
+
+    outcomes = tags.get("outcomes", [])
+    if outcomes and isinstance(outcomes, list):
+        parts.append(f"成果物: {', '.join(outcomes)}")
+
+    if tags.get("importance") and tags.get("conversation_type"):
+        parts.append(f"重要度: {tags['importance']}")
+    elif tags.get("mood"):
         parts.append(f"ムード: {tags['mood']}")
+
     return "\n".join(parts)
 
 
@@ -96,8 +115,9 @@ def to_comprehensive(session_id: str, transcript: dict,
     }
 
     tags_info = {}
-    for key in ("topics", "activity", "mood", "quality", "entities", "summary", "intent",
-                "source_type", "business_domain", "importance", "confidentiality",
+    for key in ("conversation_type", "outcomes", "domains", "importance", "decision_memo",
+                "topics", "activity", "mood", "quality", "entities", "summary", "intent",
+                "source_type", "business_domain", "confidentiality",
                 "decision_required", "decision_summary", "reasoning_summary",
                 "action_items", "outcome", "next_action"):
         val = tags.get(key)
@@ -223,7 +243,8 @@ def to_conversation(session_id: str, transcript: dict,
         return None
 
     metadata = {}
-    for key in ("topics", "activity", "quality", "mood"):
+    for key in ("conversation_type", "outcomes", "domains", "importance",
+                "topics", "activity", "quality", "mood"):
         if tags.get(key):
             metadata[key] = tags[key]
 
@@ -253,15 +274,18 @@ def to_knowledge(session_id: str, transcript: dict,
     turns = merge_turns(segments)
     body_parts = [t["text"] for t in turns]
 
+    domains = tags.get("domains", [])
+    category = ", ".join(domains) if domains else tags.get("business_domain", "other")
+
     return {
         "id": session_id,
         "title": summary[:60],
         "body": " ".join(body_parts),
-        "category": tags.get("business_domain", "other"),
+        "category": category,
         "topics": tags.get("topics", []),
         "entities": tags.get("entities", []),
         "source_sessions": [session_id],
-        "importance": tags.get("importance", "low"),
+        "importance": tags.get("importance", "低"),
         "updated_at": transcript.get("session", {}).get("start"),
     }
 
@@ -315,12 +339,15 @@ def to_sop(session_id: str, transcript: dict,
     if tags.get("activity") == "casual_chat" or tags.get("source_type") == "casual_chat":
         return None
 
+    domains = tags.get("domains", [])
+    domain = ", ".join(domains) if domains else tags.get("business_domain", "other")
+
     return {
         "id": session_id,
         "title": tags.get("summary", "")[:60] or "Untitled SOP",
         "steps": action_items,
         "context": tags.get("summary", ""),
-        "domain": tags.get("business_domain", "other"),
+        "domain": domain,
         "source_session": session_id,
     }
 
