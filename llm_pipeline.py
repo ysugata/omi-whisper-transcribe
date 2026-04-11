@@ -136,7 +136,7 @@ class LLMPipeline:
         if not self._client:
             return None
         try:
-            response = self._client.chat.completions.create(
+            kwargs = dict(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -146,6 +146,14 @@ class LLMPipeline:
                 temperature=self._temperature,
                 max_tokens=max_tokens,
             )
+            # Minimize thinking tokens for cost control.
+            # Gemini 3.x: reasoning_effort="low" (cannot be fully disabled).
+            # Gemini 2.5 Flash: reasoning_effort="none" disables thinking.
+            if "gemini-3" in self._model:
+                kwargs["reasoning_effort"] = "low"
+            elif self._model.startswith("gemini-2.5-flash") and "lite" not in self._model:
+                kwargs["reasoning_effort"] = "none"
+            response = self._client.chat.completions.create(**kwargs)
             return response.choices[0].message.content
         except Exception as e:
             log.warning("LLM API error: %s", e)

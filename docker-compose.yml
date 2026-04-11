@@ -36,7 +36,7 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - LLM_ENABLED=${LLM_ENABLED:-true}
-      - LLM_MODEL=${LLM_MODEL:-gemini-2.5-flash-lite}
+      - LLM_MODEL=${LLM_MODEL:-gemini-3.1-flash-lite-preview}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-10}
       - LLM_MIN_TEXT_LENGTH=${LLM_MIN_TEXT_LENGTH:-20}
       - LLM_PIPELINE_STAGES=${LLM_PIPELINE_STAGES:-AB}

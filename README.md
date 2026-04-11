@@ -355,7 +355,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `LLM_ENABLED` | `true` | LLM 後処理の有効化 |
-| `LLM_MODEL` | `gemini-2.5-flash-lite` | LLM モデル名 |
+| `LLM_MODEL` | `gemini-3.1-flash-lite-preview` | LLM モデル名 |
 | `LLM_TIMEOUT` | `10` | リクエストタイムアウト (秒) |
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
