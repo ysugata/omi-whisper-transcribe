@@ -452,6 +452,13 @@
                             <span>Include Monologue Sessions</span>
                         </label>
                     </div>
+                    <div class="export-row">
+                        <label>Max Per Class</label>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <input type="number" id="export-max-per-class" value="0" min="0" max="10000" style="width:80px">
+                            <span class="text-dim" style="font-size:0.75rem;">0=無制限。conversation_type ごとの最大件数。クラス均等化に使用。</span>
+                        </div>
+                    </div>
                 </div>
                 <div id="export-preview" class="export-preview hidden">
                     <div id="export-preview-content"></div>

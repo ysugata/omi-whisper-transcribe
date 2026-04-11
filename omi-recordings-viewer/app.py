@@ -1176,6 +1176,7 @@ def _parse_export_params(request: web.Request) -> dict:
         "speaker_mode": request.query.get("speaker_mode", "conversation"),
         "min_segments": int(request.query.get("min_segments", "3")),
         "include_monologue": include_monologue,
+        "max_per_class": int(request.query.get("max_per_class", "0")),
     }
 
 
@@ -1198,6 +1199,7 @@ async def handle_export_stats(request: web.Request) -> web.Response:
             conversation_type=params["conversation_type"],
             domain=params["domain"],
             importance_v2=params["importance_v2"],
+            max_per_class=params["max_per_class"],
         )
     except Exception as e:
         logger.exception("Export stats failed")
@@ -1225,6 +1227,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
             conversation_type=params["conversation_type"],
             domain=params["domain"],
             importance_v2=params["importance_v2"],
+            max_per_class=params["max_per_class"],
         )
     except Exception as e:
         logger.exception("Export query failed")

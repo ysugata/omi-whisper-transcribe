@@ -592,6 +592,7 @@ class Indexer:
         quality: list[str] | None = None, activity: list[str] | None = None,
         min_segments: int = 3, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
+        max_per_class: int = 0,
     ) -> dict:
         """Get stats for export preview (session count, segment count, date range, est size)."""
         where, params = self._build_export_where(
@@ -610,21 +611,51 @@ class Indexer:
             params,
         )
         r = rows[0]
-        return {
-            "sessions": r["cnt"],
+        total_sessions = r["cnt"]
+
+        # If balanced, compute effective session count
+        balanced_sessions = total_sessions
+        class_breakdown = {}
+        if max_per_class > 0:
+            cursor = await self._db.execute(
+                f"SELECT COALESCE(tags_conversation_type, '_untagged') as cls,"
+                f" COUNT(*) as cnt FROM sessions{where_sql}"
+                f" GROUP BY cls",
+                params,
+            )
+            cls_rows = await cursor.fetchall()
+            balanced_sessions = 0
+            for cr in cls_rows:
+                actual = cr["cnt"]
+                capped = min(actual, max_per_class)
+                balanced_sessions += capped
+                class_breakdown[cr["cls"]] = {"total": actual, "sampled": capped}
+
+        result = {
+            "sessions": total_sessions,
             "segments": r["segs"],
             "date_from": r["min_date"] or "",
             "date_to": r["max_date"] or "",
-            "est_size_bytes": int(r["text_bytes"] * 1.5),  # rough estimate with JSON overhead
+            "est_size_bytes": int(r["text_bytes"] * 1.5),
         }
+        if max_per_class > 0:
+            result["balanced_sessions"] = balanced_sessions
+            result["class_breakdown"] = class_breakdown
+        return result
 
     async def get_export_sessions(
         self, date_from: str = "", date_to: str = "",
         quality: list[str] | None = None, activity: list[str] | None = None,
         min_segments: int = 3, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
+        max_per_class: int = 0,
     ) -> list[tuple[str, str]]:
-        """Get (date, time) pairs matching export filters."""
+        """Get (date, time) pairs matching export filters.
+
+        If max_per_class > 0, limit each conversation_type to at most
+        that many sessions (stratified sampling for balanced training data).
+        Sessions are selected randomly within each class.
+        """
         where, params = self._build_export_where(
             date_from, date_to, quality, activity, min_segments,
             business_domain=business_domain,
@@ -632,6 +663,23 @@ class Indexer:
             importance_v2=importance_v2,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        if max_per_class > 0:
+            # Stratified: GROUP BY conversation_type, limit per group
+            cursor = await self._db.execute(
+                f"SELECT date, time, tags_conversation_type FROM sessions{where_sql}"
+                f" ORDER BY RANDOM()",
+                params,
+            )
+            rows = await cursor.fetchall()
+            class_counts: dict[str, int] = {}
+            result = []
+            for r in rows:
+                cls = r["tags_conversation_type"] or "_untagged"
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+                if class_counts[cls] <= max_per_class:
+                    result.append((r["date"], r["time"]))
+            return result
 
         cursor = await self._db.execute(
             f"SELECT date, time FROM sessions{where_sql} ORDER BY date, time",

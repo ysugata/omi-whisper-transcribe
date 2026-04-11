@@ -2189,6 +2189,10 @@
         params += "&speaker_mode=" + encodeURIComponent(exportSpeakerMode.value);
         params += "&min_segments=" + encodeURIComponent(exportMinSegments.value || "3");
         params += "&include_monologue=" + (exportIncludeMonologue.checked ? "true" : "false");
+        var maxPerClass = document.getElementById("export-max-per-class");
+        if (maxPerClass && parseInt(maxPerClass.value, 10) > 0) {
+            params += "&max_per_class=" + encodeURIComponent(maxPerClass.value);
+        }
         return params;
     }
 
@@ -2211,11 +2215,28 @@
                         return;
                     }
                     exportPreview.classList.remove("hidden");
-                    exportPreviewContent.innerHTML =
+                    var previewHtml =
                         '<div class="export-preview-line"><strong>' + data.sessions + '</strong> sessions / <strong>' + data.segments + '</strong> segments</div>' +
                         '<div class="export-preview-line">Date: ' + escapeHtml(data.date_from || "N/A") + ' ~ ' + escapeHtml(data.date_to || "N/A") + '</div>' +
                         '<div class="export-preview-line">Est. size: <strong>' + formatBytes(data.est_size_bytes) + '</strong></div>';
-                    exportDownloadBtn.disabled = data.sessions === 0;
+                    if (data.balanced_sessions != null) {
+                        previewHtml += '<div class="export-preview-line" style="margin-top:6px;"><strong>均等化後: ' + data.balanced_sessions + '</strong> sessions</div>';
+                        var bd = data.class_breakdown || {};
+                        var bdKeys = Object.keys(bd).sort(function (a, b) { return bd[b].total - bd[a].total; });
+                        previewHtml += '<div class="export-class-breakdown">';
+                        bdKeys.forEach(function (cls) {
+                            var info = bd[cls];
+                            var capped = info.sampled < info.total;
+                            previewHtml += '<div class="text-dim" style="font-size:0.75rem;">' +
+                                escapeHtml(cls) + ': ' + info.sampled + '/' + info.total +
+                                (capped ? ' <span style="color:#e67e22;">(capped)</span>' : '') +
+                                '</div>';
+                        });
+                        previewHtml += '</div>';
+                    }
+                    exportPreviewContent.innerHTML = previewHtml;
+                    var effectiveSessions = data.balanced_sessions != null ? data.balanced_sessions : data.sessions;
+                    exportDownloadBtn.disabled = effectiveSessions === 0;
                     exportStatusEl.textContent = "";
                 })
                 .catch(function (err) {

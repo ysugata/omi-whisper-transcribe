@@ -795,6 +795,7 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 | `business_domain` | 旧事業領域 (後方互換) | 全て |
 | `speaker_mode` | `conversation` (全員) / `user_only` (自分のみ) | conversation |
 | `min_segments` | 最小セグメント数 | 3 |
+| `max_per_class` | conversation_type ごとの最大件数 (クラス均等化) | 0 (無制限) |
 | `include_monologue` | 独白セッションを含めるか | フォーマットによる |
 
 ### API
