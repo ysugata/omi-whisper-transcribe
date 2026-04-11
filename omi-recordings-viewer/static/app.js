@@ -2675,24 +2675,20 @@
                 taxonomyStatusEl.style.color = "#2ecc71";
                 // Refresh filter dropdowns
                 loadTaxonomy();
-                // Check impact
+                // Check impact (truly deleted values, not renames)
                 if (data.impact && Object.keys(data.impact).length > 0) {
-                    var impactMsg = "以下のタグ値が使用中のセッションで削除されます:\n";
+                    var impactMsg = "以下のタグ値が使用中のセッションから削除されました:\n";
                     for (var k in data.impact) {
                         impactMsg += "  " + k + ": " + data.impact[k] + " セッション\n";
                     }
-                    impactMsg += "\n再タグ付けを実行しますか？";
+                    impactMsg += "\nこれらのセッションを新しいタクソノミーで再タグ付けしますか？";
                     if (confirm(impactMsg)) {
-                        fetch("/api/tag-taxonomy", {
-                            method: "PUT",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ taxonomy: taxonomyEditCache, retag: true }),
+                        fetch("/api/session-tags/start", {
+                            method: "POST",
                         }).then(function (r) { return r.json(); }).then(function (rd) {
-                            if (rd.retag_started) {
-                                taxonomyStatusEl.textContent = "Saved + retag started!";
-                                showBatchPanel("tags", { running: true, total: 0, processed: 0 });
-                                startBatchPolling("tags");
-                            }
+                            taxonomyStatusEl.textContent = "Saved + retag started!";
+                            showBatchPanel("tags", { running: true, total: 0, processed: 0 });
+                            startBatchPolling("tags");
                         });
                     }
                 }

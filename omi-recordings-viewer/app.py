@@ -548,8 +548,9 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
         if key not in new_taxonomy or not isinstance(new_taxonomy[key], list):
             return web.json_response({"error": f"{key} must be a list"}, status=400)
 
-    # Check impact: count sessions using removed values
+    # Check impact: count sessions using truly removed values (not renames)
     old_taxonomy = _read_json(_TAG_TAXONOMY_PATH, None)
+    renames = body.get("renames", {})
     impact = {}
     if old_taxonomy and isinstance(old_taxonomy, dict):
         indexer: Indexer = request.app["indexer"]
@@ -561,7 +562,9 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
         ]:
             old_vals = set(old_taxonomy.get(axis, []))
             new_vals = set(new_taxonomy.get(axis, []))
-            removed = old_vals - new_vals
+            # Exclude renamed values — they aren't truly deleted
+            renamed_old_vals = set((renames.get(axis) or {}).keys())
+            removed = old_vals - new_vals - renamed_old_vals
             if removed:
                 for val in removed:
                     try:
@@ -583,7 +586,6 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
                         pass
 
     # Apply renames to transcript.json files (source of truth) and DB
-    renames = body.get("renames", {})
     renamed_count = 0
     if renames and isinstance(renames, dict):
         indexer: Indexer = request.app["indexer"]
