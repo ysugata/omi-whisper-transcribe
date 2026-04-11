@@ -2085,9 +2085,15 @@ async def _batch_combined_tag_task(force: bool = False):
                         )
                         log.info(f"Combined tag: Batch API submitted → {batch_result.name}")
 
-                        # Poll for completion
+                        # Poll for completion (timeout 2h → sync fallback)
+                        _batch_tag_timeout = 2 * 60 * 60  # 2 hours
+                        _batch_tag_start = asyncio.get_event_loop().time()
+                        _batch_tag_done = False
                         while not st["cancel_requested"]:
                             await asyncio.sleep(30)
+                            if asyncio.get_event_loop().time() - _batch_tag_start > _batch_tag_timeout:
+                                log.warning("Combined tag: Batch API timeout (2h), falling back to sync")
+                                break
                             batch_job = await loop.run_in_executor(
                                 None,
                                 lambda: genai_client.batches.get(name=batch_result.name),
@@ -2095,7 +2101,6 @@ async def _batch_combined_tag_task(force: bool = False):
                             state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
                             if state == "JOB_STATE_SUCCEEDED":
                                 log.info(f"Combined tag: Batch API completed → {batch_result.name}")
-                                # Process results
                                 responses = list(genai_client.batches.list_results(name=batch_result.name))
                                 for i, resp in enumerate(responses):
                                     if i >= len(batch_session_map):
@@ -2122,32 +2127,16 @@ async def _batch_combined_tag_task(force: bool = False):
                                         st["session_tag_failed"] += 1
                                         st["failed"] += 1
                                         st["errors"].append(f"{sess['path']}: {e}")
+                                _batch_tag_done = True
                                 break
                             elif state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
                                 log.error(f"Combined tag: Batch API failed ({state})")
-                                # Fall back to sync for all remaining
-                                for sess, fresh_data, segments, audio_scene in batch_session_map:
-                                    try:
-                                        tags = session_tagger.tag_session(segments, audio_scene=audio_scene)
-                                        if tags:
-                                            fresh_data["session"]["tags"] = tags
-                                            fresh_data["session"]["session_tagged"] = True
-                                            tmp_path = str(sess["transcript_path"]) + ".tmp"
-                                            with open(tmp_path, "w", encoding="utf-8") as f:
-                                                json.dump(fresh_data, f, ensure_ascii=False, indent=2)
-                                            os.replace(tmp_path, str(sess["transcript_path"]))
-                                            _update_rag_index(sess["path"], segments, tags)
-                                            st["session_tag_processed"] += 1
-                                            st["processed"] += 1
-                                        else:
-                                            st["session_tag_failed"] += 1
-                                            st["failed"] += 1
-                                    except Exception as e:
-                                        st["session_tag_failed"] += 1
-                                        st["failed"] += 1
-                                    await asyncio.sleep(0)
                                 break
                             # Still pending — continue polling
+
+                        # Sync fallback: timeout, failed, or cancelled
+                        if not _batch_tag_done and not st["cancel_requested"]:
+                            log.info(f"Combined tag: sync fallback for {len(batch_session_map)} session(s)")
                     except Exception as e:
                         log.error(f"Combined tag: Batch API submit failed: {e}, falling back to sync")
                         genai_client = None  # fall through to sync
