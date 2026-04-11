@@ -743,6 +743,7 @@ def calc_rms_int16(pcm_bytes: bytes) -> float:
 # ハルシネーション除去用パターン (Whisper が生成しがちな定型句)
 _HALLUCINATION_PATTERNS = [
     re.compile(r"ご視聴ありがとうございま(した|す)"),
+    re.compile(r"ご視聴いただき.*"),  # 「ご視聴いただき有難う御座いました」等
     re.compile(r"チャンネル登録.*?お願いします"),
     re.compile(r"チャンネル登録"),
     re.compile(r"高評価"),
@@ -750,6 +751,7 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"最後まで(ご覧|見て)いただき.*"),
     re.compile(r"ご覧いただきありがとうございま(した|す)"),
     re.compile(r"字幕.*?(視聴者|翻訳|提供)"),
+    re.compile(r"サブタイトル.*?(製作|制作)"),  # 「サブタイトル&字幕製作by...」
     re.compile(r"Thanks? for watching\.?", re.IGNORECASE),
     re.compile(r"See you next time\.?", re.IGNORECASE),
     re.compile(r"Subscribe", re.IGNORECASE),
@@ -762,12 +764,29 @@ _HALLUCINATION_PATTERNS = [
     re.compile(r"\ufffd"),  # Unicode replacement character (音声デコードエラー)
 ]
 
+# 店名・ブランド名の暴走検出: hotwords に登録された語がノイズから連続生成される
+# 2個以上の固有名詞がカンマ等で連続する場合、ハルシネーションとみなして全文除去
+_STORE_BRAND_NAMES = [
+    "いすゞ", "Komeda", "コメダ", "丸亀", "ガスト", "スシロー", "Sushiro",
+    "FamilyMart", "ファミマ", "ジョイフル", "Joyfull", "すき家", "Sukiya",
+    "吉野家", "なだ万", "ASMO", "アスモ", "Adobe", "アドビ", "ActiveMeds",
+    "みかか", "アジ研", "カツとじ", "セブンイレブン",
+]
+_STORE_BRAND_RE = re.compile(
+    r"(?:" + "|".join(re.escape(s) for s in _STORE_BRAND_NAMES) + r")",
+    re.IGNORECASE,
+)
+
 # 全文一致専用パターン: セグメント全体がこのフレーズのみの場合だけ除去
 # (実際の会話で使われうるが、セグメント全体がこれだけなら Whisper のハルシネーション)
 _HALLUCINATION_FULL_MATCH = [
     re.compile(r"^お(つかれさま|疲れ様)でした[。.!]*$"),
     re.compile(r"^(ではまた|また次回)[。.!]*$"),
     re.compile(r"^おやすみなさい[。.!]*$"),
+    re.compile(r"^ごちそうさまでした[。.!]*$"),
+    re.compile(r"^いらっしゃいませ[。.!]*$"),
+    re.compile(r"^とりあえず[、,]*(これで)?終わりです[。.!]*$"),
+    re.compile(r"^これが今日の(映像|動画)です[。.!]*$"),
 ]
 
 
@@ -778,6 +797,9 @@ def _remove_hallucinations(text: str) -> str:
     for pattern in _HALLUCINATION_FULL_MATCH:
         if pattern.match(stripped):
             return ""
+    # Store/brand name hallucination: 2+ known names in one segment → full remove
+    if len(_STORE_BRAND_RE.findall(stripped)) >= 2:
+        return ""
     cleaned = text
     for pattern in _HALLUCINATION_PATTERNS:
         cleaned = pattern.sub("", cleaned)

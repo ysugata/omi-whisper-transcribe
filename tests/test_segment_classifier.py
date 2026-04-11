@@ -110,9 +110,14 @@ class TestClassifySegment:
                "avg_logprob": CONFIDENCE_LOGPROB_THRESHOLD - 0.01}
         assert classify_segment(seg, set(), min_text_length=5) == "dirty"
 
-    def test_low_confidence_short_text_still_clean(self):
-        """Low confidence but short text → clean (Rule 2 takes priority)."""
+    def test_low_confidence_short_text_dirty(self):
+        """Very low confidence short text → dirty (R2 exception for lp < -0.7)."""
         seg = {"text": "短い", "avg_logprob": -0.9}
+        assert classify_segment(seg, set(), min_text_length=20) == "dirty"
+
+    def test_moderate_confidence_short_text_still_clean(self):
+        """Moderate confidence short text → clean (R2 applies normally)."""
+        seg = {"text": "短い", "avg_logprob": -0.5}
         assert classify_segment(seg, set(), min_text_length=20) == "clean"
 
     def test_low_confidence_already_corrected_clean(self):

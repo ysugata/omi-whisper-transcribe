@@ -20,6 +20,12 @@ log = logging.getLogger(__name__)
 # -0.5 is conservative: catches genuinely uncertain segments without flooding LLM.
 CONFIDENCE_LOGPROB_THRESHOLD = -0.5
 
+# Short segment confidence threshold: even segments shorter than min_text_length
+# should be sent to LLM when Whisper confidence is very low.
+# -0.7 is stricter than the general threshold to avoid flooding LLM with
+# trivially short segments that just happen to have moderate uncertainty.
+SHORT_SEGMENT_LOGPROB_THRESHOLD = -0.7
+
 # Katakana detection pattern
 _KATAKANA_RE = re.compile(r'[\u30A0-\u30FF]')
 # Kanji + Hiragana pattern
@@ -51,8 +57,13 @@ def classify_segment(
 
     text = segment.get("text", "")
 
-    # Rule 2: Too short → skip
+    # Rule 2: Too short → skip (unless very low confidence)
     if len(text) < min_text_length:
+        # Short segments with very low Whisper confidence are likely ASR errors
+        # or hallucinations that still benefit from LLM review.
+        avg_logprob = segment.get("avg_logprob")
+        if avg_logprob is not None and avg_logprob < SHORT_SEGMENT_LOGPROB_THRESHOLD:
+            return "dirty"
         return "clean"
 
     # Rule 3: Unknown katakana words (not in dictionary/hotwords) → dirty
