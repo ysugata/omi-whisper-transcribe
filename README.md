@@ -301,7 +301,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `BUFFER_SECONDS` | `5.0` | 音声バッファ秒数 |
 | `INITIAL_PROMPT` | (空) | 初期プロンプト |
 | `NO_REPEAT_NGRAM_SIZE` | `5` | N-gram 繰り返し防止 (0=無効) |
-| `PATIENCE` | `2` | ビームサーチ patience (探索深度、0=無効) |
+| `PATIENCE` | `1.5` | ビームサーチ patience (探索深度、0=無効) |
 | `LOG_PROB_THRESHOLD` | `-0.5` | 対数確率の閾値 |
 | `NO_SPEECH_THRESHOLD` | `0.6` | 非発話判定の閾値 |
 | `COMPRESSION_RATIO_THRESHOLD` | `2.4` | 圧縮率の閾値 |
@@ -321,7 +321,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `VAD_SEG_ENABLED` | `true` | VAD ベースセグメンテーションの有効化 |
 | `VAD_CHECK_INTERVAL` | `1.0` | VAD チェック間隔 (秒) |
 | `VAD_SILENCE_TRIGGER` | `1.2` | 文字起こしトリガーとなる無音時間 (秒) |
-| `VAD_MAX_BUFFER` | `30.0` | 強制文字起こしまでの最大バッファ (秒) |
+| `VAD_MAX_BUFFER` | `20.0` | 強制文字起こしまでの最大バッファ (秒) |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD の信頼度閾値 |
 | `VAD_MIN_SILENCE_MS` | `500` | 発話間の最小無音時間 (ms) |
 | `VAD_SPEECH_PAD_MS` | `300` | 発話前後のパディング (ms) |

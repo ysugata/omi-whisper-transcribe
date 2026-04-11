@@ -51,7 +51,7 @@ SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))                # Omi �
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "./config")                       # 設定ファイルディレクトリ
 
 NO_REPEAT_NGRAM_SIZE = int(os.environ.get("NO_REPEAT_NGRAM_SIZE", "5"))   # 繰り返し防止 n-gram サイズ (0=無効)
-PATIENCE = float(os.environ.get("PATIENCE", "2"))                         # ビームサーチ patience (探索深度、0=無効)
+PATIENCE = float(os.environ.get("PATIENCE", "1.5"))                       # ビームサーチ patience (探索深度、0=無効)
 LOG_PROB_THRESHOLD = float(os.environ.get("LOG_PROB_THRESHOLD", "-0.5"))  # セグメント平均対数確率の閾値
 NO_SPEECH_THRESHOLD = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.6")) # 無音確率の閾値
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # 圧縮率閾値
@@ -148,7 +148,7 @@ SEGMENT_MAX_DURATION = float(os.environ.get("SEGMENT_MAX_DURATION", "15.0"))  # 
 VAD_SEG_ENABLED = os.environ.get("VAD_SEG_ENABLED", "true").lower() in ("true", "1", "yes")
 VAD_CHECK_INTERVAL = float(os.environ.get("VAD_CHECK_INTERVAL", "1.0"))       # VAD チェック間隔 (秒)
 VAD_SILENCE_TRIGGER = float(os.environ.get("VAD_SILENCE_TRIGGER", "1.2"))     # 発話後この無音で文字起こし実行 (longer = more context for Whisper)
-VAD_MAX_BUFFER = float(os.environ.get("VAD_MAX_BUFFER", "30.0"))              # バッファ上限 (秒)
+VAD_MAX_BUFFER = float(os.environ.get("VAD_MAX_BUFFER", "20.0"))              # バッファ上限 (秒)
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))                 # Silero VAD 閾値
 VAD_MIN_SILENCE_MS = int(os.environ.get("VAD_MIN_SILENCE_MS", "500"))         # 発話間の最小無音 (ms)
 VAD_SPEECH_PAD_MS = int(os.environ.get("VAD_SPEECH_PAD_MS", "300"))           # 発話前後のパディング (ms)
@@ -1078,6 +1078,7 @@ def transcribe_audio(
         log_prob_threshold=LOG_PROB_THRESHOLD,
         no_speech_threshold=NO_SPEECH_THRESHOLD,
         repetition_penalty=REPETITION_PENALTY,
+        temperature=0,  # beam_search with temperature=0 for deterministic output
     )
     if HALLUCINATION_SILENCE_THRESHOLD is not None:
         transcribe_kwargs["hallucination_silence_threshold"] = HALLUCINATION_SILENCE_THRESHOLD
