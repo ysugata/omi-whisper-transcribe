@@ -138,11 +138,11 @@ class TestBuildUserPrompt:
         ]
         out = _build_user_prompt("物販の方針を教えて", sources)
         assert "物販の方針を教えて" in out
-        assert "[#1]" in out
+        assert "[KC #1]" in out
         assert "sid1" in out
         assert "FBAと自己配送" in out
         assert "根拠:" in out
-        assert "コンテキスト: 物販事業における配送チャネル判断" in out
+        assert "context: 物販事業における配送チャネル判断" in out
         assert "rrf: 0.032" in out
 
 
@@ -265,6 +265,99 @@ class TestBuildAndRetrieve:
         assert any("FBA" in q for q in questions), (
             f"Expected FBA doc in top-3, got: {questions}"
         )
+
+    def test_parent_child_retrieve_with_wiki(self, tmp_path):
+        """retrieve_with_wiki aggregates KCs into parent wiki topics."""
+        _make_sanitized_file(tmp_path, [
+            _make_session("2026-03-28/03-48-40", [
+                _kc("FBAと自己配送の手数料の違いと方針は何か?",
+                    "FBA統一と自己配送併用で利益を最大化。"),
+                _kc("FBA手数料には何が含まれるか?",
+                    "配送費と在庫保管費が含まれる。"),
+            ]),
+            _make_session("2026-03-26/16-12-14", [
+                _kc("Whisper Largeはどこで動くか?",
+                    "RTX3060 12GBで動作する。"),
+            ]),
+        ])
+
+        # Set up a tiny wiki dir under tmp_path with a topic referencing
+        # the FBA session (parent/child mapping)
+        knowledge_dir = tmp_path / "knowledge"
+        topic_file = knowledge_dir / "knowledge-public" / "topics" / "物販" / "fba.md"
+        topic_file.parent.mkdir(parents=True, exist_ok=True)
+        topic_file.write_text(
+            "---\n"
+            "title: FBA優先と自己配送併用\n"
+            "domain: 物販\n"
+            "confidence: high\n"
+            "status: active\n"
+            "manual: false\n"
+            "sources:\n"
+            "  - type: voice\n"
+            "    session_id: 2026-03-28/03-48-40\n"
+            "    confidence: high\n"
+            "---\n\n"
+            "## 概要\nFBA統一と自己配送併用の方針。\n"
+            "## 要点\n- FBA統一が基本\n- 必要に応じて自己配送併用\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(SuccessionRAG, "_embed_batch", _fake_embed_batch), \
+             patch.object(SuccessionRAG, "_contextualize_all", _fake_contextualize):
+            rag = SuccessionRAG(
+                tmp_path, "gkey", "okey",
+                knowledge_dir=knowledge_dir,
+            )
+            rag.build_index()
+            kcs, topics = rag.retrieve_with_wiki(
+                "FBA 方針", k_kcs=10, k_topics=3,
+            )
+
+        assert len(kcs) > 0
+        assert len(topics) == 1
+        topic = topics[0]
+        assert topic.title == "FBA優先と自己配送併用"
+        assert topic.matched_kc_count >= 1  # at least one FBA KC matched
+        assert topic.aggregate_score > 0
+
+    def test_parent_child_falls_back_when_wiki_empty(self, tmp_path):
+        """retrieve_with_wiki returns ([] topics) when no wiki dir set."""
+        _make_sanitized_file(tmp_path, [
+            _make_session("s1", [_kc("Q1 とても具体的な質問", "A1 十分な長さの回答")])
+        ])
+        with patch.object(SuccessionRAG, "_embed_batch", _fake_embed_batch), \
+             patch.object(SuccessionRAG, "_contextualize_all", _fake_contextualize):
+            rag = SuccessionRAG(tmp_path, "gkey", "okey")  # no knowledge_dir
+            rag.build_index()
+            kcs, topics = rag.retrieve_with_wiki("Q1", k_kcs=5, k_topics=3)
+        assert len(kcs) > 0
+        assert topics == []
+
+    def test_status_reports_parent_child_mode_when_wiki_loaded(self, tmp_path):
+        _make_sanitized_file(tmp_path, [
+            _make_session("sid_with_wiki", [_kc("Q with parent topic", "A long enough answer text")])
+        ])
+        knowledge_dir = tmp_path / "knowledge"
+        topic_file = knowledge_dir / "knowledge-public" / "topics" / "AI" / "topic.md"
+        topic_file.parent.mkdir(parents=True, exist_ok=True)
+        topic_file.write_text(
+            "---\ntitle: T\ndomain: AI\nsources:\n"
+            "  - type: voice\n    session_id: sid_with_wiki\n    confidence: high\n"
+            "---\n\nbody\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(SuccessionRAG, "_embed_batch", _fake_embed_batch), \
+             patch.object(SuccessionRAG, "_contextualize_all", _fake_contextualize):
+            rag = SuccessionRAG(
+                tmp_path, "gkey", "okey",
+                knowledge_dir=knowledge_dir,
+            )
+            rag.build_index()
+        s = rag.status()
+        assert s["retrieval_mode"] == "parent_child"
+        assert s["wiki"]["topic_count"] == 1
 
     def test_fingerprint_unchanged_skips_rebuild(self, tmp_path):
         _make_sanitized_file(tmp_path, [
