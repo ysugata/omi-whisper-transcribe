@@ -233,17 +233,26 @@ open http://localhost:8092
 
 ### 事業継承 RAG (Succession RAG)
 
-sanitized `knowledge_cards` を **Anthropic Contextual Retrieval** 方式で
-検索して gpt-5-nano で根拠付き回答を生成する Retrieval-Augmented Q&A
-システム。月次コストは ~$1-2。fine-tuning なしで即運用可能。
+sanitized `knowledge_cards` (Phase 1.5) と LLM Wiki トピック (Phase 2.5)
+の両方を組み合わせた **Parent-Child Hybrid Retrieval** 方式で根拠付き回答を
+生成する Retrieval-Augmented Q&A システム。月次コストは ~$1-2。fine-tuning
+なしで即運用可能。
 
 | メソッド | パス | 説明 |
 |----------|------|------|
-| GET | `/succession/status` | インデックス情報 (size, version, retrieval_mode 等) |
-| POST | `/succession/rebuild` | インデックス再構築 (`{"force": bool}`) |
+| GET | `/succession/status` | インデックス情報 (size, version, retrieval_mode, wiki状態) |
+| POST | `/succession/rebuild` | KC インデックス再構築 (`{"force": bool}`) |
+| POST | `/succession/reload_wiki` | Wiki インデックスを `~/knowledge/` から再ロード |
 | POST | `/succession/ask` | 質問に回答 (`{"query": str, "k": int=5}`) |
 
 Viewer からも `/api/succession/*` で同じ機能を使えます (Settings > 事業相談 タブ)。
+
+**retrieval_mode の自動切替**:
+- `parent_child` (Phase 2.5): `~/knowledge/` の wiki が読み込まれている時。
+  KC を hybrid 検索 → 親 wiki トピックに集約 → トピック+KC を answer model
+  に渡す ([LangChain Parent Document Retriever 方式](https://medium.com/@seahorse.technologies.sl/parent-child-chunking-in-langchain-for-advanced-rag-e7c37171995a))
+- `hybrid` (Phase 1.5): wiki がまだない時のフォールバック。dense + BM25 + RRF
+- `dense_only`: BM25 が無効な時の最終フォールバック
 
 **動作原理 (Contextual Retrieval + Hybrid RRF)**:
 
@@ -291,10 +300,11 @@ curl -X POST http://localhost:8092/api/succession/ask \
 | `SUCCESSION_ANSWER_MODEL` | `gpt-5-nano` | 回答生成モデル (Responses API) |
 | `SUCCESSION_EMBED_MODEL` | `gemini-embedding-001` | 埋め込みモデル |
 | `SUCCESSION_CONTEXT_MODEL` | `gpt-5-nano` | KC への 1 文コンテキスト生成に使うモデル |
+| `KNOWLEDGE_DIR` | `/app/knowledge` | Wiki マウント先 (`~/knowledge` を read-only でマウント) |
 
-**プロンプト方針**: 「提供された KC の内容のみ」に基づいて答える。外部知識や一般論で
-補完せず、該当なしの場合は率直に「記録がありません」と返す。推測禁止。回答末尾で
-どの KC を参照したかを `[#1] [#2]` 形式で引用。
+**プロンプト方針**: 「提供された Wiki / KC のみ」に基づいて答える。Wiki を主軸 + KC を
+裏付けとして使用。外部知識や一般論で補完せず、該当なしの場合は率直に「記録がありません」
+と返す。推測禁止。回答末尾でどの素材を参照したかを `[Wiki #N]` `[KC #N]` 形式で引用。
 
 **Build コスト**: 455 KC で contextualize に ~$0.02、embed に ~$0.01、合計 ~$0.03/回。
 差分更新時は既存の context を reuse するので新規 KC 分のみ課金される。
