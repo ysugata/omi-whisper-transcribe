@@ -59,6 +59,10 @@ COPY correction_metrics.py .
 COPY sanitize_provider.py .
 COPY sanitize_schema.py .
 COPY sanitize_prompt.py .
+COPY succession_rag.py .
+# SuccessionRAG imports exporter.SanitizedIndex from the viewer package;
+# copy the whole subdirectory so the sys.path.insert at module top works.
+COPY omi-recordings-viewer/exporter.py ./omi-recordings-viewer/exporter.py
 COPY test_whisper.py .
 
 # モデルキャッシュを永続化するためのボリュームマウントポイント
