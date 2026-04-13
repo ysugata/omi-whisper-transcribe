@@ -134,6 +134,7 @@
                 <button class="settings-nav-item" data-tab="voice-tab">Voice <span id="nav-dot-voice" class="nav-attention-dot hidden"></span></button>
                 <div class="settings-nav-category">データ</div>
                 <button class="settings-nav-item" data-tab="export-tab">Export</button>
+                <button class="settings-nav-item" data-tab="succession-tab">事業相談</button>
             </nav>
 
             <div class="settings-content">
@@ -511,6 +512,42 @@
                     <span id="export-status" class="save-status"></span>
                 </div>
             </div><!-- #export-tab -->
+
+            <!-- 事業相談 (Succession RAG) tab -->
+            <div id="succession-tab" class="tab-content">
+                <h3 style="font-size:1rem;margin-bottom:12px;">事業相談 (Succession RAG)</h3>
+                <p class="text-dim" style="font-size:0.8rem;margin-bottom:8px;">
+                    過去の sanitized Knowledge Cards を検索して、事業判断に関する質問に
+                    根拠付きで答えます。まず「Rebuild Index」でインデックスを構築し、
+                    その後質問してください。
+                </p>
+                <div id="succession-status-bar" class="text-dim" style="font-size:0.75rem;margin-bottom:8px;">
+                    Index: 読み込み中...
+                </div>
+                <div class="export-actions" style="margin-bottom:12px;">
+                    <button id="succession-rebuild-btn" class="btn-primary">Rebuild Index</button>
+                    <span id="succession-rebuild-status" class="save-status"></span>
+                </div>
+                <div class="export-row" style="flex-direction:column;align-items:stretch;">
+                    <label for="succession-query" style="margin-bottom:4px;">質問</label>
+                    <textarea id="succession-query" rows="3" placeholder="例: FBA と自己配送の使い分けはどう判断してた？" style="width:100%;padding:8px;font-family:inherit;"></textarea>
+                </div>
+                <div class="export-row" style="margin-top:8px;">
+                    <label>Top-K</label>
+                    <input type="number" id="succession-k" value="5" min="1" max="20" style="width:80px">
+                    <button id="succession-ask-btn" class="btn-primary" style="margin-left:12px;">質問する</button>
+                    <span id="succession-ask-status" class="save-status" style="margin-left:8px;"></span>
+                </div>
+                <div id="succession-answer-block" class="export-preview hidden" style="margin-top:12px;">
+                    <div style="font-weight:bold;margin-bottom:6px;">回答</div>
+                    <div id="succession-answer" style="white-space:pre-wrap;line-height:1.6;"></div>
+                    <div id="succession-meta" class="text-dim" style="font-size:0.7rem;margin-top:6px;"></div>
+                    <details style="margin-top:12px;">
+                        <summary style="cursor:pointer;font-weight:bold;">参照した Knowledge Cards</summary>
+                        <div id="succession-sources" style="margin-top:8px;font-size:0.8rem;"></div>
+                    </details>
+                </div>
+            </div><!-- #succession-tab -->
 
             </div><!-- .settings-content -->
             </div><!-- .settings-layout -->
