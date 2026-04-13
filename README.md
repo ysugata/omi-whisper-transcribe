@@ -735,7 +735,7 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 
 ### RAG 分類 (Phase 4)
 
-過去のタグ付き済みセッションの埋め込みベクトル (Gemini `text-embedding-004`) を使い、
+過去のタグ付き済みセッションの埋め込みベクトル (Gemini `gemini-embedding-001`) を使い、
 新セッションを k-NN 加重投票で分類します。LLM を呼ばずに 8-9 割の分類を完結し、
 曖昧なケースのみ LLM にフォールバックします。
 
@@ -909,7 +909,7 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA, multi-card)
 Multi-KC で生成された KC の中には、異なるセッション間で「Whisper Large は
 どの GPU で動作しますか?」と「RTX3060 の VRAM で Whisper Large は動くか?」
 のような実質同義の質問が発生する。NeMo Curator の semantic deduplication
-方式に従い、Gemini text-embedding-004 で質問文を埋め込み、cosine ≥ 0.92 で
+方式に従い、Gemini `gemini-embedding-001` で質問文を埋め込み、cosine ≥ 0.92 で
 クラスタリングして各グループから confidence 最高の 1 件のみ残す。
 
 ```bash
