@@ -2309,20 +2309,36 @@
     }
 
     // ============================================================
-    // Succession RAG (事業相談) tab
+    // Succession RAG (事業相談) tab — multi-turn chat
     // ============================================================
 
     var successionStatusBar = document.getElementById("succession-status-bar");
     var successionRebuildBtn = document.getElementById("succession-rebuild-btn");
+    var successionReloadWikiBtn = document.getElementById("succession-reload-wiki-btn");
+    var successionClearBtn = document.getElementById("succession-clear-btn");
     var successionRebuildStatus = document.getElementById("succession-rebuild-status");
     var successionQuery = document.getElementById("succession-query");
     var successionK = document.getElementById("succession-k");
     var successionAskBtn = document.getElementById("succession-ask-btn");
     var successionAskStatus = document.getElementById("succession-ask-status");
-    var successionAnswerBlock = document.getElementById("succession-answer-block");
-    var successionAnswer = document.getElementById("succession-answer");
-    var successionMeta = document.getElementById("succession-meta");
-    var successionSources = document.getElementById("succession-sources");
+    var successionChatHistory = document.getElementById("succession-chat-history");
+    var successionChatEmpty = document.getElementById("succession-chat-empty");
+    var successionTurnCounter = document.getElementById("succession-turn-counter");
+
+    // In-memory conversation state. Server is stateless; we send the full
+    // history with each /ask call, and the server caps it to MAX_HISTORY_TURNS.
+    // Each entry: { role: "user"|"assistant", content: "...", meta?: {...},
+    //                wiki_topics?: [...], sources?: [...] }
+    var successionConversation = [];
+    var SUCCESSION_HISTORY_CAP = 10;
+
+    function updateTurnCounter() {
+        if (!successionTurnCounter) return;
+        var n = successionConversation.length;
+        successionTurnCounter.textContent = n > 0
+            ? "会話: " + n + " ターン (cap " + SUCCESSION_HISTORY_CAP + ")"
+            : "";
+    }
 
     function refreshSuccessionStatus() {
         if (!successionStatusBar) return;
@@ -2336,13 +2352,19 @@
                 if (!s.enabled) {
                     successionStatusBar.textContent = "無効 (GEMINI_API_KEY / OPENAI_API_KEY 両方必要)";
                     successionRebuildBtn.disabled = true;
+                    if (successionReloadWikiBtn) successionReloadWikiBtn.disabled = true;
                     successionAskBtn.disabled = true;
                     return;
                 }
-                var ready = s.ready ? "✓ Ready" : "未構築";
+                var mode = s.retrieval_mode || "?";
+                var wikiText = "";
+                if (s.wiki && s.wiki.enabled) {
+                    wikiText = " | wiki=" + s.wiki.topic_count + " topics";
+                }
                 successionStatusBar.textContent =
-                    "Index: " + s.index_size + " KCs | " + ready +
-                    " | embed=" + (s.embed_model || "?") +
+                    "Mode: " + mode +
+                    " | KC: " + s.index_size + wikiText +
+                    " | " + (s.ready ? "✓ Ready" : "未構築") +
                     " | answer=" + (s.answer_model || "?");
                 successionAskBtn.disabled = !s.ready;
             })
@@ -2351,10 +2373,73 @@
             });
     }
 
+    function renderChatHistory() {
+        if (!successionChatHistory) return;
+        if (successionConversation.length === 0) {
+            successionChatHistory.innerHTML =
+                '<div id="succession-chat-empty" class="text-dim" ' +
+                'style="text-align:center;padding:40px 0;font-size:0.85rem;">' +
+                '質問を入力すると、ここに会話履歴が表示されます。</div>';
+            updateTurnCounter();
+            return;
+        }
+        var html = "";
+        successionConversation.forEach(function (turn, idx) {
+            var isUser = turn.role === "user";
+            var bg = isUser ? "#1e3a5f" : "#1f4d2e";
+            var label = isUser ? "👤 You" : "🤖 Assistant";
+            html +=
+                '<div style="margin-bottom:14px;padding:10px;border-radius:6px;background:' + bg + ';">' +
+                '<div class="text-dim" style="font-size:0.7rem;margin-bottom:4px;">' +
+                escapeHtml(label) + ' (#' + (idx + 1) + ')</div>' +
+                '<div style="white-space:pre-wrap;line-height:1.5;font-size:0.85rem;">' +
+                escapeHtml(turn.content) + '</div>';
+            if (!isUser && turn.meta) {
+                html += '<div class="text-dim" style="font-size:0.65rem;margin-top:6px;">' +
+                    escapeHtml(turn.meta) + '</div>';
+            }
+            if (!isUser && (turn.wiki_topics || turn.sources)) {
+                html += '<details style="margin-top:6px;">' +
+                    '<summary style="cursor:pointer;font-size:0.75rem;">参照した素材</summary>' +
+                    '<div style="margin-top:6px;font-size:0.75rem;">';
+                if (turn.wiki_topics && turn.wiki_topics.length) {
+                    turn.wiki_topics.forEach(function (t, i) {
+                        html += '<div style="margin:6px 0;padding:6px;border-left:3px solid #4a9;">' +
+                            '<strong>[Wiki #' + (i + 1) + '] ' + escapeHtml(t.title) + '</strong>' +
+                            ' <span class="text-dim">(' + escapeHtml(t.domain) +
+                            ', score=' + (t.aggregate_score || 0).toFixed(3) +
+                            ', kcs=' + (t.matched_kc_count || 0) + ')</span>' +
+                            '</div>';
+                    });
+                }
+                if (turn.sources && turn.sources.length) {
+                    turn.sources.slice(0, 5).forEach(function (s, i) {
+                        html += '<div style="margin:4px 0 4px 12px;padding:4px;border-left:2px solid #888;">' +
+                            '<div class="text-dim" style="font-size:0.65rem;">[KC #' + (i + 1) + '] ' +
+                            escapeHtml(s.session_id) + ' (rrf=' + (s.rrf_score || 0).toFixed(3) + ')</div>' +
+                            '<div><strong>Q:</strong> ' + escapeHtml(s.question.substring(0, 100)) + '</div>' +
+                            '</div>';
+                    });
+                }
+                html += '</div></details>';
+            }
+            html += '</div>';
+        });
+        successionChatHistory.innerHTML = html;
+        // Auto-scroll to bottom so latest turn is visible
+        successionChatHistory.scrollTop = successionChatHistory.scrollHeight;
+        updateTurnCounter();
+    }
+
+    function clearConversation() {
+        successionConversation = [];
+        renderChatHistory();
+    }
+
     if (successionRebuildBtn) {
         successionRebuildBtn.addEventListener("click", function () {
             successionRebuildBtn.disabled = true;
-            successionRebuildStatus.textContent = "構築中... (数十秒〜数分)";
+            successionRebuildStatus.textContent = "KC index 構築中... (数十秒〜数分)";
             successionRebuildStatus.style.color = "";
             fetch("/api/succession/rebuild", {
                 method: "POST",
@@ -2369,8 +2454,7 @@
                         return;
                     }
                     successionRebuildStatus.textContent =
-                        "完了 (" + data.status + ", " + (data.size || 0) + " KCs, " +
-                        (data.elapsed_sec ? data.elapsed_sec.toFixed(1) + "s" : "") + ")";
+                        "KC: " + data.status + " (" + (data.size || 0) + " KCs)";
                     successionRebuildStatus.style.color = "#27ae60";
                     refreshSuccessionStatus();
                 })
@@ -2384,70 +2468,121 @@
         });
     }
 
-    if (successionAskBtn) {
-        successionAskBtn.addEventListener("click", function () {
-            var q = (successionQuery.value || "").trim();
-            if (!q) return;
-            var k = parseInt(successionK.value, 10) || 5;
-            successionAskBtn.disabled = true;
-            successionAskStatus.textContent = "回答中...";
-            successionAskStatus.style.color = "";
-            successionAnswerBlock.classList.add("hidden");
-            fetch("/api/succession/ask", {
+    if (successionReloadWikiBtn) {
+        successionReloadWikiBtn.addEventListener("click", function () {
+            successionReloadWikiBtn.disabled = true;
+            successionRebuildStatus.textContent = "Wiki 再ロード中...";
+            successionRebuildStatus.style.color = "";
+            fetch("/api/succession/reload_wiki", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ query: q, k: k }),
+                body: JSON.stringify({}),
             })
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
                     if (data.error) {
-                        successionAskStatus.textContent = "Error: " + data.error;
-                        successionAskStatus.style.color = "#e74c3c";
+                        successionRebuildStatus.textContent = "Error: " + data.error;
+                        successionRebuildStatus.style.color = "#e74c3c";
                         return;
                     }
-                    successionAskStatus.textContent = "";
-                    successionAnswerBlock.classList.remove("hidden");
-                    successionAnswer.textContent = data.answer || "";
-                    successionMeta.textContent =
-                        "model=" + (data.model || "?") +
-                        " | " + (data.elapsed_sec ? data.elapsed_sec.toFixed(2) + "s" : "") +
-                        " | index=" + (data.index_size || 0) +
-                        (data.warnings && data.warnings.length
-                            ? " | warn=" + data.warnings.join(",")
-                            : "");
-                    var sourcesHtml = "";
-                    (data.sources || []).forEach(function (s, i) {
-                        sourcesHtml +=
-                            '<div style="margin-bottom:12px;padding:8px;border-left:3px solid #888;">' +
-                            '<div class="text-dim" style="font-size:0.7rem;">[#' + (i + 1) +
-                            '] ' + escapeHtml(s.session_id) +
-                            ' (conf=' + escapeHtml(s.confidence) +
-                            ', sim=' + (s.similarity || 0).toFixed(3) + ')</div>' +
-                            '<div style="margin-top:4px;"><strong>Q:</strong> ' + escapeHtml(s.question) + '</div>' +
-                            '<div><strong>A:</strong> ' + escapeHtml(s.answer) + '</div>';
-                        if (s.evidence && s.evidence.length) {
-                            sourcesHtml += '<div class="text-dim" style="font-size:0.7rem;margin-top:4px;">根拠:';
-                            s.evidence.forEach(function (ev) {
-                                sourcesHtml += '<br>- ' + escapeHtml(ev);
-                            });
-                            sourcesHtml += '</div>';
-                        }
-                        sourcesHtml += '</div>';
-                    });
-                    successionSources.innerHTML = sourcesHtml;
+                    successionRebuildStatus.textContent =
+                        "Wiki: " + data.topic_count + " topics, " +
+                        data.session_count + " sessions";
+                    successionRebuildStatus.style.color = "#27ae60";
+                    refreshSuccessionStatus();
                 })
                 .catch(function (e) {
-                    successionAskStatus.textContent = "Error: " + e.message;
-                    successionAskStatus.style.color = "#e74c3c";
+                    successionRebuildStatus.textContent = "Error: " + e.message;
+                    successionRebuildStatus.style.color = "#e74c3c";
                 })
                 .finally(function () {
-                    successionAskBtn.disabled = false;
+                    successionReloadWikiBtn.disabled = false;
                 });
         });
     }
 
-    // Initial status load
+    if (successionClearBtn) {
+        successionClearBtn.addEventListener("click", clearConversation);
+    }
+
+    function sendSuccessionQuery() {
+        var q = (successionQuery.value || "").trim();
+        if (!q) return;
+        var k = parseInt(successionK.value, 10) || 5;
+
+        // Snapshot prior history (server caps internally too)
+        var historyPayload = successionConversation.map(function (t) {
+            return { role: t.role, content: t.content };
+        });
+
+        // Optimistically add the user turn so the user sees their question
+        successionConversation.push({ role: "user", content: q });
+        successionQuery.value = "";
+        renderChatHistory();
+
+        successionAskBtn.disabled = true;
+        successionAskStatus.textContent = "回答中...";
+        successionAskStatus.style.color = "";
+
+        fetch("/api/succession/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: q, k: k, history: historyPayload }),
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.error) {
+                    successionAskStatus.textContent = "Error: " + data.error;
+                    successionAskStatus.style.color = "#e74c3c";
+                    // Roll back the optimistic user message so retry works
+                    successionConversation.pop();
+                    renderChatHistory();
+                    return;
+                }
+                successionAskStatus.textContent = "";
+                var meta = "model=" + (data.model || "?") +
+                    " | " + (data.elapsed_sec ? data.elapsed_sec.toFixed(2) + "s" : "") +
+                    " | mode=" + (data.retrieval_mode || "?") +
+                    (data.warnings && data.warnings.length
+                        ? " | warn=" + data.warnings.join(",")
+                        : "");
+                successionConversation.push({
+                    role: "assistant",
+                    content: data.answer || "(no answer)",
+                    meta: meta,
+                    wiki_topics: data.wiki_topics || [],
+                    sources: data.sources || [],
+                });
+                renderChatHistory();
+            })
+            .catch(function (e) {
+                successionAskStatus.textContent = "Error: " + e.message;
+                successionAskStatus.style.color = "#e74c3c";
+                successionConversation.pop();
+                renderChatHistory();
+            })
+            .finally(function () {
+                successionAskBtn.disabled = false;
+            });
+    }
+
+    if (successionAskBtn) {
+        successionAskBtn.addEventListener("click", sendSuccessionQuery);
+    }
+
+    if (successionQuery) {
+        // Ctrl/Cmd+Enter to submit
+        successionQuery.addEventListener("keydown", function (e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                e.preventDefault();
+                sendSuccessionQuery();
+            }
+        });
+    }
+
+    // Initial status load + empty render
     refreshSuccessionStatus();
+    renderChatHistory();
 
     // ============================================================
     // Taxonomy Settings tab
