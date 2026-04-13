@@ -412,6 +412,77 @@ class TestAsk:
         assert ans.sources[0].session_id == "s1"
         fake_client.responses.create.assert_called_once()
 
+    def test_ask_with_history_passes_prior_turns_to_llm(self, tmp_path):
+        """Multi-turn chat: prior history must reach the Responses API as
+        separate user/assistant input messages, with the current query as
+        the last user message."""
+        _make_sanitized_file(tmp_path, [
+            _make_session("s1", [_kc("Q1 とても具体的な質問の文章",
+                                      "A1 具体的な回答文が入る長めの答え")])
+        ])
+
+        fake_response = MagicMock()
+        fake_response.status = "completed"
+        fake_response.output_text = "回答 with history"
+        fake_response.incomplete_details = None
+
+        fake_client = MagicMock()
+        fake_client.responses.create.return_value = fake_response
+
+        with patch.object(SuccessionRAG, "_embed_batch", _fake_embed_batch), \
+             patch.object(SuccessionRAG, "_contextualize_all", _fake_contextualize):
+            rag = SuccessionRAG(tmp_path, "gkey", "okey")
+            rag.build_index()
+            rag._openai_client = fake_client
+
+            history = [
+                {"role": "user", "content": "前の質問1"},
+                {"role": "assistant", "content": "前の回答1"},
+                {"role": "user", "content": "前の質問2"},
+                {"role": "assistant", "content": "前の回答2"},
+            ]
+            ans = rag.ask("Q1 とても具体的な質問の文章", k=1, history=history)
+
+        assert ans.answer == "回答 with history"
+        call_args = fake_client.responses.create.call_args
+        api_input = call_args.kwargs["input"]
+        # 4 history turns + 1 current user turn = 5
+        assert len(api_input) == 5
+        assert api_input[0] == {"role": "user", "content": "前の質問1"}
+        assert api_input[1] == {"role": "assistant", "content": "前の回答1"}
+        assert api_input[3] == {"role": "assistant", "content": "前の回答2"}
+        assert api_input[-1]["role"] == "user"
+        assert "Q1 とても具体的な質問" in api_input[-1]["content"]
+
+    def test_history_capped_to_max_turns(self):
+        """_sanitize_history drops oldest turns past the cap."""
+        big_history = []
+        for i in range(25):
+            big_history.append({"role": "user", "content": f"q{i}"})
+            big_history.append({"role": "assistant", "content": f"a{i}"})
+        cleaned = SuccessionRAG._sanitize_history(big_history)
+        assert len(cleaned) == SuccessionRAG.MAX_HISTORY_TURNS
+        assert cleaned[-1]["content"] == "a24"
+
+    def test_history_filters_invalid_entries(self):
+        cleaned = SuccessionRAG._sanitize_history([
+            {"role": "user", "content": "ok 1"},
+            {"role": "system", "content": "bad role"},  # dropped
+            {"role": "assistant", "content": ""},        # dropped
+            {"role": "assistant"},                        # missing content
+            {"content": "no role"},                       # missing role
+            "not a dict",                                 # not a dict
+            {"role": "user", "content": "ok 2"},
+        ])
+        assert len(cleaned) == 2
+        assert cleaned[0]["content"] == "ok 1"
+        assert cleaned[1]["content"] == "ok 2"
+
+    def test_history_none_returns_empty(self):
+        assert SuccessionRAG._sanitize_history(None) == []
+        assert SuccessionRAG._sanitize_history([]) == []
+        assert SuccessionRAG._sanitize_history("not a list") == []
+
     def test_ask_llm_error_returns_sources(self, tmp_path):
         _make_sanitized_file(tmp_path, [
             _make_session("s1", [_kc("Q1 とても具体的な質問の文章",

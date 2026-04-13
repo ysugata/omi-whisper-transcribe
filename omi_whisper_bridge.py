@@ -4181,10 +4181,21 @@ async def main():
         if k > 20:
             k = 20
 
+        # Optional multi-turn conversation history.
+        # Format: [{"role": "user"|"assistant", "content": str}, ...]
+        # The current `query` is NOT included in history; pass it via `query`.
+        # Server will validate and cap to MAX_HISTORY_TURNS.
+        history = body.get("history")
+        if history is not None and not isinstance(history, list):
+            return web.json_response(
+                {"error": "history must be a list"}, status=400,
+            )
+
         loop = asyncio.get_running_loop()
         try:
             answer = await loop.run_in_executor(
-                None, succession_rag.ask, query, k
+                None,
+                lambda: succession_rag.ask(query, k=k, history=history),
             )
         except Exception as e:
             log.exception("SuccessionRAG: ask failed")

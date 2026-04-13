@@ -816,13 +816,65 @@ class SuccessionRAG:
 
     # -- answer --------------------------------------------------------------
 
-    def ask(self, query: str, k: int = 5) -> SuccessionAnswer:
+    # Maximum number of prior conversation turns to retain. Older turns are
+    # dropped from the head of the history (FIFO) so token usage stays bounded.
+    # 10 turns ≈ 5 user + 5 assistant ≈ 2-3K tokens of overhead per request.
+    MAX_HISTORY_TURNS = 10
+
+    @classmethod
+    def _sanitize_history(
+        cls,
+        history: Optional[list[dict[str, str]]],
+    ) -> list[dict[str, str]]:
+        """Validate + cap the conversation history payload from the client.
+
+        Drops malformed entries, ensures only user/assistant roles, trims
+        each content to a sane max length, and keeps only the last
+        MAX_HISTORY_TURNS turns so we never blow the input token budget.
+        """
+        if not history or not isinstance(history, list):
+            return []
+        cleaned: list[dict[str, str]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if role not in ("user", "assistant"):
+                continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            # Cap each message to ~6000 chars to stop runaway token use
+            cleaned.append({
+                "role": role,
+                "content": content[:6000],
+            })
+        # Keep the most recent N turns
+        if len(cleaned) > cls.MAX_HISTORY_TURNS:
+            cleaned = cleaned[-cls.MAX_HISTORY_TURNS:]
+        return cleaned
+
+    def ask(
+        self,
+        query: str,
+        k: int = 5,
+        history: Optional[list[dict[str, str]]] = None,
+    ) -> SuccessionAnswer:
         """Run the full RAG pipeline and return an answer + sources.
 
-        If a wiki index is loaded, uses parent-child retrieval (Phase 2.5):
-        retrieve_with_wiki returns top KCs aggregated by their parent wiki
-        topic, and both are passed to the answer model. Otherwise falls
-        back to KC-only hybrid retrieval (Phase 1.5).
+        Multi-turn support (Phase 2.5+):
+        - `history`: optional list of `{"role": "user"|"assistant", "content": str}`
+          dicts representing the prior conversation. The latest user message
+          (the current query) is NOT included in history; pass it via `query`.
+        - History is capped at MAX_HISTORY_TURNS (FIFO). Retrieved sources
+          from previous turns are NOT carried forward — only the current
+          query drives retrieval, and only the current turn's KCs/Wiki are
+          included in the prompt as fresh context.
+        - The conversation history is sent to the answer model as separate
+          user/assistant input messages so it can reason across turns.
+
+        Wiki-aware: if the wiki index is loaded, parent-child retrieval is
+        used; otherwise falls back to KC-only hybrid retrieval (Phase 1.5).
         """
         t0 = time.time()
         warnings: list[str] = []
@@ -887,12 +939,22 @@ class SuccessionRAG:
 
         user_prompt = _build_user_prompt(query, sources, wiki_topics or None)
 
+        # Build the Responses API input list:
+        #   [prior user/assistant turns ...] + [current user with sources]
+        # History is trimmed to the most recent MAX_HISTORY_TURNS turns to
+        # keep prompt size bounded.
+        api_input: list[dict[str, str]] = []
+        truncated_history = self._sanitize_history(history)
+        if truncated_history:
+            api_input.extend(truncated_history)
+        api_input.append({"role": "user", "content": user_prompt})
+
         try:
             client = self._get_openai_client()
             response = client.responses.create(
                 model=self._answer_model,
                 instructions=_SYSTEM_PROMPT,
-                input=[{"role": "user", "content": user_prompt}],
+                input=api_input,
                 reasoning={"effort": self._reasoning_effort},
                 max_output_tokens=self._max_output_tokens,
                 store=False,
