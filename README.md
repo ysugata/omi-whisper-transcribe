@@ -232,29 +232,43 @@ open http://localhost:8092
 
 ### 事業継承 RAG (Succession RAG)
 
-sanitized `knowledge_cards` をベクター検索して gpt-5-nano で根拠付き回答を生成する
-Retrieval-Augmented Q&A システム。月次コストは ~$1 (gemini-embedding-001 で埋め込み +
-gpt-5-nano で回答)。事業継承 AI のフェーズ 1 として、fine-tuning なしで即運用可能。
+sanitized `knowledge_cards` を **Anthropic Contextual Retrieval** 方式で
+検索して gpt-5-nano で根拠付き回答を生成する Retrieval-Augmented Q&A
+システム。月次コストは ~$1-2。fine-tuning なしで即運用可能。
 
 | メソッド | パス | 説明 |
 |----------|------|------|
-| GET | `/succession/status` | インデックスサイズ・モデル・ready 状態 |
+| GET | `/succession/status` | インデックス情報 (size, version, retrieval_mode 等) |
 | POST | `/succession/rebuild` | インデックス再構築 (`{"force": bool}`) |
 | POST | `/succession/ask` | 質問に回答 (`{"query": str, "k": int=5}`) |
 
 Viewer からも `/api/succession/*` で同じ機能を使えます (Settings > 事業相談 タブ)。
 
-**動作原理**:
+**動作原理 (Contextual Retrieval + Hybrid RRF)**:
+
+[Anthropic の公式ブログ](https://www.anthropic.com/news/contextual-retrieval)
+で発表された Contextual Retrieval 方式を採用。純粋な dense search 比で
+**失敗率 49% 削減** (reranker 併用で 67%) が報告されています。
 
 ```
-1. config/safe_training_*.jsonl をすべて読み込み
-2. 各 knowledge_card の question を gemini-embedding-001 で埋め込み
-3. L2 正規化してインデックスに保存 (config/succession_index.{npz,json})
-4. ユーザー質問もベクター化
-5. cosine top-K 検索で関連 KC を抽出
-6. gpt-5-nano に [question, 関連KC, 指示] を渡して根拠付き回答生成
-7. 応答 + 参照した KC を evidence として返却
+1. config/safe_training_*.jsonl をすべて読み込み (SanitizedIndex 経由)
+2. 各 knowledge_card について gpt-5-nano で 1 文 (50-80 字) の
+   "context" を生成 (Anthropic Contextual Embeddings 方式)
+   例: "物販事業における FBA と自己配送の使い分け方針"
+3. "context + question" を gemini-embedding-001 で埋め込み (dense)
+4. 同じテキストを CJK 向け BM25 tokenizer (ASCII 単語 + 日本語
+   unigram/bigram) でトークン化し rank-bm25 に投入 (sparse)
+5. インデックスを config/succession_index.{npz,json} に永続化
+6. クエリ時: query を同じ tokenizer + embedding で処理
+7. dense top-20 + BM25 top-20 を Reciprocal Rank Fusion (RRF, k=60) で融合
+8. 上位 K 件を gpt-5-nano に渡して根拠付き回答を生成
+9. 応答 + 参照した KC (similarity / bm25_score / rrf_score 付き) を返却
 ```
+
+Contextual Retrieval が効くケース:
+- 固有名詞・型番・金額が絡む質問 (BM25 が強い)
+- 言い換え・同義語を含む質問 (dense が強い)
+- 両方混在する実用クエリ → **RRF で両方の長所を取る**
 
 **CLI**:
 
@@ -275,10 +289,14 @@ curl -X POST http://localhost:8092/api/succession/ask \
 |------|-----------|------|
 | `SUCCESSION_ANSWER_MODEL` | `gpt-5-nano` | 回答生成モデル (Responses API) |
 | `SUCCESSION_EMBED_MODEL` | `gemini-embedding-001` | 埋め込みモデル |
+| `SUCCESSION_CONTEXT_MODEL` | `gpt-5-nano` | KC への 1 文コンテキスト生成に使うモデル |
 
 **プロンプト方針**: 「提供された KC の内容のみ」に基づいて答える。外部知識や一般論で
 補完せず、該当なしの場合は率直に「記録がありません」と返す。推測禁止。回答末尾で
 どの KC を参照したかを `[#1] [#2]` 形式で引用。
+
+**Build コスト**: 455 KC で contextualize に ~$0.02、embed に ~$0.01、合計 ~$0.03/回。
+差分更新時は既存の context を reuse するので新規 KC 分のみ課金される。
 
 ### 音響シーン分類
 

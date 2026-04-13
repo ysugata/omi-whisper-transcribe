@@ -9,6 +9,10 @@ services:
       - whisper-models:/models
       - ./recordings:/app/recordings
       - ./config:/app/config
+      # Knowledge repo (Phase 2+): read-only from inside the container.
+      # Host path is configurable; defaults to ~/knowledge. Writes must
+      # come from host-side tools so container cannot corrupt the wiki.
+      - ${KNOWLEDGE_DIR:-/home/dev/knowledge}:/app/knowledge:ro
     environment:
       - TZ=${TZ:-Asia/Tokyo}
       - HF_HOME=/models
@@ -94,11 +98,14 @@ services:
       - ./recordings:/app/recordings
       - ./config:/app/config
       - ./data:/app/data
+      # Knowledge repo (read-only) for Wiki-based succession features
+      - ${KNOWLEDGE_DIR:-/home/dev/knowledge}:/app/knowledge:ro
     environment:
       - RECORDINGS_DIR=/app/recordings
       - CONFIG_DIR=/app/config
       - DB_PATH=/app/data/index.db
       - BRIDGE_MGMT_URL=http://omi-whisper-transcribe:${MANAGEMENT_PORT:-8091}
+      - KNOWLEDGE_DIR=/app/knowledge
     restart: unless-stopped
 
 volumes:
