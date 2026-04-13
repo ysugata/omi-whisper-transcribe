@@ -195,6 +195,7 @@ from rag_classifier import RagClassifier
 from taxonomy_refiner import TaxonomyRefiner
 from training_sanitizer import TrainingSanitizer
 from responses_sanitizer import ResponsesSanitizer
+from succession_rag import SuccessionRAG
 from segment_screener import SegmentScreener
 from suggestion_learner import SuggestionLearner
 from keyword_learner import KeywordLearner
@@ -358,6 +359,7 @@ OPENAI_TIMEOUT_MS = int(os.environ.get("OPENAI_TIMEOUT_MS", "60000"))
 
 training_sanitizer: TrainingSanitizer | None = None
 responses_sanitizer: ResponsesSanitizer | None = None
+succession_rag: SuccessionRAG | None = None
 
 # Responses API を使うかどうか判定
 _use_responses = False
@@ -389,6 +391,29 @@ else:
             base_url=_sanitize_url,
             model=SANITIZE_MODEL,
         )
+
+
+# Succession RAG (retrieval-augmented Q&A over sanitized knowledge cards)
+SUCCESSION_ANSWER_MODEL = os.environ.get("SUCCESSION_ANSWER_MODEL", "gpt-5-nano")
+SUCCESSION_EMBED_MODEL = os.environ.get("SUCCESSION_EMBED_MODEL", "gemini-embedding-001")
+if GEMINI_API_KEY and OPENAI_API_KEY:
+    succession_rag = SuccessionRAG(
+        config_dir=CONFIG_DIR,
+        gemini_api_key=GEMINI_API_KEY,
+        openai_api_key=OPENAI_API_KEY,
+        embed_model=SUCCESSION_EMBED_MODEL,
+        answer_model=SUCCESSION_ANSWER_MODEL,
+        reasoning_effort=OPENAI_REASONING_EFFORT,
+        timeout_sec=OPENAI_TIMEOUT_MS / 1000.0,
+    )
+    # Try to load the persisted index synchronously; rebuild is on-demand via API.
+    try:
+        if not succession_rag.load_index():
+            log.info("SuccessionRAG: no persisted index found; call /succession/rebuild to build it")
+    except Exception as e:
+        log.warning("SuccessionRAG: load_index failed: %s", e)
+else:
+    log.info("SuccessionRAG disabled: GEMINI_API_KEY and OPENAI_API_KEY both required")
 
 
 def _build_raw_text_from_transcript(transcript: dict) -> str:
@@ -4082,6 +4107,69 @@ async def main():
             _batch_sanitize_state["cancel_requested"] = True
         return web.json_response({"status": "cancel_requested"})
 
+    # ============================================================
+    # Succession RAG (retrieval-augmented Q&A over sanitized KCs)
+    # ============================================================
+
+    async def handle_succession_status(request):
+        if succession_rag is None:
+            return web.json_response({
+                "enabled": False,
+                "index_size": 0,
+                "ready": False,
+            })
+        return web.json_response(succession_rag.status())
+
+    async def handle_succession_rebuild(request):
+        if succession_rag is None:
+            return web.json_response(
+                {"error": "SuccessionRAG disabled"}, status=503,
+            )
+        force = False
+        try:
+            body = await request.json()
+            force = bool(body.get("force", False))
+        except Exception:
+            pass
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, succession_rag.build_index, force
+            )
+        except Exception as e:
+            log.exception("SuccessionRAG: rebuild failed")
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response(result)
+
+    async def handle_succession_ask(request):
+        if succession_rag is None:
+            return web.json_response(
+                {"error": "SuccessionRAG disabled"}, status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        query = (body.get("query") or "").strip()
+        if not query:
+            return web.json_response({"error": "query is required"}, status=400)
+        k = int(body.get("k", 5))
+        if k < 1:
+            k = 5
+        if k > 20:
+            k = 20
+
+        loop = asyncio.get_running_loop()
+        try:
+            answer = await loop.run_in_executor(
+                None, succession_rag.ask, query, k
+            )
+        except Exception as e:
+            log.exception("SuccessionRAG: ask failed")
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response(answer.to_dict())
+
     async def handle_sanitize_download(request):
         filename = request.query.get("file", "")
         # Security: only allow safe_training_*.jsonl pattern
@@ -4318,6 +4406,10 @@ async def main():
     mgmt_app.router.add_get("/sanitize/status", handle_sanitize_status)
     mgmt_app.router.add_post("/sanitize/cancel", handle_sanitize_cancel)
     mgmt_app.router.add_get("/sanitize/download", handle_sanitize_download)
+    # Succession RAG API (retrieval-augmented Q&A)
+    mgmt_app.router.add_get("/succession/status", handle_succession_status)
+    mgmt_app.router.add_post("/succession/rebuild", handle_succession_rebuild)
+    mgmt_app.router.add_post("/succession/ask", handle_succession_ask)
     # Batch LLM correction API
     mgmt_app.router.add_get("/batch/status", handle_batch_llm_status)
     mgmt_app.router.add_get("/batch/jobs", handle_batch_llm_jobs)

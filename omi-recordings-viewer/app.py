@@ -972,6 +972,23 @@ async def handle_rag_rebuild(request: web.Request) -> web.Response:
 
 
 # ============================================================
+# Succession RAG プロキシ API
+# ============================================================
+
+
+async def handle_succession_status(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/succession/status", timeout_sec=10)
+
+
+async def handle_succession_rebuild(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/succession/rebuild", timeout_sec=120)
+
+
+async def handle_succession_ask(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/succession/ask", timeout_sec=90)
+
+
+# ============================================================
 # Taxonomy Refiner プロキシ API
 # ============================================================
 
@@ -1656,6 +1673,11 @@ def create_app() -> web.Application:
     app.router.add_get("/api/sanitize/status", handle_sanitize_status)
     app.router.add_post("/api/sanitize/cancel", handle_sanitize_cancel)
     app.router.add_get("/api/sanitize/download", handle_sanitize_download)
+
+    # Succession RAG API
+    app.router.add_get("/api/succession/status", handle_succession_status)
+    app.router.add_post("/api/succession/rebuild", handle_succession_rebuild)
+    app.router.add_post("/api/succession/ask", handle_succession_ask)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")
 

@@ -2309,6 +2309,147 @@
     }
 
     // ============================================================
+    // Succession RAG (事業相談) tab
+    // ============================================================
+
+    var successionStatusBar = document.getElementById("succession-status-bar");
+    var successionRebuildBtn = document.getElementById("succession-rebuild-btn");
+    var successionRebuildStatus = document.getElementById("succession-rebuild-status");
+    var successionQuery = document.getElementById("succession-query");
+    var successionK = document.getElementById("succession-k");
+    var successionAskBtn = document.getElementById("succession-ask-btn");
+    var successionAskStatus = document.getElementById("succession-ask-status");
+    var successionAnswerBlock = document.getElementById("succession-answer-block");
+    var successionAnswer = document.getElementById("succession-answer");
+    var successionMeta = document.getElementById("succession-meta");
+    var successionSources = document.getElementById("succession-sources");
+
+    function refreshSuccessionStatus() {
+        if (!successionStatusBar) return;
+        fetch("/api/succession/status")
+            .then(function (r) { return r.json(); })
+            .then(function (s) {
+                if (s.error) {
+                    successionStatusBar.textContent = "Error: " + s.error;
+                    return;
+                }
+                if (!s.enabled) {
+                    successionStatusBar.textContent = "無効 (GEMINI_API_KEY / OPENAI_API_KEY 両方必要)";
+                    successionRebuildBtn.disabled = true;
+                    successionAskBtn.disabled = true;
+                    return;
+                }
+                var ready = s.ready ? "✓ Ready" : "未構築";
+                successionStatusBar.textContent =
+                    "Index: " + s.index_size + " KCs | " + ready +
+                    " | embed=" + (s.embed_model || "?") +
+                    " | answer=" + (s.answer_model || "?");
+                successionAskBtn.disabled = !s.ready;
+            })
+            .catch(function (e) {
+                successionStatusBar.textContent = "Error: " + e.message;
+            });
+    }
+
+    if (successionRebuildBtn) {
+        successionRebuildBtn.addEventListener("click", function () {
+            successionRebuildBtn.disabled = true;
+            successionRebuildStatus.textContent = "構築中... (数十秒〜数分)";
+            successionRebuildStatus.style.color = "";
+            fetch("/api/succession/rebuild", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ force: false }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.error) {
+                        successionRebuildStatus.textContent = "Error: " + data.error;
+                        successionRebuildStatus.style.color = "#e74c3c";
+                        return;
+                    }
+                    successionRebuildStatus.textContent =
+                        "完了 (" + data.status + ", " + (data.size || 0) + " KCs, " +
+                        (data.elapsed_sec ? data.elapsed_sec.toFixed(1) + "s" : "") + ")";
+                    successionRebuildStatus.style.color = "#27ae60";
+                    refreshSuccessionStatus();
+                })
+                .catch(function (e) {
+                    successionRebuildStatus.textContent = "Error: " + e.message;
+                    successionRebuildStatus.style.color = "#e74c3c";
+                })
+                .finally(function () {
+                    successionRebuildBtn.disabled = false;
+                });
+        });
+    }
+
+    if (successionAskBtn) {
+        successionAskBtn.addEventListener("click", function () {
+            var q = (successionQuery.value || "").trim();
+            if (!q) return;
+            var k = parseInt(successionK.value, 10) || 5;
+            successionAskBtn.disabled = true;
+            successionAskStatus.textContent = "回答中...";
+            successionAskStatus.style.color = "";
+            successionAnswerBlock.classList.add("hidden");
+            fetch("/api/succession/ask", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: q, k: k }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.error) {
+                        successionAskStatus.textContent = "Error: " + data.error;
+                        successionAskStatus.style.color = "#e74c3c";
+                        return;
+                    }
+                    successionAskStatus.textContent = "";
+                    successionAnswerBlock.classList.remove("hidden");
+                    successionAnswer.textContent = data.answer || "";
+                    successionMeta.textContent =
+                        "model=" + (data.model || "?") +
+                        " | " + (data.elapsed_sec ? data.elapsed_sec.toFixed(2) + "s" : "") +
+                        " | index=" + (data.index_size || 0) +
+                        (data.warnings && data.warnings.length
+                            ? " | warn=" + data.warnings.join(",")
+                            : "");
+                    var sourcesHtml = "";
+                    (data.sources || []).forEach(function (s, i) {
+                        sourcesHtml +=
+                            '<div style="margin-bottom:12px;padding:8px;border-left:3px solid #888;">' +
+                            '<div class="text-dim" style="font-size:0.7rem;">[#' + (i + 1) +
+                            '] ' + escapeHtml(s.session_id) +
+                            ' (conf=' + escapeHtml(s.confidence) +
+                            ', sim=' + (s.similarity || 0).toFixed(3) + ')</div>' +
+                            '<div style="margin-top:4px;"><strong>Q:</strong> ' + escapeHtml(s.question) + '</div>' +
+                            '<div><strong>A:</strong> ' + escapeHtml(s.answer) + '</div>';
+                        if (s.evidence && s.evidence.length) {
+                            sourcesHtml += '<div class="text-dim" style="font-size:0.7rem;margin-top:4px;">根拠:';
+                            s.evidence.forEach(function (ev) {
+                                sourcesHtml += '<br>- ' + escapeHtml(ev);
+                            });
+                            sourcesHtml += '</div>';
+                        }
+                        sourcesHtml += '</div>';
+                    });
+                    successionSources.innerHTML = sourcesHtml;
+                })
+                .catch(function (e) {
+                    successionAskStatus.textContent = "Error: " + e.message;
+                    successionAskStatus.style.color = "#e74c3c";
+                })
+                .finally(function () {
+                    successionAskBtn.disabled = false;
+                });
+        });
+    }
+
+    // Initial status load
+    refreshSuccessionStatus();
+
+    // ============================================================
     // Taxonomy Settings tab
     // ============================================================
 

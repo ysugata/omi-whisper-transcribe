@@ -48,6 +48,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | 空セッションスキップ | セグメントのないセッションは自動削除 |
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
+| 事業継承 RAG (Succession RAG) | sanitized KC をベクター検索 → gpt-5-nano で根拠付き回答する Q&A システム (月コスト ~$1) |
 | タグレビューキュー | 優先度付きレビューモードで不確実なタグを効率的に承認・修正 (キーボードショートカット対応) |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
@@ -228,6 +229,56 @@ open http://localhost:8092
 | GET | `/sanitize/status` | 進捗状態を返す |
 | POST | `/sanitize/cancel` | 実行中のバッチをキャンセル |
 | GET | `/sanitize/download` | 生成された JSONL ファイルをダウンロード |
+
+### 事業継承 RAG (Succession RAG)
+
+sanitized `knowledge_cards` をベクター検索して gpt-5-nano で根拠付き回答を生成する
+Retrieval-Augmented Q&A システム。月次コストは ~$1 (gemini-embedding-001 で埋め込み +
+gpt-5-nano で回答)。事業継承 AI のフェーズ 1 として、fine-tuning なしで即運用可能。
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/succession/status` | インデックスサイズ・モデル・ready 状態 |
+| POST | `/succession/rebuild` | インデックス再構築 (`{"force": bool}`) |
+| POST | `/succession/ask` | 質問に回答 (`{"query": str, "k": int=5}`) |
+
+Viewer からも `/api/succession/*` で同じ機能を使えます (Settings > 事業相談 タブ)。
+
+**動作原理**:
+
+```
+1. config/safe_training_*.jsonl をすべて読み込み
+2. 各 knowledge_card の question を gemini-embedding-001 で埋め込み
+3. L2 正規化してインデックスに保存 (config/succession_index.{npz,json})
+4. ユーザー質問もベクター化
+5. cosine top-K 検索で関連 KC を抽出
+6. gpt-5-nano に [question, 関連KC, 指示] を渡して根拠付き回答生成
+7. 応答 + 参照した KC を evidence として返却
+```
+
+**CLI**:
+
+```bash
+# インデックス構築 (初回 or sanitize 追加後)
+GEMINI_API_KEY=xxx OPENAI_API_KEY=xxx \
+  python tools/build_succession_index.py --force
+
+# 質問 (HTTP)
+curl -X POST http://localhost:8092/api/succession/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "FBA と自己配送の使い分けはどう判断してた?", "k": 5}'
+```
+
+**環境変数**:
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `SUCCESSION_ANSWER_MODEL` | `gpt-5-nano` | 回答生成モデル (Responses API) |
+| `SUCCESSION_EMBED_MODEL` | `gemini-embedding-001` | 埋め込みモデル |
+
+**プロンプト方針**: 「提供された KC の内容のみ」に基づいて答える。外部知識や一般論で
+補完せず、該当なしの場合は率直に「記録がありません」と返す。推測禁止。回答末尾で
+どの KC を参照したかを `[#1] [#2]` 形式で引用。
 
 ### 音響シーン分類
 
