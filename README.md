@@ -49,6 +49,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | トレーニングデータエクスポート | 6 フォーマット (OpenAI / ShareGPT / Comprehensive / Knowledge / Decision Log / SOP) |
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
 | 事業継承 RAG (Succession RAG) | sanitized KC をベクター検索 → gpt-5-nano で根拠付き回答する Q&A システム (月コスト ~$1) |
+| LLM Wiki ビルダー (Phase 2) | Karpathy 型 LLM Wiki: sanitized KC を atomic topic の markdown に自動コンパイルして `~/knowledge/` に出力 (Claude Skills 対応) |
 | タグレビューキュー | 優先度付きレビューモードで不確実なタグを効率的に承認・修正 (キーボードショートカット対応) |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
@@ -297,6 +298,59 @@ curl -X POST http://localhost:8092/api/succession/ask \
 
 **Build コスト**: 455 KC で contextualize に ~$0.02、embed に ~$0.01、合計 ~$0.03/回。
 差分更新時は既存の context を reuse するので新規 KC 分のみ課金される。
+
+### LLM Wiki ビルダー (Phase 2)
+
+Karpathy の LLM Wiki パターンに従い、sanitized KC を **atomic topic 単位の
+markdown ファイル**にコンパイルして `~/knowledge/` (独立 git リポジトリ) に出力。
+Claude Desktop / Claude Code / Obsidian から直接読める Wiki を自動生成する。
+
+- **書き込みはホスト側からのみ** — Docker コンテナは `~/knowledge:/app/knowledge:ro`
+  で read-only マウント。事故防止のためコンテナは wiki を読むだけ
+- **階層**: `topics/{domain}/{topic}.md` (atomic ページ) + `decisions/`, `journal/`,
+  `people/` + `index.md` (TOC)
+- **ドメイン分類**: `config/tag_taxonomy.json` の domains + keyword_anchors を
+  LLM クラスタリングの prior として使用
+- **idempotent**: frontmatter `manual: true` のファイルは上書きされない。
+  既存ファイルは `supersedes` / `superseded_by` / `status` を引き継ぐ
+
+**CLI**:
+
+```bash
+# プレビュー (ファイル書き込みなし、コスト見積もり付き)
+python tools/build_wiki.py --mode full --dry-run
+
+# 初回 full build (全 KC → ~/knowledge/)
+GEMINI_API_KEY=xxx OPENAI_API_KEY=xxx \
+  python tools/build_wiki.py --mode full
+
+# 差分更新 (前回 build 以降の新 KC のみ処理)
+python tools/build_wiki.py --mode incremental
+
+# 特定ドメインのみ (デバッグ)
+python tools/build_wiki.py --mode full --domain 物販 --dry-run
+```
+
+**ホストサイド cron セットアップ** (1 回):
+
+```cron
+# 毎朝 4:30 (Bridge の nightly 4:00 sanitize が終わった後)
+30 4 * * * cd /home/dev/omi_whisper_transcribe && \
+  GEMINI_API_KEY=... OPENAI_API_KEY=... \
+  python3 tools/build_wiki.py --mode incremental \
+  >> /home/dev/knowledge/.build.log 2>&1
+```
+
+**注意事項**:
+
+- **LLM 非決定性**: クラスタリング結果は毎回微妙に変わる。`--mode full` を
+  複数回走らせると、以前存在したトピックが別名で再生成されることがあり、
+  古いファイルは残ったままになる。**incremental mode が基本運用**で、full は
+  初回または大幅変更時のみ使う。古いファイルを完全に消したい場合は手動で
+  `rm -rf ~/knowledge/knowledge-public/topics/` してから full を走らせる
+- `~/knowledge/` は **別の独立 git リポジトリ**として管理される
+  (`cd ~/knowledge && git log` で wiki の更新履歴が追える)
+- manual 編集を保護するには frontmatter に `manual: true` を付ける
 
 ### 音響シーン分類
 
