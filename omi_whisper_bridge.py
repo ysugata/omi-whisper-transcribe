@@ -396,6 +396,12 @@ else:
 # Succession RAG (retrieval-augmented Q&A over sanitized knowledge cards)
 SUCCESSION_ANSWER_MODEL = os.environ.get("SUCCESSION_ANSWER_MODEL", "gpt-5-nano")
 SUCCESSION_EMBED_MODEL = os.environ.get("SUCCESSION_EMBED_MODEL", "gemini-embedding-001")
+# Phase 2.5: parent-child retrieval reads the LLM Wiki built by host-side
+# tools/build_wiki.py. The container mounts ~/knowledge read-only at
+# /app/knowledge (see docker-compose.yml). When the wiki directory is not
+# present, SuccessionRAG transparently falls back to KC-only Phase 1.5
+# behavior.
+KNOWLEDGE_DIR = os.environ.get("KNOWLEDGE_DIR", "/app/knowledge")
 if GEMINI_API_KEY and OPENAI_API_KEY:
     succession_rag = SuccessionRAG(
         config_dir=CONFIG_DIR,
@@ -405,6 +411,7 @@ if GEMINI_API_KEY and OPENAI_API_KEY:
         answer_model=SUCCESSION_ANSWER_MODEL,
         reasoning_effort=OPENAI_REASONING_EFFORT,
         timeout_sec=OPENAI_TIMEOUT_MS / 1000.0,
+        knowledge_dir=KNOWLEDGE_DIR if os.path.isdir(KNOWLEDGE_DIR) else None,
     )
     # Try to load the persisted index synchronously; rebuild is on-demand via API.
     try:
@@ -4141,6 +4148,20 @@ async def main():
             return web.json_response({"error": str(e)}, status=500)
         return web.json_response(result)
 
+    async def handle_succession_reload_wiki(request):
+        """Reload the wiki index from disk after host-side build_wiki.py runs."""
+        if succession_rag is None:
+            return web.json_response(
+                {"error": "SuccessionRAG disabled"}, status=503,
+            )
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(None, succession_rag.reload_wiki)
+        except Exception as e:
+            log.exception("SuccessionRAG: wiki reload failed")
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response(result)
+
     async def handle_succession_ask(request):
         if succession_rag is None:
             return web.json_response(
@@ -4409,6 +4430,7 @@ async def main():
     # Succession RAG API (retrieval-augmented Q&A)
     mgmt_app.router.add_get("/succession/status", handle_succession_status)
     mgmt_app.router.add_post("/succession/rebuild", handle_succession_rebuild)
+    mgmt_app.router.add_post("/succession/reload_wiki", handle_succession_reload_wiki)
     mgmt_app.router.add_post("/succession/ask", handle_succession_ask)
     # Batch LLM correction API
     mgmt_app.router.add_get("/batch/status", handle_batch_llm_status)

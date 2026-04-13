@@ -984,6 +984,10 @@ async def handle_succession_rebuild(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/succession/rebuild", timeout_sec=120)
 
 
+async def handle_succession_reload_wiki(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "POST", "/succession/reload_wiki", timeout_sec=30)
+
+
 async def handle_succession_ask(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/succession/ask", timeout_sec=90)
 
@@ -1677,6 +1681,7 @@ def create_app() -> web.Application:
     # Succession RAG API
     app.router.add_get("/api/succession/status", handle_succession_status)
     app.router.add_post("/api/succession/rebuild", handle_succession_rebuild)
+    app.router.add_post("/api/succession/reload_wiki", handle_succession_reload_wiki)
     app.router.add_post("/api/succession/ask", handle_succession_ask)
 
     app.router.add_static("/static/", path=str(base_dir / "static"), name="static")

@@ -47,6 +47,7 @@ if str(_VIEWER_DIR) not in sys.path:
     sys.path.insert(0, str(_VIEWER_DIR))
 
 from exporter import SanitizedIndex  # noqa: E402
+from wiki_index import WikiIndex, WikiTopic  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -85,13 +86,15 @@ class SuccessionAnswer:
     elapsed_sec: float
     index_size: int
     warnings: list[str]
-    retrieval_mode: str = "hybrid"  # "hybrid" / "dense_only" / "bm25_only"
+    retrieval_mode: str = "hybrid"  # "hybrid" / "dense_only" / "bm25_only" / "parent_child"
+    wiki_topics: list[WikiTopic] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "query": self.query,
             "answer": self.answer,
             "sources": [s.to_dict() for s in self.sources],
+            "wiki_topics": [t.to_dict() for t in self.wiki_topics],
             "model": self.model,
             "elapsed_sec": self.elapsed_sec,
             "index_size": self.index_size,
@@ -159,48 +162,88 @@ _SYSTEM_PROMPT = """\
 あなたは事業経営者の過去の発言・判断を記録した「事業継承ナレッジベース」を
 参照して質問に答えるアシスタントです。
 
+入力には 2 種類の参照素材があります:
+
+- **Wiki トピック** (`[Wiki #N]`): 複数の発言をまとめた**統合済みの判断・知見**。
+  本人の方針が atomic にまとめられている。
+- **KC (Knowledge Card)** (`[KC #N]`): 個別セッションから抽出された**具体的な
+  原文 Q&A**。Wiki の根拠 (evidence) として使う。
+
 ## 回答ルール
 
-1. **提供された KC (Knowledge Card) の内容のみ**に基づいて答えてください。
-   外部知識や一般論で補完しないこと。
-2. KC に直接的な答えがない場合は「この質問に対応する記録はありません」と
-   率直に答え、一般論で埋めないでください。
-3. 複数の KC を組み合わせて回答してもよいが、**どの KC の情報を使ったか**を
-   回答の末尾で [#1] [#2] のように参照してください。
-4. 本人の語り口・判断パターンを尊重してください。KC の answer に書かれている
-   表現・価値観をそのまま継承すること。
-5. 回答は簡潔に (2〜5 文)。冗長な前置きは不要。
-6. **推測で語らない**: 「たぶん」「おそらく」で始まる文章は書かない。
+1. **Wiki トピックを主軸**にして答える。Wiki の本文は本人が複数回の議論で
+   到達した統合判断なので、まずこちらを優先する。
+2. **KC は具体的な裏付け**として補強する。日付・固有名詞・数値が必要なときに
+   引用する。
+3. **提供された Wiki/KC のみ**に基づいて答え、外部知識や一般論で補完しない。
+4. Wiki にも KC にも答えがない場合は「この質問に対応する記録はありません」と
+   率直に答え、無理に推測しない。
+5. 引用は **`[Wiki #N]` か `[KC #N]`** の形式で回答末尾に付ける。同じ事実を
+   両方が支持していれば `[Wiki #1][KC #3]` のように併記してよい。
+6. 本人の語り口・判断パターンを尊重する。Wiki/KC の表現をそのまま使う。
+7. 回答は簡潔に (2〜5 文)。冗長な前置きは不要。
+8. **推測禁止**: 「たぶん」「おそらく」「一般的には」で始まる文章は書かない。
 
-## KC の参照形式
-
-入力として以下の形式で KC が与えられます:
+## 入力フォーマット
 
 ```
-[#1] (セッション: 2026-03-28/10-00-00, confidence: high)
-コンテキスト: ...
+[Wiki #1] タイトル (domain: 物販, matches: 3 KCs, score: 0.10)
+<本文 markdown>
+
+[KC #1] (session: 2026-03-28/03-48-40, confidence: high, rrf: 0.033)
 Q: ...
 A: ...
-(根拠: ...)
 ```
 
-## 注意
+## 範囲外の質問
 
-ユーザーの質問が KC の範囲外の場合、無理に答えず次のように返答してください:
-「この質問に関する記録はありません。関連する過去の発言を挙げるなら [#1] [#2] です。」
+ユーザーの質問が Wiki / KC の範囲外なら無理せず:
+「この質問に関する記録はありません。関連する過去の話題があれば [Wiki #1] [Wiki #2] です。」
+と返答してください。
 """
 
 
-def _build_user_prompt(query: str, sources: list[KCSource]) -> str:
-    """Build the user message containing the query and top-K KC context."""
-    parts = [f"## 質問\n{query}\n\n## 参照可能な KC"]
-    for i, s in enumerate(sources, 1):
+def _build_user_prompt(
+    query: str,
+    sources: list[KCSource],
+    wiki_topics: Optional[list[WikiTopic]] = None,
+) -> str:
+    """Build the user message containing the query, wiki topics, and KCs.
+
+    If wiki_topics is non-empty, render them first as the synthesized parent
+    context, followed by the matching KCs as evidence. If wiki_topics is empty
+    or None, falls back to the original KC-only layout (Phase 1.5 behavior).
+    """
+    parts = [f"## 質問\n{query}"]
+
+    if wiki_topics:
+        parts.append("\n\n## 関連 Wiki トピック (統合された判断・知見)")
+        for i, t in enumerate(wiki_topics, 1):
+            header = (
+                f"\n[Wiki #{i}] {t.title} "
+                f"(domain: {t.domain}, matches: {t.matched_kc_count} KCs, "
+                f"score: {t.aggregate_score:.3f})"
+            )
+            parts.append(header)
+            # Cap the body to keep total prompt size bounded.
+            body = (t.body or "").strip()
+            if len(body) > 1500:
+                body = body[:1500].rstrip() + "\n..."
+            parts.append(body)
+
+        parts.append("\n\n## KC 引用 (原文の根拠 Q&A)")
+    else:
+        parts.append("\n\n## 参照可能な KC")
+
+    # Cap KC count when wiki is present, since wiki already provides synthesis
+    kc_limit = 8 if wiki_topics else len(sources)
+    for i, s in enumerate(sources[:kc_limit], 1):
         block = [
-            f"\n[#{i}] (セッション: {s.session_id}, confidence: {s.confidence}, "
+            f"\n[KC #{i}] (session: {s.session_id}, confidence: {s.confidence}, "
             f"rrf: {s.rrf_score:.3f})",
         ]
         if s.context:
-            block.append(f"コンテキスト: {s.context}")
+            block.append(f"context: {s.context}")
         block.append(f"Q: {s.question}")
         block.append(f"A: {s.answer}")
         if s.evidence:
@@ -208,8 +251,9 @@ def _build_user_prompt(query: str, sources: list[KCSource]) -> str:
             for ev in s.evidence[:3]:
                 block.append(f"  - {ev}")
         parts.append("\n".join(block))
+
     parts.append(
-        "\n\n## 回答\n上記ルールに従い、参照可能な KC のみを使って回答してください。"
+        "\n\n## 回答\n上記ルールに従い、Wiki を主軸 + KC を裏付けとして使って回答してください。"
     )
     return "\n".join(parts)
 
@@ -246,6 +290,7 @@ class SuccessionRAG:
         reasoning_effort: str = "low",
         max_output_tokens: int = 800,
         timeout_sec: float = 60.0,
+        knowledge_dir: str | Path | None = None,
     ) -> None:
         self._config_dir = Path(config_dir)
         self._gemini_key = gemini_api_key
@@ -264,6 +309,14 @@ class SuccessionRAG:
         self._bm25_corpus: list[list[str]] = []  # parallel to _sources
         self._fingerprint: str = ""
         self._index_version: int = 2  # bump when shape changes
+
+        # Wiki parent index (Phase 2.5)
+        self._wiki = WikiIndex(knowledge_dir) if knowledge_dir else None
+        if self._wiki and self._wiki.enabled:
+            try:
+                self._wiki.load()
+            except Exception as e:
+                log.warning("WikiIndex initial load failed: %s", e)
 
         # Lazy clients
         self._genai_client = None
@@ -292,6 +345,14 @@ class SuccessionRAG:
         return len(self._sources)
 
     def status(self) -> dict[str, Any]:
+        wiki_status = self._wiki.status() if self._wiki else None
+        # parent_child mode is automatic when wiki has data; otherwise stay on KC-only hybrid
+        if self._wiki and self._wiki.topic_count > 0:
+            mode = "parent_child"
+        elif self._bm25 is not None:
+            mode = "hybrid_rrf"
+        else:
+            mode = "dense_only"
         return {
             "enabled": self._enabled,
             "index_size": self.index_size,
@@ -301,9 +362,16 @@ class SuccessionRAG:
             "fingerprint": self._fingerprint,
             "index_path": str(self._npz_path),
             "index_version": self._index_version,
-            "retrieval_mode": "hybrid_rrf" if self._bm25 is not None else "dense_only",
+            "retrieval_mode": mode,
+            "wiki": wiki_status,
             "ready": self._embeddings is not None and len(self._sources) > 0,
         }
+
+    def reload_wiki(self) -> dict[str, Any]:
+        """Reload the wiki index from disk (called after host-side build_wiki.py runs)."""
+        if self._wiki is None:
+            return {"status": "disabled"}
+        return self._wiki.load()
 
     # -- client helpers ------------------------------------------------------
 
@@ -682,13 +750,89 @@ class SuccessionRAG:
             ))
         return results
 
+    # -- parent-child retrieval (Phase 2.5) ----------------------------------
+
+    def retrieve_with_wiki(
+        self,
+        query: str,
+        k_kcs: int = 15,
+        k_topics: int = 5,
+    ) -> tuple[list[KCSource], list[WikiTopic]]:
+        """LangChain Parent-Document-Retriever style:
+            1. Hybrid retrieve k_kcs KCs (precision layer)
+            2. Aggregate by parent wiki topic via session_id
+            3. Return top k_topics topics + the kcs that matched them
+
+        If the wiki index is empty/disabled, returns (kcs, []).
+        """
+        kcs = self.retrieve(query, k=k_kcs)
+        if not kcs:
+            return [], []
+        if self._wiki is None or self._wiki.topic_count == 0:
+            return kcs, []
+
+        # Aggregate KCs by wiki topic. The score for a topic is the sum of
+        # rrf_scores of its child KCs that hit, so a topic backed by 3
+        # strong KCs ranks above a topic backed by 1.
+        topic_scores: dict[int, float] = {}
+        topic_match_counts: dict[int, int] = {}
+        topic_kcs: dict[int, list[KCSource]] = {}
+
+        for kc in kcs:
+            for idx in self._wiki.topic_indices_for_session(kc.session_id):
+                topic_scores[idx] = topic_scores.get(idx, 0.0) + kc.rrf_score
+                topic_match_counts[idx] = topic_match_counts.get(idx, 0) + 1
+                topic_kcs.setdefault(idx, []).append(kc)
+
+        if not topic_scores:
+            # No KC mapped to a wiki topic — wiki may be stale relative to
+            # newly sanitized sessions. Fall back to KC-only.
+            return kcs, []
+
+        ranked = sorted(topic_scores.items(), key=lambda x: -x[1])[:k_topics]
+        wiki_topics: list[WikiTopic] = []
+        for idx, score in ranked:
+            t = self._wiki.get_topic(idx)
+            if t is None:
+                continue
+            # Return a *copy* so callers can mutate aggregate fields without
+            # polluting the cached topic. WikiTopic is dataclass with simple
+            # fields, asdict + new ctor would lose typing — copy by hand.
+            copy = WikiTopic(
+                path=t.path,
+                visibility=t.visibility,
+                title=t.title,
+                domain=t.domain,
+                body=t.body,
+                sources=list(t.sources),
+                confidence=t.confidence,
+                status=t.status,
+                manual=t.manual,
+                aggregate_score=float(score),
+                matched_kc_count=int(topic_match_counts.get(idx, 0)),
+            )
+            wiki_topics.append(copy)
+        return kcs, wiki_topics
+
     # -- answer --------------------------------------------------------------
 
     def ask(self, query: str, k: int = 5) -> SuccessionAnswer:
-        """Run the full RAG pipeline and return an answer + sources."""
+        """Run the full RAG pipeline and return an answer + sources.
+
+        If a wiki index is loaded, uses parent-child retrieval (Phase 2.5):
+        retrieve_with_wiki returns top KCs aggregated by their parent wiki
+        topic, and both are passed to the answer model. Otherwise falls
+        back to KC-only hybrid retrieval (Phase 1.5).
+        """
         t0 = time.time()
         warnings: list[str] = []
-        retrieval_mode = "hybrid" if self._bm25 is not None else "dense_only"
+        wiki_loaded = self._wiki is not None and self._wiki.topic_count > 0
+        if wiki_loaded:
+            retrieval_mode = "parent_child"
+        elif self._bm25 is not None:
+            retrieval_mode = "hybrid"
+        else:
+            retrieval_mode = "dense_only"
 
         if not self._enabled:
             return SuccessionAnswer(
@@ -714,7 +858,21 @@ class SuccessionRAG:
                 retrieval_mode=retrieval_mode,
             )
 
-        sources = self.retrieve(query, k=k)
+        wiki_topics: list[WikiTopic] = []
+        if wiki_loaded:
+            # Pull a wider KC pool so we can aggregate to topic level
+            sources, wiki_topics = self.retrieve_with_wiki(
+                query, k_kcs=max(k * 3, 15), k_topics=k,
+            )
+            if not wiki_topics:
+                # Wiki is loaded but none of the top KCs map to a topic
+                # (e.g. wiki is stale). Fall back to KC-only display.
+                warnings.append("wiki_no_match_fallback")
+                # Trim sources to the requested k for output
+                sources = sources[:k]
+        else:
+            sources = self.retrieve(query, k=k)
+
         if not sources:
             return SuccessionAnswer(
                 query=query,
@@ -727,7 +885,7 @@ class SuccessionRAG:
                 retrieval_mode=retrieval_mode,
             )
 
-        user_prompt = _build_user_prompt(query, sources)
+        user_prompt = _build_user_prompt(query, sources, wiki_topics or None)
 
         try:
             client = self._get_openai_client()
@@ -769,6 +927,7 @@ class SuccessionRAG:
             query=query,
             answer=answer_text,
             sources=sources,
+            wiki_topics=wiki_topics,
             model=self._answer_model,
             elapsed_sec=time.time() - t0,
             index_size=self.index_size,
