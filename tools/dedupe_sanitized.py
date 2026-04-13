@@ -20,7 +20,7 @@ Usage:
 
 Environment:
     GEMINI_API_KEY — required for the embedding API.
-    RAG_EMBED_MODEL — optional (default: text-embedding-004).
+    RAG_EMBED_MODEL — optional (default: gemini-embedding-001).
 """
 
 import argparse
@@ -214,8 +214,8 @@ def main() -> int:
                         help="Output JSONL path")
     parser.add_argument("--threshold", "-t", type=float, default=0.92,
                         help="Cosine similarity threshold (default: 0.92)")
-    parser.add_argument("--model", default=os.environ.get("RAG_EMBED_MODEL", "text-embedding-004"),
-                        help="Gemini embedding model")
+    parser.add_argument("--model", default=os.environ.get("RAG_EMBED_MODEL", "gemini-embedding-001"),
+                        help="Gemini embedding model (default: gemini-embedding-001)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report stats only, do not write output")
     args = parser.parse_args()
