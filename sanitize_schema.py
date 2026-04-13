@@ -188,11 +188,18 @@ def run_quality_gates(data: dict) -> list[str]:
         if pii_hits >= 2:
             warnings.append(f"risk_low_but_pii_found:{pii_hits}")
 
-    # 6. knowledge_card の品質検証 (Step 2 で追加された場合)
-    kc = data.get("knowledge_card")
-    if kc is not None and isinstance(kc, dict):
-        kc_warnings = validate_knowledge_card(kc)
-        warnings.extend(kc_warnings)
+    # 6. knowledge_cards の品質検証 (Step 2 で追加された場合)
+    cards = data.get("knowledge_cards")
+    if isinstance(cards, list):
+        for i, kc in enumerate(cards):
+            if isinstance(kc, dict):
+                for w in validate_knowledge_card(kc):
+                    warnings.append(f"kc[{i}]:{w}")
+    else:
+        # Legacy single-card fallback
+        kc = data.get("knowledge_card")
+        if kc is not None and isinstance(kc, dict):
+            warnings.extend(validate_knowledge_card(kc))
 
     return warnings
 
@@ -212,25 +219,29 @@ KC_EXTRACTION_SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
-            "extractable": {
-                "type": "boolean",
-            },
-            "question": {
-                "type": "string",
-            },
-            "answer": {
-                "type": "string",
-            },
-            "evidence": {
+            "extractable": {"type": "boolean"},
+            "cards": {
                 "type": "array",
-                "items": {"type": "string"},
-            },
-            "confidence": {
-                "type": "string",
-                "enum": ["none", "low", "medium", "high"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["none", "low", "medium", "high"],
+                        },
+                    },
+                    "required": ["question", "answer", "evidence", "confidence"],
+                    "additionalProperties": False,
+                },
             },
         },
-        "required": ["extractable", "question", "answer", "evidence", "confidence"],
+        "required": ["extractable", "cards"],
         "additionalProperties": False,
     },
 }
@@ -238,65 +249,120 @@ KC_EXTRACTION_SCHEMA = {
 # Minimum keypoints to attempt KC extraction
 KC_MIN_KEYPOINTS = 3
 
+# Maximum KCs per session (must match prompt instruction)
+KC_MAX_PER_SESSION = 5
+
+# Vague/generic question patterns to reject during quality gate
+_VAGUE_QUESTION_PATTERNS = [
+    r"について教えて",
+    r"どう思いますか",
+    r"要点を(再)?確認",
+    r"主なトピックは何",
+    r"どのような(内容|話|議論)",
+    r"何について(話|議論)",
+    r"全体の(内容|流れ|概要)",
+]
+_VAGUE_QUESTION_RE = re.compile("|".join(_VAGUE_QUESTION_PATTERNS))
+
 
 def validate_knowledge_card(kc: dict) -> list[str]:
-    """Knowledge card の品質ゲートを実行し warnings を返す.
+    """Per-card quality gate — returns list of warning strings.
 
-    Quality gates:
-    1. evidence が 1 件以上あること
-    2. confidence が low/none でないこと
-    3. question が抽象的すぎないこと (10 文字以上)
-    4. answer が一般論でないこと (15 文字以上)
+    Used for logging/metrics. The hard accept/reject decision is in
+    should_keep_knowledge_card().
     """
     warnings: list[str] = []
 
-    if not kc.get("extractable", False):
-        return warnings  # extractable=false なら検証不要
-
-    # 1. evidence >= 1
     evidence = kc.get("evidence", [])
     if not evidence:
         warnings.append("kc_no_evidence")
-        return warnings  # evidence なしは致命的 → 他の検証は不要
+        return warnings
 
-    # 2. confidence != low/none
     confidence = kc.get("confidence", "none")
     if confidence in ("none", "low"):
         warnings.append(f"kc_weak_confidence:{confidence}")
 
-    # 3. question の長さ
     question = kc.get("question", "")
-    if len(question) < 10:
+    if len(question) < 15:
         warnings.append("kc_question_too_short")
 
-    # 4. answer の長さ
     answer = kc.get("answer", "")
-    if len(answer) < 15:
+    if len(answer) < 20:
         warnings.append("kc_answer_too_short")
+
+    if _VAGUE_QUESTION_RE.search(question):
+        warnings.append("kc_question_vague")
 
     return warnings
 
 
 def should_keep_knowledge_card(kc: dict) -> bool:
-    """Knowledge card を最終出力に含めるべきか判定する.
+    """Hard quality gate — decide whether to keep a single KC in the output.
 
-    False を返す場合、knowledge_card は null にフォールバックする。
+    Rejects:
+        - no evidence
+        - confidence none/low
+        - question < 15 chars
+        - answer < 20 chars
+        - vague question pattern match
     """
-    if not kc.get("extractable", False):
-        return False
-
-    # evidence must exist
     if not kc.get("evidence"):
         return False
 
-    # confidence must be medium or high
     if kc.get("confidence", "none") in ("none", "low"):
         return False
 
-    # question/answer must have substance
-    if len(kc.get("question", "")) < 10:
+    question = kc.get("question", "")
+    if len(question) < 15:
         return False
-    if len(kc.get("answer", "")) < 15:
+
+    answer = kc.get("answer", "")
+    if len(answer) < 20:
+        return False
+
+    if _VAGUE_QUESTION_RE.search(question):
         return False
 
     return True
+
+
+def filter_knowledge_cards(data: dict) -> list[dict]:
+    """Extract and filter the `cards` array from a KC extraction response.
+
+    Supports both the new multi-card format (`cards: [...]`) and the
+    legacy single-card format (flat `question/answer/evidence/confidence`).
+    Returns cards that pass should_keep_knowledge_card(), deduplicated
+    by exact-question-match within the session.
+    """
+    if not data.get("extractable", False):
+        return []
+
+    candidates: list[dict] = []
+
+    cards = data.get("cards")
+    if isinstance(cards, list):
+        candidates = [c for c in cards if isinstance(c, dict)]
+    elif "question" in data and "answer" in data:
+        # Legacy single-card shape
+        candidates = [{
+            "question": data.get("question", ""),
+            "answer": data.get("answer", ""),
+            "evidence": data.get("evidence", []),
+            "confidence": data.get("confidence", "none"),
+        }]
+
+    # Apply hard gate + exact-question dedup
+    kept: list[dict] = []
+    seen_questions: set[str] = set()
+    for c in candidates:
+        if not should_keep_knowledge_card(c):
+            continue
+        q = c.get("question", "").strip()
+        if q in seen_questions:
+            continue
+        seen_questions.add(q)
+        kept.append(c)
+        if len(kept) >= KC_MAX_PER_SESSION:
+            break
+
+    return kept

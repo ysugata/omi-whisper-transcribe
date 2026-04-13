@@ -20,8 +20,8 @@ from sanitize_schema import (
     KC_EXTRACTION_SCHEMA,
     KC_MIN_KEYPOINTS,
     SANITIZE_SCHEMA,
+    filter_knowledge_cards,
     run_quality_gates,
-    should_keep_knowledge_card,
     validate_schema,
 )
 
@@ -40,8 +40,9 @@ _DEFAULT_RETRY_BASE_SEC = 2.0
 # Input truncation
 _MAX_INPUT_CHARS = 4000
 
-# Step 2: Knowledge Card extraction
-_KC_MAX_OUTPUT_TOKENS = 800
+# Step 2: Knowledge Card extraction (multi-card, up to 5 KCs per session)
+# Each card ≈ 200-300 tokens (q+a+evidence+confidence), so 2500 gives headroom.
+_KC_MAX_OUTPUT_TOKENS = 2500
 
 
 class ResponsesSanitizer(SanitizeProvider):
@@ -216,21 +217,31 @@ class ResponsesSanitizer(SanitizeProvider):
             log.warning(f"[{session_id}] schema validation failed (attempt {attempt})")
             return None  # → リトライ
 
-        # Step 2: Knowledge Card extraction (if enough keypoints)
-        data["knowledge_card"] = None
+        # Step 2: Knowledge Card extraction (multi-card, if enough keypoints)
+        data["knowledge_cards"] = []
+        data["knowledge_card"] = None  # legacy single-card field for back-compat
         kc_elapsed = 0.0
         if len(data.get("keypoints", [])) >= KC_MIN_KEYPOINTS:
             kc_result, kc_elapsed = self._extract_knowledge_card(session_id, data)
-            if kc_result is not None and should_keep_knowledge_card(kc_result):
-                data["knowledge_card"] = {
-                    "question": kc_result["question"],
-                    "answer": kc_result["answer"],
-                    "evidence": kc_result["evidence"],
-                    "confidence": kc_result["confidence"],
-                }
+            if kc_result is not None:
+                cards = filter_knowledge_cards(kc_result)
+                data["knowledge_cards"] = cards
+                if cards:
+                    # Populate legacy single field with highest-confidence card
+                    order = {"high": 0, "medium": 1, "low": 2, "none": 3}
+                    best = min(
+                        cards,
+                        key=lambda c: order.get(c.get("confidence", "none"), 4),
+                    )
+                    data["knowledge_card"] = {
+                        "question": best["question"],
+                        "answer": best["answer"],
+                        "evidence": best["evidence"],
+                        "confidence": best["confidence"],
+                    }
             else:
                 log.debug(
-                    f"[{session_id}] KC extraction: skipped or quality gate failed"
+                    f"[{session_id}] KC extraction: skipped or API returned None"
                 )
 
         total_elapsed = elapsed + kc_elapsed
@@ -246,21 +257,21 @@ class ResponsesSanitizer(SanitizeProvider):
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": getattr(response.usage, "total_tokens", 0),
             }
-            # reasoning_tokens は output_tokens_details にある場合がある
             details = getattr(response.usage, "output_tokens_details", None)
             if details:
                 usage["reasoning_tokens"] = getattr(details, "reasoning_tokens", 0)
 
         # 簡潔なログ (入力全文は出さない)
-        kc = data["knowledge_card"]
-        kc_info = "yes"  if kc else "no"
-        if kc:
-            kc_info += f" conf={kc.get('confidence', '?')}"
+        cards = data["knowledge_cards"]
+        kc_info = f"{len(cards)}"
+        if cards:
+            confs = [c.get("confidence", "?") for c in cards]
+            kc_info += f"({','.join(confs)})"
         log.info(
             f"[{session_id}] risk={data['risk']}, "
             f"keypoints={len(data['keypoints'])}, "
             f"conv={len(data['safe_conversation'])}turns, "
-            f"kcard={kc_info}, "
+            f"kcards={kc_info}, "
             f"issues={data['issues_detected']}, "
             f"warnings={warnings}, "
             f"{total_elapsed:.2f}s (step1={elapsed:.2f}s, step2={kc_elapsed:.2f}s)"

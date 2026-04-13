@@ -873,10 +873,16 @@ Step 1: 匿名化・構造化 (SANITIZE_SCHEMA)
   入力: raw_text (ASR 出力)
   出力: risk, summary, keypoints, safe_conversation, issues_detected
 
-Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
+Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA, multi-card)
   入力: Step 1 の cleaned output のみ (raw text は使わない)
-  出力: extractable, question, answer, evidence[], confidence
+  出力: extractable, knowledge_cards[] (最大 5 件 / session)
+        各 card: question, answer, evidence[], confidence
 ```
+
+**Multi-KC (V2)**: 1 セッションから最大 5 個の Q&A ペアを異なる視点
+(fact / reason / method / comparison / risk / lesson × 技術 / 経営 / 業務 /
+顧客) から抽出。Evol-Instruct / Explicit Diversity Conditions の手法に
+準拠。後方互換のため従来の単一 `knowledge_card` フィールドも併記。
 
 ### プロバイダ
 
@@ -891,9 +897,36 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 
 - **「生成」ではなく「根拠付き抽出」**: テキストに書かれていない外部知識を使わない
 - `evidence` (根拠) が必須: safe_conversation からの引用を含める
-- `confidence` が `medium` 以上のみ出力 (`low` / `none` は null にフォールバック)
+- `confidence` が `medium` 以上のみ出力 (`low` / `none` は破棄)
 - `keypoints` が 3 件未満のセッションは抽出をスキップ
-- question 10文字以上、answer 15文字以上の品質ゲート
+- **質問 15 文字以上、回答 20 文字以上**の品質ゲート
+- **曖昧な質問を自動拒否**: 「〜について教えてください」「どう思いますか」「要点を再確認」等のパターンを正規表現で検出 → 破棄
+- **セッション内 exact-question 重複排除** (filter_knowledge_cards)
+- **セッション横断の semantic 重複排除**: 別ツール `tools/dedupe_sanitized.py` で embedding ベースのクラスタリング (cosine ≥ 0.92)
+
+### セッション横断のセマンティック重複排除
+
+Multi-KC で生成された KC の中には、異なるセッション間で「Whisper Large は
+どの GPU で動作しますか?」と「RTX3060 の VRAM で Whisper Large は動くか?」
+のような実質同義の質問が発生する。NeMo Curator の semantic deduplication
+方式に従い、Gemini text-embedding-004 で質問文を埋め込み、cosine ≥ 0.92 で
+クラスタリングして各グループから confidence 最高の 1 件のみ残す。
+
+```bash
+# 単一ファイルを重複排除
+python tools/dedupe_sanitized.py \
+  --input config/safe_training_20260413_113103.jsonl \
+  --output config/safe_training_deduped.jsonl \
+  --threshold 0.92
+
+# 全 safe_training_*.jsonl を統合して重複排除
+python tools/dedupe_sanitized.py \
+  --input 'config/safe_training_*.jsonl' \
+  --output config/safe_training_merged_deduped.jsonl
+```
+
+環境変数: `GEMINI_API_KEY` (embedding API 用)。
+コスト: 100 KC ≈ $0.013 (約 2 円)。
 
 ### リスク判定
 
