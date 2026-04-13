@@ -2201,6 +2201,19 @@
         if (valRatio && parseFloat(valRatio.value) > 0) {
             params += "&val_ratio=" + encodeURIComponent(valRatio.value);
         }
+        // KC-targeted filters (new in V2 KC-sourced export)
+        var reqTagged = document.getElementById("export-require-tagged");
+        if (reqTagged && reqTagged.checked) params += "&require_tagged=true";
+        var reqSummary = document.getElementById("export-require-summary");
+        if (reqSummary && reqSummary.checked) params += "&require_summary=true";
+        var excPersonal = document.getElementById("export-exclude-personal-only");
+        if (excPersonal && excPersonal.checked) params += "&exclude_personal_only=true";
+        var highValOr = document.getElementById("export-high-value-or");
+        if (highValOr && highValOr.checked) params += "&high_value_or=true";
+        var extAudio = document.getElementById("export-external-audio-max");
+        if (extAudio && extAudio.value !== "" && !isNaN(parseFloat(extAudio.value))) {
+            params += "&external_audio_max=" + encodeURIComponent(extAudio.value);
+        }
         return params;
     }
 

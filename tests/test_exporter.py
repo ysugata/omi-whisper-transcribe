@@ -147,6 +147,56 @@ class TestSanitizedIndex:
         assert len(bucket["knowledge_cards"]) == 1
         assert bucket["knowledge_cards"][0]["confidence"] == "high"
 
+    def test_multi_card_format(self, tmp_path):
+        """SanitizedIndex reads the new knowledge_cards array shape."""
+        rec = {
+            "session_id": "2026-04-13/00-00-00",
+            "risk": "low",
+            "summary": {"input": "", "output": "AI 戦略議論"},
+            "keypoints": ["K1"],
+            "safe_conversation": [{"speaker": "user", "text": "x"}],
+            "issues_detected": [],
+            "knowledge_cards": [
+                {"question": "Q1 とても長い具体的な質問?", "answer": "A1 十分な長さの回答です。",
+                 "evidence": ["e1"], "confidence": "high"},
+                {"question": "Q2 別の角度からの具体的な質問?", "answer": "A2 別の具体的な回答です。",
+                 "evidence": ["e2"], "confidence": "medium"},
+            ],
+            "knowledge_card": None,
+        }
+        (tmp_path / "safe_training_20260413_000000.jsonl").write_text(
+            json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        idx = SanitizedIndex(tmp_path)
+        bucket = idx.get("2026-04-13/00-00-00")
+        assert bucket is not None
+        assert len(bucket["knowledge_cards"]) == 2
+        confs = [c["confidence"] for c in bucket["knowledge_cards"]]
+        assert "high" in confs
+        assert "medium" in confs
+
+    def test_multi_card_dedupes_within_session(self, tmp_path):
+        """Duplicate questions within one record must be deduped."""
+        rec = {
+            "session_id": "sid",
+            "risk": "low",
+            "summary": {"input": "", "output": ""},
+            "keypoints": [],
+            "safe_conversation": [],
+            "issues_detected": [],
+            "knowledge_cards": [
+                {"question": "同じ質問", "answer": "A1", "evidence": [], "confidence": "high"},
+                {"question": "同じ質問", "answer": "A2", "evidence": [], "confidence": "medium"},
+            ],
+            "knowledge_card": None,
+        }
+        (tmp_path / "safe_training_x.jsonl").write_text(
+            json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        idx = SanitizedIndex(tmp_path)
+        bucket = idx.get("sid")
+        assert len(bucket["knowledge_cards"]) == 1
+
     def test_training_sanitizer_format(self, tmp_path):
         records = [
             {"type": "summary", "session_id": "sid", "risk_level": "low",

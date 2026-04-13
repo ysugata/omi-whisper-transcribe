@@ -127,14 +127,37 @@ class SanitizedIndex:
                     for t in conv
                     if isinstance(t, dict)
                 ]
+            # New multi-card field takes precedence over the legacy single-card
+            seen_questions = {c["question"] for c in bucket["knowledge_cards"]}
+            kcs_multi = rec.get("knowledge_cards")
+            if isinstance(kcs_multi, list):
+                for kc in kcs_multi:
+                    if not isinstance(kc, dict):
+                        continue
+                    q = str(kc.get("question", "")).strip()
+                    a = str(kc.get("answer", "")).strip()
+                    if not q or not a or q in seen_questions:
+                        continue
+                    seen_questions.add(q)
+                    bucket["knowledge_cards"].append({
+                        "question": q,
+                        "answer": a,
+                        "evidence": kc.get("evidence") or [],
+                        "confidence": kc.get("confidence") or "medium",
+                    })
+            # Legacy single-card field (back-compat with pre-multi-KC runs)
             kc = rec.get("knowledge_card")
-            if isinstance(kc, dict) and kc.get("question") and kc.get("answer"):
-                bucket["knowledge_cards"].append({
-                    "question": str(kc.get("question", "")).strip(),
-                    "answer": str(kc.get("answer", "")).strip(),
-                    "evidence": kc.get("evidence") or [],
-                    "confidence": kc.get("confidence") or "medium",
-                })
+            if isinstance(kc, dict):
+                q = str(kc.get("question", "")).strip()
+                a = str(kc.get("answer", "")).strip()
+                if q and a and q not in seen_questions:
+                    seen_questions.add(q)
+                    bucket["knowledge_cards"].append({
+                        "question": q,
+                        "answer": a,
+                        "evidence": kc.get("evidence") or [],
+                        "confidence": kc.get("confidence") or "medium",
+                    })
             return
 
         # TrainingSanitizer format: multiple records per session, distinguished
