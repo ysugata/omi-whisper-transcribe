@@ -13,7 +13,7 @@ import aiohttp_jinja2
 import jinja2
 from aiohttp import web
 
-from exporter import export_session
+from exporter import SanitizedIndex, export_session
 from indexer import Indexer
 
 logging.basicConfig(
@@ -1163,6 +1163,21 @@ def _parse_export_params(request: web.Request) -> dict:
     else:
         include_monologue = fmt not in ("openai", "conversation")
 
+    # KC-targeted filters (new)
+    def _bool(name: str, default: bool = False) -> bool:
+        v = request.query.get(name, "").strip().lower()
+        if v in ("true", "1", "yes"):
+            return True
+        if v in ("false", "0", "no"):
+            return False
+        return default
+
+    ext_audio_raw = request.query.get("external_audio_max", "").strip()
+    try:
+        external_audio_max = float(ext_audio_raw) if ext_audio_raw else None
+    except ValueError:
+        external_audio_max = None
+
     return {
         "format": fmt,
         "date_from": request.query.get("date_from", "").strip(),
@@ -1179,6 +1194,11 @@ def _parse_export_params(request: web.Request) -> dict:
         "max_per_class": int(request.query.get("max_per_class", "0")),
         "val_ratio": float(request.query.get("val_ratio", "0")),
         "min_class_samples": int(request.query.get("min_class_samples", "0")),
+        "require_tagged": _bool("require_tagged"),
+        "require_summary": _bool("require_summary"),
+        "exclude_personal_only": _bool("exclude_personal_only"),
+        "external_audio_max": external_audio_max,
+        "high_value_or": _bool("high_value_or"),
     }
 
 
@@ -1202,6 +1222,11 @@ async def handle_export_stats(request: web.Request) -> web.Response:
             domain=params["domain"],
             importance_v2=params["importance_v2"],
             max_per_class=params["max_per_class"],
+            require_tagged=params["require_tagged"],
+            require_summary=params["require_summary"],
+            exclude_personal_only=params["exclude_personal_only"],
+            external_audio_max=params["external_audio_max"],
+            high_value_or=params["high_value_or"],
         )
     except Exception as e:
         logger.exception("Export stats failed")
@@ -1245,6 +1270,11 @@ async def handle_export_training(request: web.Request) -> web.Response:
             domain=params["domain"],
             importance_v2=params["importance_v2"],
             max_per_class=params["max_per_class"],
+            require_tagged=params["require_tagged"],
+            require_summary=params["require_summary"],
+            exclude_personal_only=params["exclude_personal_only"],
+            external_audio_max=params["external_audio_max"],
+            high_value_or=params["high_value_or"],
         )
     except Exception as e:
         logger.exception("Export query failed")
@@ -1256,7 +1286,18 @@ async def handle_export_training(request: web.Request) -> web.Response:
     val_ratio = params["val_ratio"]
     min_class_samples = params["min_class_samples"]
 
-    # Build all export lines first (needed for split & filtering)
+    # Load sanitized index (safe_training_*.jsonl) for chat-style formats.
+    # comprehensive still reads from raw transcripts.
+    sanitized_index: SanitizedIndex | None = None
+    if fmt in ("openai", "conversation", "knowledge", "decision_log", "sop"):
+        try:
+            sanitized_index = SanitizedIndex(Path(CONFIG_DIR))
+        except Exception:
+            logger.exception("Failed to load SanitizedIndex")
+            sanitized_index = SanitizedIndex()
+
+    # Build all export lines first (needed for split & filtering).
+    # Each session may emit 0-N JSONL lines (chat formats are multi-line).
     lines: list[tuple[str, str]] = []  # (line_json, conversation_type)
     for date, time_val in session_pairs:
         try:
@@ -1264,12 +1305,21 @@ async def handle_export_training(request: web.Request) -> web.Response:
             if not transcript:
                 continue
             session_id = f"{date}/{time_val}"
-            line = export_session(fmt, session_id, transcript, speaker_mode,
-                                  include_monologue=include_monologue)
-            if line:
+            sanitized = (
+                sanitized_index.get(session_id)
+                if sanitized_index is not None
+                else None
+            )
+            out_lines = export_session(
+                fmt, session_id, transcript, speaker_mode,
+                include_monologue=include_monologue,
+                sanitized=sanitized,
+            )
+            if out_lines:
                 ct = (transcript.get("session", {}).get("tags", {})
                       .get("conversation_type", "_untagged"))
-                lines.append((line, ct))
+                for line in out_lines:
+                    lines.append((line, ct))
         except Exception:
             logger.exception("Export error for %s/%s", date, time_val)
             continue
@@ -1349,6 +1399,20 @@ def _parse_sanitize_params(request: web.Request) -> dict:
 
     business_domain = request.query.get("business_domain", "").strip()
 
+    def _bool(name: str, default: bool = False) -> bool:
+        v = request.query.get(name, "").strip().lower()
+        if v in ("true", "1", "yes"):
+            return True
+        if v in ("false", "0", "no"):
+            return False
+        return default
+
+    ext_audio_raw = request.query.get("external_audio_max", "").strip()
+    try:
+        external_audio_max = float(ext_audio_raw) if ext_audio_raw else None
+    except ValueError:
+        external_audio_max = None
+
     return {
         "date_from": request.query.get("date_from", "").strip(),
         "date_to": request.query.get("date_to", "").strip(),
@@ -1359,6 +1423,11 @@ def _parse_sanitize_params(request: web.Request) -> dict:
         "domain": request.query.get("domain", "").strip(),
         "importance_v2": request.query.get("importance_v2", "").strip(),
         "min_segments": int(request.query.get("min_segments", "3")),
+        "require_tagged": _bool("require_tagged"),
+        "require_summary": _bool("require_summary"),
+        "exclude_personal_only": _bool("exclude_personal_only"),
+        "external_audio_max": external_audio_max,
+        "high_value_or": _bool("high_value_or"),
     }
 
 
@@ -1381,6 +1450,11 @@ async def handle_sanitize_start(request: web.Request) -> web.Response:
             conversation_type=params.get("conversation_type", ""),
             domain=params.get("domain", ""),
             importance_v2=params.get("importance_v2", ""),
+            require_tagged=params["require_tagged"],
+            require_summary=params["require_summary"],
+            exclude_personal_only=params["exclude_personal_only"],
+            external_audio_max=params["external_audio_max"],
+            high_value_or=params["high_value_or"],
         )
     except Exception as e:
         logger.exception("Sanitize session query failed")

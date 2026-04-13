@@ -766,22 +766,29 @@ Gemini API でセッション終了時に自動でメタデータタグを付与
 
 Viewer の **Export** タブまたは API からセッションデータを JSONL 形式でエクスポートできます。事業継承 AI のファインチューニングデータ生成を想定しています。
 
+**V2 の変更 (KC ソース切替)**: チャット形式 (`openai` / `conversation`) と構造化形式 (`knowledge` / `decision_log` / `sop`) は、raw transcript の話者マッピングではなく **Safe Training Data エクスポート (後述) の `config/safe_training_*.jsonl` から KC (knowledge card) / summary / keypoints を引いて学習レコードを合成** します。自然会話の話者ラベルを `assistant` ロールに流用する旧方式は、事業判断とは無関係の雑談を教師信号に昇格させる問題があったため廃止されました。
+
+このため:
+1. まず **Safe Training Data パイプライン** (Viewer の Sanitize タブ or `/api/sanitize/start`) を高価値セッションに対して実行
+2. `config/safe_training_*.jsonl` が生成される
+3. Export タブで対象フォーマットを選択してダウンロード → 上記 JSONL を読み込んで fine-tuning 用レコードを生成
+
 ### フォーマット
 
-| フォーマット | 用途 | 出力内容 |
-|---|---|---|
-| **OpenAI Fine-tuning** | GPT ファインチューニング | `messages` 形式 (system/user/assistant)。system message に V2 タクソノミー (会話の種類, 事業領域, 成果物, 重要度) を含む |
-| **ShareGPT / LLaMA-Factory** | オープンモデルのファインチューニング | `conversations` 形式 (human/gpt)。metadata に V2 タクソノミーを含む |
-| **Comprehensive** | 全メタデータ付き生データ | session + tags (V2 タクソノミー含む) + turns |
-| **Knowledge Base** | ナレッジ蓄積 | title, body, category (V2 domains), importance |
-| **Decision Log** | 意思決定記録 | decision, reason, action_items, outcome |
-| **SOP** | 手順書 / TODO 抽出 | steps, context, domain (V2 domains) |
+| フォーマット | 用途 | 出力内容 | ソース |
+|---|---|---|---|
+| **OpenAI Fine-tuning** | GPT ファインチューニング | `{"messages": [system, user, assistant]}` — 1 セッションから KC ごとの Q&A タスク + 要約タスクを複数行で出力 | sanitized JSONL |
+| **ShareGPT / LLaMA-Factory** | オープンソースモデル (Llama/Qwen/Mistral 等) の LoRA/QLoRA | `{"conversations": [{from:human}, {from:gpt}], "system": "..."}` — LLaMA-Factory 公式仕様通り (id/metadata は出力しない) | sanitized JSONL |
+| **Comprehensive** | 全メタデータ付き生データ (分析・デバッグ用) | session + tags (V2 タクソノミー) + turns + sanitized メタ情報 | raw transcript + (あれば) sanitized |
+| **Knowledge Base** | RAG ナレッジ蓄積 | title, body, qa_pairs[], category, entities, importance | sanitized > tags.summary fallback |
+| **Decision Log** | 意思決定記録 | decision, reasoning, outcomes, knowledge_cards[], domains | tags.decision_memo + outcomes + sanitized KC |
+| **SOP** | 手順書 / TODO 抽出 | steps (keypoints から), context, domain | outcomes=TODO発生/方針転換 + sanitized keypoints |
 
-- OpenAI / ShareGPT 形式では**独白セッションをデフォルトで除外** (Include Monologue チェックで変更可)
-- Knowledge は `summary` のあるセッションのみ出力
-- Decision Log は `decision_required=true` のセッションのみ出力
-- SOP は `action_items` があり `casual_chat` でないセッションのみ出力
-- V2 タクソノミー未設定のセッションは V1 タグ (activity, topics, mood, business_domain) にフォールバック
+- **OpenAI/ShareGPT**: sanitized KC が存在しない場合は空を返す (そのセッションはスキップ)
+- **Knowledge**: summary (sanitized or tags) があれば出力
+- **Decision Log**: `decision_memo` 非空 OR `outcomes` に意思決定あり OR sanitized KC の confidence≥medium
+- **SOP**: `outcomes` に TODO発生/方針転換 を含むセッションから sanitized keypoints を手順として抽出
+- マルチターン / DPO / ツール使用への将来拡張は ShareGPT 形式で対応可能
 
 ### フィルタ
 
@@ -799,6 +806,11 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 | `min_class_samples` | この件数未満のクラスを除外 (過学習防止) | 0 (除外なし) |
 | `val_ratio` | 検証データの割合 (0.2=20%)。>0 で ZIP (train+val) 出力 | 0 (分割なし) |
 | `include_monologue` | 独白セッションを含めるか | フォーマットによる |
+| `require_tagged` | session_tagged=1 のみ (KC 抽出に必須) | false |
+| `require_summary` | tags.summary 非空のみ | false |
+| `exclude_personal_only` | domains=["個人"] のみを除外 (複合は残す) | false |
+| `external_audio_max` | `tags_external_audio < N` (NULL 許容) | 制限なし |
+| `high_value_or` | 事業継承価値のある OR 条件 (重要度中+ / 有用 conv_type / decision_memo 非空 / outcomes に実質的成果物) | false |
 
 ### API
 
@@ -806,17 +818,48 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 # プレビュー (件数・サイズ推定)
 curl "http://localhost:8092/api/export/stats?format=knowledge&domain=経営"
 
-# ダウンロード
-curl -o knowledge.jsonl \
-  "http://localhost:8092/api/export/training?format=knowledge&min_segments=1"
+# ダウンロード (Safe Training Data 実行後)
+curl -o openai_ft.jsonl \
+  "http://localhost:8092/api/export/training?format=openai&require_tagged=true&require_summary=true&high_value_or=true&external_audio_max=0.8&exclude_personal_only=true&min_segments=5"
 
-# 意思決定ログのみ
+# ShareGPT (LLaMA-Factory 向け)
+curl -o sharegpt.jsonl \
+  "http://localhost:8092/api/export/training?format=conversation&require_tagged=true&require_summary=true&high_value_or=true&external_audio_max=0.8&exclude_personal_only=true&min_segments=5"
+
+# Knowledge Base
+curl -o knowledge.jsonl \
+  "http://localhost:8092/api/export/training?format=knowledge&require_summary=true"
+
+# 意思決定ログ
 curl -o decisions.jsonl \
-  "http://localhost:8092/api/export/training?format=decision_log&min_segments=1"
+  "http://localhost:8092/api/export/training?format=decision_log"
 
 # SOP (手順書)
 curl -o sop.jsonl \
-  "http://localhost:8092/api/export/training?format=sop&min_segments=1"
+  "http://localhost:8092/api/export/training?format=sop"
+```
+
+**推奨フロー** (1,000件超のセッションがある場合):
+
+```bash
+# 1. 高価値セッション (目安 50-80件) を sanitize パイプラインに投入
+curl -X POST "http://localhost:8092/api/sanitize/start" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  -G \
+  --data-urlencode "require_tagged=true" \
+  --data-urlencode "require_summary=true" \
+  --data-urlencode "high_value_or=true" \
+  --data-urlencode "external_audio_max=0.8" \
+  --data-urlencode "exclude_personal_only=true" \
+  --data-urlencode "min_segments=5" \
+  --data-urlencode "quality=clean,partial"
+
+# 2. 進捗確認
+curl "http://localhost:8092/api/sanitize/status"
+
+# 3. 完了後、同じフィルタで export
+curl -o openai_ft.jsonl "http://localhost:8092/api/export/training?format=openai&require_tagged=true&..."
 ```
 
 ## Safe Training Data エクスポート (LLM 匿名化)
@@ -839,10 +882,10 @@ Step 2: Knowledge Card 抽出 (KC_EXTRACTION_SCHEMA)
 
 | プロバイダ | API | 特徴 |
 |---|---|---|
-| **OpenAI Responses API** (推奨) | `OPENAI_API_KEY` 設定時 | GPT-5 nano + Structured Outputs で schema 準拠を保証、2-step KC 抽出対応 |
-| **Chat Completions API** (フォールバック) | `GEMINI_API_KEY` のみ | Gemini 2.5 Flash、json_object 形式 |
+| **OpenAI Responses API** (推奨) | `SANITIZE_MODEL=gpt-5-nano` + `OPENAI_API_KEY` | GPT-5 nano + Structured Outputs で schema 準拠を保証、2-step KC 抽出対応 |
+| **Chat Completions API** (フォールバック) | `SANITIZE_MODEL=gemini-2.5-flash` + `GEMINI_API_KEY` | Gemini 2.5 Flash、json_object 形式。KC 抽出品質は Responses API より低い |
 
-`OPENAI_API_KEY` が設定されていれば Responses API が優先されます。
+`SANITIZE_MODEL` が `gpt-*` で始まると自動的に Responses API (2-step pipeline) が有効化されます。事業継承 AI 向けの学習データを作るなら **必ず `gpt-5-nano` 推奨**。
 
 ### Knowledge Card の抽出ルール
 

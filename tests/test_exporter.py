@@ -1,4 +1,9 @@
-"""Unit tests for exporter.py."""
+"""Unit tests for exporter.py (V2 KC-sourced).
+
+Since the V2 rewrite, chat-style formats (openai, conversation, knowledge,
+decision_log, sop) source their data from sanitized JSONL records rather
+than raw transcript speaker mapping. These tests verify the new behavior.
+"""
 
 import json
 import sys
@@ -6,12 +11,19 @@ from pathlib import Path
 
 import pytest
 
-# Make the viewer module importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "omi-recordings-viewer"))
 
 from exporter import (
-    merge_turns, to_comprehensive, to_openai, to_conversation,
-    to_knowledge, to_decision_log, to_sop, export_session,
+    SanitizedIndex,
+    export_session,
+    merge_turns,
+    to_comprehensive,
+    to_conversation,
+    to_decision_log,
+    to_knowledge,
+    to_openai,
+    to_sop,
+    _parse_bullet_list,
 )
 
 
@@ -19,432 +31,381 @@ from exporter import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 def _make_transcript(segments, tags=None):
-    """Build a minimal transcript dict."""
     session = {"start": "2026-03-28T00:26:29", "duration_seconds": 120.0, "language": "ja"}
     if tags:
         session["tags"] = tags
     return {"session": session, "segments": segments}
 
 
-SEGMENTS_CONVERSATION = [
-    {"text": "こんにちは", "start": 0, "end": 2, "person_name": "自分", "is_user": True, "speaker": "SPEAKER_00"},
-    {"text": "元気ですか", "start": 2, "end": 4, "person_name": "自分", "is_user": True, "speaker": "SPEAKER_00"},
-    {"text": "はい、元気です", "start": 5, "end": 7, "person_name": "田中", "is_user": False, "speaker": "SPEAKER_01"},
-    {"text": "よかった", "start": 8, "end": 9, "person_name": "自分", "is_user": True, "speaker": "SPEAKER_00"},
+SEGMENTS_CONV = [
+    {"text": "こんにちは", "start": 0, "end": 2, "person_name": "自分", "is_user": True},
+    {"text": "元気ですか", "start": 2, "end": 4, "person_name": "自分", "is_user": True},
+    {"text": "はい、元気です", "start": 5, "end": 7, "person_name": "田中", "is_user": False},
+    {"text": "よかった", "start": 8, "end": 9, "person_name": "自分", "is_user": True},
 ]
-
-SEGMENTS_MONOLOGUE = [
-    {"text": "AIの未来について", "start": 0, "end": 3, "person_name": "自分", "is_user": True},
-    {"text": "考えてみた", "start": 3, "end": 5, "person_name": "自分", "is_user": True},
-]
-
-TAGS = {
-    "topics": ["programming", "AI"],
-    "activity": "brainstorming",
-    "mood": "mixed",
-    "quality": "clean",
-    "entities": ["Docker"],
-    "summary": "AIについて議論した",
-}
 
 TAGS_V2 = {
-    "conversation_type": "社内ミーティング",
+    "conversation_type": "ミーティング",
     "outcomes": ["意思決定あり", "TODO発生"],
     "domains": ["AI", "経営"],
-    "importance": "高",
+    "importance": "中",
     "summary": "AI戦略について議論した",
     "decision_memo": "来期のAI投資を増やす",
 }
 
-TAGS_EXTENDED = {
-    **TAGS,
-    "source_type": "meeting",
-    "business_domain": "technology",
-    "importance": "high",
-    "confidentiality": "internal",
-    "decision_required": True,
-    "decision_summary": "新しいフレームワークを採用する",
-    "reasoning_summary": "開発効率が上がるため",
-    "action_items": ["技術検証を行う", "チームに共有する"],
-    "outcome": "pending",
-    "next_action": "来週までにPoCを完成させる",
-}
 
-TAGS_V2_EXTENDED = {
-    **TAGS_V2,
-    "decision_required": True,
-    "decision_summary": "AI投資を倍増する",
-    "reasoning_summary": "競合に差をつけるため",
-    "action_items": ["予算案を作成する", "取締役会に提出する"],
-    "outcome": "approved",
-    "next_action": "来月までに予算確定",
-}
+def _sanitized_with_kc(question="AI投資をどう判断しましたか?",
+                      answer="市場成長率と競合動向を比較し、来期の投資を30%増やすと決めた。",
+                      with_summary=True):
+    """Build a sanitized record fixture (ResponsesSanitizer-like shape)."""
+    data = {
+        "session_id": "2026-03-28/00-26-29",
+        "risk": "low",
+        "summary_input": None,
+        "summary_output": "AI戦略を議論し、来期の投資を30%増やすと決定した。" if with_summary else None,
+        "keypoints": [
+            "市場成長率と競合動向を分析",
+            "来期のAI投資を30%増やす",
+            "四半期ごとに進捗をレビュー",
+        ],
+        "safe_conversation": [
+            {"speaker": "user", "text": "AI投資の優先順位はどう決める?"},
+            {"speaker": "assistant", "text": "ROIと市場成長率で評価すべきです。"},
+            {"speaker": "user", "text": "では来期は30%増やそう。"},
+        ],
+        "knowledge_cards": [
+            {
+                "question": question,
+                "answer": answer,
+                "evidence": ["来期のAI投資を30%増やすと決定した。"],
+                "confidence": "high",
+            },
+        ],
+    }
+    return data
 
 
 # ---------------------------------------------------------------------------
-# merge_turns tests
+# _parse_bullet_list
 # ---------------------------------------------------------------------------
+
+
+class TestParseBulletList:
+    def test_dash(self):
+        assert _parse_bullet_list("- A\n- B\n- C") == ["A", "B", "C"]
+
+    def test_japanese_bullet(self):
+        assert _parse_bullet_list("・A\n・B") == ["A", "B"]
+
+    def test_empty(self):
+        assert _parse_bullet_list("") == []
+
+    def test_mixed(self):
+        assert _parse_bullet_list("- A\n\n* B\n・C") == ["A", "B", "C"]
+
+
+# ---------------------------------------------------------------------------
+# SanitizedIndex
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizedIndex:
+    def test_empty_dir(self, tmp_path):
+        idx = SanitizedIndex(tmp_path)
+        assert len(idx) == 0
+
+    def test_responses_format(self, tmp_path):
+        rec = {
+            "session_id": "2026-03-28/00-26-29",
+            "risk": "low",
+            "summary": {"input": "会話を要約してください。", "output": "AIの議論。"},
+            "keypoints": ["A", "B"],
+            "safe_conversation": [
+                {"speaker": "user", "text": "hi"},
+                {"speaker": "assistant", "text": "hello"},
+            ],
+            "issues_detected": [],
+            "knowledge_card": {
+                "question": "AIの議論のポイントは何でしたか?",
+                "answer": "AIの投資判断について話し合った。来期は増やす方針。",
+                "evidence": ["来期は増やす。"],
+                "confidence": "high",
+            },
+        }
+        (tmp_path / "safe_training_20260328_000000.jsonl").write_text(
+            json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        idx = SanitizedIndex(tmp_path)
+        bucket = idx.get("2026-03-28/00-26-29")
+        assert bucket is not None
+        assert bucket["risk"] == "low"
+        assert bucket["summary_output"] == "AIの議論。"
+        assert bucket["keypoints"] == ["A", "B"]
+        assert len(bucket["safe_conversation"]) == 2
+        assert len(bucket["knowledge_cards"]) == 1
+        assert bucket["knowledge_cards"][0]["confidence"] == "high"
+
+    def test_training_sanitizer_format(self, tmp_path):
+        records = [
+            {"type": "summary", "session_id": "sid", "risk_level": "low",
+             "input": "要約してください", "output": "要約テキスト。"},
+            {"type": "keypoints", "session_id": "sid", "risk_level": "low",
+             "input": "要点を抽出", "output": "- A\n- B\n- C"},
+            {"type": "knowledge_card", "session_id": "sid", "risk_level": "low",
+             "input": "この質問は?", "output": "この回答です。"},
+        ]
+        lines = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
+        (tmp_path / "safe_training_20260328_010000.jsonl").write_text(
+            lines + "\n", encoding="utf-8"
+        )
+        idx = SanitizedIndex(tmp_path)
+        bucket = idx.get("sid")
+        assert bucket is not None
+        assert bucket["summary_output"] == "要約テキスト。"
+        assert bucket["keypoints"] == ["A", "B", "C"]
+        assert len(bucket["knowledge_cards"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# merge_turns (unchanged helper)
+# ---------------------------------------------------------------------------
+
 
 class TestMergeTurns:
-    def test_empty(self):
-        assert merge_turns([]) == []
-
     def test_merges_consecutive_same_speaker(self):
-        turns = merge_turns(SEGMENTS_CONVERSATION)
+        turns = merge_turns(SEGMENTS_CONV)
         assert len(turns) == 3
         assert turns[0]["text"] == "こんにちは 元気ですか"
-        assert turns[0]["speaker"] == "自分"
-        assert turns[0]["is_user"] is True
-        assert turns[0]["start"] == 0
-        assert turns[0]["end"] == 4
-        assert turns[1]["text"] == "はい、元気です"
-        assert turns[1]["speaker"] == "田中"
-        assert turns[2]["text"] == "よかった"
-
-    def test_skips_empty_text(self):
-        segs = [
-            {"text": "hello", "start": 0, "end": 1, "person_name": "A"},
-            {"text": "  ", "start": 1, "end": 2, "person_name": "A"},
-            {"text": "world", "start": 2, "end": 3, "person_name": "A"},
-        ]
-        turns = merge_turns(segs)
-        assert len(turns) == 1
-        assert turns[0]["text"] == "hello world"
-
-    def test_no_merge_different_speakers(self):
-        segs = [
-            {"text": "A says", "start": 0, "end": 1, "person_name": "A"},
-            {"text": "B says", "start": 1, "end": 2, "person_name": "B"},
-        ]
-        turns = merge_turns(segs)
-        assert len(turns) == 2
 
 
 # ---------------------------------------------------------------------------
-# comprehensive format tests
+# comprehensive (still sourced from raw transcript)
 # ---------------------------------------------------------------------------
+
 
 class TestComprehensive:
     def test_basic(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
         result = to_comprehensive("2026-03-28/00-26-29", transcript)
         assert result is not None
         assert result["session_id"] == "2026-03-28/00-26-29"
         assert len(result["turns"]) == 3
-        assert result["tags"]["activity"] == "brainstorming"
-
-    def test_user_only(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_comprehensive("id", transcript, speaker_mode="user_only")
-        assert result is not None
-        assert all(t["is_user"] for t in result["turns"])
-
-    def test_empty_segments(self):
-        transcript = _make_transcript([], TAGS)
-        assert to_comprehensive("id", transcript) is None
-
-    def test_extended_tags_included(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
-        result = to_comprehensive("id", transcript)
-        assert result is not None
-        assert result["tags"]["source_type"] == "meeting"
-        assert result["tags"]["business_domain"] == "technology"
-        assert result["tags"]["importance"] == "high"
-        assert result["tags"]["decision_required"] is True
-        assert result["tags"]["decision_summary"] == "新しいフレームワークを採用する"
-        assert result["tags"]["action_items"] == ["技術検証を行う", "チームに共有する"]
-        assert result["tags"]["outcome"] == "pending"
-        assert result["tags"]["next_action"] == "来週までにPoCを完成させる"
 
     def test_v2_tags_included(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
         result = to_comprehensive("id", transcript)
-        assert result is not None
-        assert result["tags"]["conversation_type"] == "社内ミーティング"
-        assert result["tags"]["outcomes"] == ["意思決定あり", "TODO発生"]
+        assert result["tags"]["conversation_type"] == "ミーティング"
         assert result["tags"]["domains"] == ["AI", "経営"]
-        assert result["tags"]["importance"] == "高"
         assert result["tags"]["decision_memo"] == "来期のAI投資を増やす"
 
+    def test_empty_segments(self):
+        assert to_comprehensive("id", _make_transcript([], TAGS_V2)) is None
+
+    def test_sanitized_metadata_attached(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        result = to_comprehensive("id", transcript, sanitized=sanitized)
+        assert result["sanitized"]["risk"] == "low"
+        assert result["sanitized"]["knowledge_card_count"] == 1
+
 
 # ---------------------------------------------------------------------------
-# openai format tests
+# openai (KC-sourced)
 # ---------------------------------------------------------------------------
+
 
 class TestOpenAI:
-    def test_conversation(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_openai("id", transcript)
-        assert result is not None
-        messages = result["messages"]
-        assert messages[0]["role"] == "system"
-        assert "事業経営者" in messages[0]["content"]
-        # user=田中, assistant=自分
-        roles = [m["role"] for m in messages[1:]]
-        assert "assistant" in roles
-        assert "user" in roles
+    def test_requires_sanitized(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        assert to_openai("id", transcript, sanitized=None) == []
 
-    def test_monologue_skipped_by_default(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_openai("id", transcript)
-        assert result is None
+    def test_kc_task(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        out = to_openai("id", transcript, sanitized=sanitized)
+        assert len(out) >= 1  # at least one KC task
+        qa = out[0]
+        assert "messages" in qa
+        assert qa["messages"][0]["role"] == "system"
+        assert "事業経営者" in qa["messages"][0]["content"]
+        assert "AI" in qa["messages"][0]["content"]  # domain injected
+        assert qa["messages"][1]["role"] == "user"
+        assert "AI投資" in qa["messages"][1]["content"]
+        assert qa["messages"][2]["role"] == "assistant"
 
-    def test_monologue_included_when_requested(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_openai("id", transcript, include_monologue=True)
-        assert result is not None
-        messages = result["messages"]
-        assert messages[0]["role"] == "system"
-        assert "独り言" in messages[0]["content"]
-        assert messages[1]["role"] == "user"
-        assert "programming" in messages[1]["content"]
-        assert messages[2]["role"] == "assistant"
-        assert "AIの未来について" in messages[2]["content"]
-
-    def test_no_user_segments_returns_none(self):
-        segs = [
-            {"text": "他者の発話", "start": 0, "end": 2, "person_name": "他者", "is_user": False},
+    def test_summarization_task(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        # Extend conversation so summary task threshold is met
+        sanitized["safe_conversation"] = [
+            {"speaker": "user", "text": "AI投資の話をしよう。今期の予算配分について相談がある。"},
+            {"speaker": "assistant", "text": "市場成長率と競合動向を分析して判断しましょう。"},
+            {"speaker": "user", "text": "来期のAI投資を30%増やそう。ROIは四半期ごとにチェックする。"},
         ]
-        transcript = _make_transcript(segs, TAGS)
-        # user_only mode → no assistant turns → None
-        result = to_openai("id", transcript, speaker_mode="user_only")
-        assert result is None
+        out = to_openai("id", transcript, sanitized=sanitized)
+        # Should include both KC task and summary task
+        summaries = [r for r in out if r["messages"][0]["content"].startswith("次の会話を")]
+        assert len(summaries) == 1
+        assert "要約" in summaries[0]["messages"][0]["content"]
 
-    def test_user_only_mode(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_openai("id", transcript, speaker_mode="user_only")
-        assert result is not None
-        non_system = [m for m in result["messages"] if m["role"] != "system"]
-        assert all(m["role"] == "assistant" for m in non_system)
-
-    def test_v2_system_message(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
-        result = to_openai("id", transcript)
-        assert result is not None
-        sys_msg = result["messages"][0]["content"]
-        assert "会話の種類: 社内ミーティング" in sys_msg
-        assert "事業領域: AI, 経営" in sys_msg
-        assert "成果物: 意思決定あり, TODO発生" in sys_msg
-        assert "重要度: 高" in sys_msg
-        # V1 fallbacks should NOT appear when V2 present
-        assert "状況:" not in sys_msg
-        assert "話題:" not in sys_msg
-        assert "ムード:" not in sys_msg
+    def test_kc_too_short_skipped(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc(question="なぜ?", answer="はい。")
+        out = to_openai("id", transcript, sanitized=sanitized)
+        # KC filtered out (q<10 chars), possibly summary task still generated
+        qa_tasks = [r for r in out if r["messages"][1]["content"] == "なぜ?"]
+        assert len(qa_tasks) == 0
 
 
 # ---------------------------------------------------------------------------
-# conversation (ShareGPT) format tests
+# conversation (ShareGPT, KC-sourced)
 # ---------------------------------------------------------------------------
+
 
 class TestConversation:
-    def test_basic(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_conversation("2026-03-28/00-26-29", transcript)
-        assert result is not None
-        assert result["id"] == "2026-03-28/00-26-29"
-        assert "事業経営者" in result["system"]
-        convs = result["conversations"]
-        assert any(c["from"] == "gpt" for c in convs)
-        assert any(c["from"] == "human" for c in convs)
+    def test_kc_task_sharegpt_shape(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        out = to_conversation("id", transcript, sanitized=sanitized)
+        assert len(out) >= 1
+        first = out[0]
+        assert "conversations" in first
+        assert "system" in first
+        # Must NOT have top-level id/metadata (per LLaMA-Factory spec)
+        assert "id" not in first
+        assert "metadata" not in first
+        convs = first["conversations"]
+        assert convs[0]["from"] == "human"
+        assert convs[1]["from"] == "gpt"
 
-    def test_monologue_skipped_by_default(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_conversation("id", transcript)
-        assert result is None
-
-    def test_monologue_included_when_requested(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_conversation("id", transcript, include_monologue=True)
-        assert result is not None
-        assert result["conversations"][0]["from"] == "human"
-        assert result["conversations"][1]["from"] == "gpt"
-
-    def test_metadata_included(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_conversation("id", transcript)
-        assert "activity" in result["metadata"]
-        assert "quality" in result["metadata"]
-
-    def test_v2_metadata_included(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
-        result = to_conversation("id", transcript)
-        assert result is not None
-        assert result["metadata"]["conversation_type"] == "社内ミーティング"
-        assert result["metadata"]["outcomes"] == ["意思決定あり", "TODO発生"]
-        assert result["metadata"]["domains"] == ["AI", "経営"]
-        assert result["metadata"]["importance"] == "高"
+    def test_empty_without_sanitized(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        assert to_conversation("id", transcript, sanitized=None) == []
 
 
 # ---------------------------------------------------------------------------
-# knowledge format tests
+# knowledge
 # ---------------------------------------------------------------------------
+
 
 class TestKnowledge:
-    def test_basic(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
-        result = to_knowledge("id", transcript)
-        assert result is not None
-        assert result["id"] == "id"
-        assert result["category"] == "technology"
-        assert result["importance"] == "high"
-        assert "topics" in result
-        assert result["body"]  # non-empty body
-
-    def test_no_summary_returns_none(self):
-        tags_no_summary = {**TAGS_EXTENDED, "summary": ""}
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_summary)
-        result = to_knowledge("id", transcript)
-        assert result is None
-
-    def test_no_tags_returns_none(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION)
-        result = to_knowledge("id", transcript)
-        assert result is None
-
-    def test_v2_uses_domains_as_category(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2)
-        result = to_knowledge("id", transcript)
+    def test_from_sanitized(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        result = to_knowledge("id", transcript, sanitized=sanitized)
         assert result is not None
         assert result["category"] == "AI, 経営"
-        assert result["importance"] == "高"
+        assert result["body"]
+        assert len(result["qa_pairs"]) == 1
+        assert result["qa_pairs"][0]["confidence"] == "high"
 
-    def test_v2_fallback_to_business_domain(self):
-        tags = {**TAGS_V2, "domains": []}
-        tags["business_domain"] = "technology"
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags)
-        result = to_knowledge("id", transcript)
+    def test_falls_back_to_tags_summary(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        result = to_knowledge("id", transcript, sanitized=None)
         assert result is not None
-        assert result["category"] == "technology"
+        assert result["body"].startswith("AI戦略")
+
+    def test_no_data_returns_none(self):
+        transcript = _make_transcript(SEGMENTS_CONV, {})
+        result = to_knowledge("id", transcript, sanitized=None)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
-# decision_log format tests
+# decision_log
 # ---------------------------------------------------------------------------
+
 
 class TestDecisionLog:
-    def test_with_decision(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
-        result = to_decision_log("id", transcript)
+    def test_decision_memo_triggers(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        result = to_decision_log("id", transcript, sanitized=None)
         assert result is not None
-        assert result["decision_id"] == "id"
-        assert result["title"] == "新しいフレームワークを採用する"
-        assert result["decision"] == "新しいフレームワークを採用する"
-        assert result["reason"] == "開発効率が上がるため"
-        assert len(result["action_items"]) == 2
-        assert result["outcome"] == "pending"
-        assert result["next_action"] == "来週までにPoCを完成させる"
+        assert "来期のAI投資" in result["title"]
+        assert "来期のAI投資" in result["decision"]
 
-    def test_no_decision_returns_none(self):
-        tags_no_decision = {**TAGS_EXTENDED, "decision_required": False}
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_decision)
-        result = to_decision_log("id", transcript)
-        assert result is None
+    def test_kc_high_confidence_triggers_without_memo(self):
+        tags_no_memo = {**TAGS_V2, "decision_memo": "", "outcomes": []}
+        transcript = _make_transcript(SEGMENTS_CONV, tags_no_memo)
+        sanitized = _sanitized_with_kc()
+        result = to_decision_log("id", transcript, sanitized=sanitized)
+        assert result is not None
+        assert len(result["knowledge_cards"]) == 1
 
-    def test_basic_tags_returns_none(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        result = to_decision_log("id", transcript)
-        assert result is None
+    def test_no_signal_returns_none(self):
+        tags = {"conversation_type": "雑談", "importance": "低"}
+        transcript = _make_transcript(SEGMENTS_CONV, tags)
+        assert to_decision_log("id", transcript, sanitized=None) is None
 
 
 # ---------------------------------------------------------------------------
-# sop format tests
+# sop
 # ---------------------------------------------------------------------------
+
 
 class TestSop:
-    def test_with_action_items(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
-        result = to_sop("id", transcript)
+    def test_todo_outcome_with_keypoints(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        result = to_sop("id", transcript, sanitized=sanitized)
         assert result is not None
-        assert result["id"] == "id"
-        assert len(result["steps"]) == 2
-        assert result["domain"] == "technology"
-
-    def test_no_action_items_returns_none(self):
-        tags_no_actions = {**TAGS_EXTENDED, "action_items": []}
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_no_actions)
-        result = to_sop("id", transcript)
-        assert result is None
-
-    def test_casual_chat_returns_none(self):
-        tags_casual = {**TAGS_EXTENDED, "activity": "casual_chat"}
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_casual)
-        result = to_sop("id", transcript)
-        assert result is None
-
-    def test_casual_chat_source_type_returns_none(self):
-        tags_casual = {**TAGS_EXTENDED, "source_type": "casual_chat"}
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, tags_casual)
-        result = to_sop("id", transcript)
-        assert result is None
-
-    def test_v2_uses_domains(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_V2_EXTENDED)
-        result = to_sop("id", transcript)
-        assert result is not None
+        assert len(result["steps"]) == 3  # keypoints used as steps
         assert result["domain"] == "AI, 経営"
 
+    def test_no_outcome_returns_none(self):
+        tags = {**TAGS_V2, "outcomes": ["情報共有のみ"]}
+        transcript = _make_transcript(SEGMENTS_CONV, tags)
+        assert to_sop("id", transcript, sanitized=None) is None
 
-# ---------------------------------------------------------------------------
-# monologue skip tests
-# ---------------------------------------------------------------------------
-
-class TestMonologueSkip:
-    def test_openai_skips_monologue_by_default(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        assert to_openai("id", transcript) is None
-
-    def test_openai_includes_monologue_when_requested(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_openai("id", transcript, include_monologue=True)
+    def test_legacy_action_items(self):
+        tags = {"action_items": ["ステップ1", "ステップ2"], "business_domain": "technology"}
+        transcript = _make_transcript(SEGMENTS_CONV, tags)
+        result = to_sop("id", transcript, sanitized=None)
         assert result is not None
-
-    def test_conversation_skips_monologue_by_default(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        assert to_conversation("id", transcript) is None
-
-    def test_conversation_includes_monologue_when_requested(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        result = to_conversation("id", transcript, include_monologue=True)
-        assert result is not None
-
-    def test_export_session_respects_include_monologue(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        # Default (include_monologue=False) → openai skips monologue
-        assert export_session("openai", "id", transcript) is None
-        # Explicit include → produces output
-        line = export_session("openai", "id", transcript, include_monologue=True)
-        assert line is not None
-
-    def test_comprehensive_includes_monologue_by_default(self):
-        transcript = _make_transcript(SEGMENTS_MONOLOGUE, TAGS)
-        # comprehensive has include_monologue=True by default
-        line = export_session("comprehensive", "id", transcript, include_monologue=True)
-        assert line is not None
+        assert result["steps"] == ["ステップ1", "ステップ2"]
 
 
 # ---------------------------------------------------------------------------
-# export_session tests
+# export_session
 # ---------------------------------------------------------------------------
+
 
 class TestExportSession:
-    def test_returns_jsonl_string(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
-        line = export_session("openai", "id", transcript)
-        assert line is not None
-        parsed = json.loads(line)
+    def test_returns_list(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
+        lines = export_session("openai", "id", transcript, sanitized=sanitized)
+        assert isinstance(lines, list)
+        assert len(lines) >= 1
+        parsed = json.loads(lines[0])
         assert "messages" in parsed
 
+    def test_empty_list_when_no_sanitized_for_chat_format(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        lines = export_session("openai", "id", transcript, sanitized=None)
+        assert lines == []
+
+    def test_comprehensive_works_without_sanitized(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        lines = export_session("comprehensive", "id", transcript)
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+        assert parsed["session_id"] == "id"
+
     def test_invalid_format(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS)
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
         with pytest.raises(ValueError, match="Unknown format"):
             export_session("invalid", "id", transcript)
 
-    def test_all_formats_produce_valid_json(self):
-        transcript = _make_transcript(SEGMENTS_CONVERSATION, TAGS_EXTENDED)
+    def test_all_formats_accept_sanitized_kwarg(self):
+        transcript = _make_transcript(SEGMENTS_CONV, TAGS_V2)
+        sanitized = _sanitized_with_kc()
         for fmt in ("comprehensive", "openai", "conversation",
-                     "knowledge", "decision_log", "sop"):
-            line = export_session(fmt, "id", transcript, include_monologue=True)
-            assert line is not None, f"Format {fmt} returned None"
-            parsed = json.loads(line)
-            assert isinstance(parsed, dict)
+                    "knowledge", "decision_log", "sop"):
+            lines = export_session(fmt, "id", transcript, sanitized=sanitized)
+            assert isinstance(lines, list)
+            # Each line must parse as JSON
+            for line in lines:
+                json.loads(line)

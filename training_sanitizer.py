@@ -244,6 +244,10 @@ class TrainingSanitizer:
                 out = rec.get("output", "")
                 if not inp or not out:
                     continue
+                # Normalize list outputs (some models return arrays for keypoints)
+                # to a natural bullet-list string instead of Python repr like "['a','b']".
+                if isinstance(out, list):
+                    out = "\n".join(f"- {str(item)}" for item in out if item)
                 valid_records.append({
                     "type": rec_type,
                     "input": str(inp),

@@ -1,14 +1,201 @@
-"""Training data export — convert transcript sessions to fine-tuning formats."""
+"""Training data export — convert transcript sessions to fine-tuning formats.
+
+Since the V2 rewrite, chat-style formats (openai, conversation) source their
+data from sanitized JSONL files (config/safe_training_*.jsonl) rather than
+raw transcript segments. The raw speaker-role-mapping approach produced
+unusable noise; the sanitized pipeline extracts evidence-based Q&A pairs
+which are proper instruction-tuning material.
+
+Supported sanitizer output formats:
+- ResponsesSanitizer: {session_id, risk, summary, keypoints, safe_conversation,
+  knowledge_card, issues_detected}
+- TrainingSanitizer: separate records per type
+  {type: summary|keypoints|safe_conversation|knowledge_card, session_id,
+   risk_level, input, output} (or messages for safe_conversation)
+"""
 
 import json
+import logging
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Sanitized JSONL index
+# ---------------------------------------------------------------------------
+
+
+def _parse_bullet_list(text: str) -> list[str]:
+    """Parse a bullet-list string into a list of items.
+
+    Accepts "- item" / "・ item" / "* item" bullets. Falls back to newline-split.
+    """
+    items = []
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        s = s.lstrip("-・*•●◯ \t").strip()
+        if s:
+            items.append(s)
+    return items
+
+
+class SanitizedIndex:
+    """In-memory index of sanitized records, keyed by session_id.
+
+    Loads all config/safe_training_*.jsonl files and aggregates records
+    across both ResponsesSanitizer (1 record per session) and
+    TrainingSanitizer (multiple records per session) output formats.
+    """
+
+    def __init__(self, config_dir: Path | str | None = None) -> None:
+        self._by_session: dict[str, dict[str, Any]] = {}
+        self._source_files: list[str] = []
+        if config_dir:
+            self.load(Path(config_dir))
+
+    def load(self, config_dir: Path) -> None:
+        """Load all safe_training_*.jsonl files from the given directory."""
+        if not config_dir.exists():
+            logger.debug("SanitizedIndex: config dir does not exist: %s", config_dir)
+            return
+
+        files = sorted(config_dir.glob("safe_training_*.jsonl"))
+        for fp in files:
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        self._merge_record(rec)
+            except OSError as e:
+                logger.warning("SanitizedIndex: failed to read %s: %s", fp, e)
+                continue
+            self._source_files.append(fp.name)
+        logger.info(
+            "SanitizedIndex loaded: %d sessions from %d files",
+            len(self._by_session), len(self._source_files),
+        )
+
+    def _bucket(self, session_id: str) -> dict[str, Any]:
+        return self._by_session.setdefault(session_id, {
+            "session_id": session_id,
+            "summary_input": None,
+            "summary_output": None,
+            "keypoints": None,
+            "safe_conversation": None,
+            "knowledge_cards": [],
+            "risk": None,
+        })
+
+    def _merge_record(self, rec: dict) -> None:
+        sid = rec.get("session_id")
+        if not sid:
+            return
+        bucket = self._bucket(sid)
+
+        # ResponsesSanitizer format: single record per session with all fields.
+        # Detection: has both 'risk' and 'safe_conversation' keys.
+        if "risk" in rec and "safe_conversation" in rec:
+            bucket["risk"] = bucket["risk"] or rec.get("risk")
+            summary = rec.get("summary") or {}
+            if isinstance(summary, dict):
+                bucket["summary_input"] = (
+                    bucket["summary_input"] or summary.get("input")
+                )
+                bucket["summary_output"] = (
+                    bucket["summary_output"] or summary.get("output")
+                )
+            kps = rec.get("keypoints")
+            if isinstance(kps, list) and kps and not bucket["keypoints"]:
+                bucket["keypoints"] = [str(k) for k in kps if k]
+            conv = rec.get("safe_conversation")
+            if isinstance(conv, list) and conv and not bucket["safe_conversation"]:
+                bucket["safe_conversation"] = [
+                    {
+                        "speaker": (t.get("speaker") or t.get("role") or "unknown"),
+                        "text": (t.get("text") or t.get("content") or ""),
+                    }
+                    for t in conv
+                    if isinstance(t, dict)
+                ]
+            kc = rec.get("knowledge_card")
+            if isinstance(kc, dict) and kc.get("question") and kc.get("answer"):
+                bucket["knowledge_cards"].append({
+                    "question": str(kc.get("question", "")).strip(),
+                    "answer": str(kc.get("answer", "")).strip(),
+                    "evidence": kc.get("evidence") or [],
+                    "confidence": kc.get("confidence") or "medium",
+                })
+            return
+
+        # TrainingSanitizer format: multiple records per session, distinguished
+        # by 'type' field. risk_level is per-record.
+        rtype = rec.get("type")
+        if not rtype:
+            return
+        bucket["risk"] = bucket["risk"] or rec.get("risk_level")
+
+        if rtype == "summary":
+            if not bucket["summary_input"]:
+                bucket["summary_input"] = rec.get("input") or ""
+            if not bucket["summary_output"]:
+                bucket["summary_output"] = rec.get("output") or ""
+        elif rtype == "keypoints":
+            out = rec.get("output")
+            if bucket["keypoints"] is None:
+                if isinstance(out, list):
+                    bucket["keypoints"] = [str(x) for x in out if x]
+                elif isinstance(out, str):
+                    bucket["keypoints"] = _parse_bullet_list(out)
+        elif rtype == "safe_conversation":
+            if bucket["safe_conversation"] is None:
+                msgs = rec.get("messages") or []
+                if isinstance(msgs, list):
+                    bucket["safe_conversation"] = [
+                        {
+                            "speaker": (m.get("role") or m.get("speaker") or "unknown"),
+                            "text": (m.get("content") or m.get("text") or ""),
+                        }
+                        for m in msgs
+                        if isinstance(m, dict)
+                    ]
+        elif rtype == "knowledge_card":
+            q = (rec.get("input") or "").strip()
+            a = (rec.get("output") or "").strip()
+            if q and a:
+                bucket["knowledge_cards"].append({
+                    "question": q,
+                    "answer": a,
+                    "evidence": [],
+                    "confidence": "medium",
+                })
+
+    def get(self, session_id: str) -> dict | None:
+        return self._by_session.get(session_id)
+
+    def __contains__(self, session_id: str) -> bool:
+        return session_id in self._by_session
+
+    def __len__(self) -> int:
+        return len(self._by_session)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def merge_turns(segments: list[dict]) -> list[dict]:
-    """Merge consecutive segments from the same speaker into turns.
-
-    Returns list of dicts with keys: speaker, is_user, text, start, end.
-    """
+    """Merge consecutive segments from the same speaker into turns."""
     if not segments:
         return []
 
@@ -21,7 +208,6 @@ def merge_turns(segments: list[dict]) -> list[dict]:
             continue
 
         if turns and turns[-1]["speaker"] == speaker:
-            # Merge with previous turn
             turns[-1]["text"] += " " + text
             turns[-1]["end"] = seg.get("end", turns[-1]["end"])
         else:
@@ -33,43 +219,6 @@ def merge_turns(segments: list[dict]) -> list[dict]:
                 "end": seg.get("end", 0),
             })
     return turns
-
-
-def _build_system_message(tags: dict, is_monologue: bool = False) -> str:
-    """Build a system message from session tags.
-
-    Prefers V2 taxonomy (conversation_type, domains, outcomes, importance)
-    with fallback to V1 tags (activity, topics, mood) for older sessions.
-    """
-    parts = []
-    if is_monologue:
-        parts.append("あなたは事業経営者です。以下は独り言/思考です。")
-    else:
-        parts.append("あなたは事業経営者です。")
-
-    # V2 taxonomy (preferred)
-    if tags.get("conversation_type"):
-        parts.append(f"会話の種類: {tags['conversation_type']}")
-    elif tags.get("activity"):
-        parts.append(f"状況: {tags['activity']}")
-
-    domains = tags.get("domains", [])
-    if domains and isinstance(domains, list):
-        parts.append(f"事業領域: {', '.join(domains)}")
-    elif tags.get("topics"):
-        topics = tags["topics"] if isinstance(tags["topics"], list) else [tags["topics"]]
-        parts.append(f"話題: {', '.join(topics)}")
-
-    outcomes = tags.get("outcomes", [])
-    if outcomes and isinstance(outcomes, list):
-        parts.append(f"成果物: {', '.join(outcomes)}")
-
-    if tags.get("importance") and tags.get("conversation_type"):
-        parts.append(f"重要度: {tags['importance']}")
-    elif tags.get("mood"):
-        parts.append(f"ムード: {tags['mood']}")
-
-    return "\n".join(parts)
 
 
 def _session_meta(transcript: dict) -> dict:
@@ -89,10 +238,62 @@ def _session_meta(transcript: dict) -> dict:
     }
 
 
-def to_comprehensive(session_id: str, transcript: dict,
-                      speaker_mode: str = "conversation",
-                      include_monologue: bool = True) -> dict | None:
-    """Convert a session to comprehensive JSONL format (1 dict per session)."""
+# ---------------------------------------------------------------------------
+# System prompts for task-synthesized records
+# ---------------------------------------------------------------------------
+
+_SYS_QA = (
+    "あなたは経験豊富な事業経営者の思考を継承したアシスタントです。"
+    "質問には実際の意思決定や経験に基づいて具体的に答えてください。"
+)
+
+_SYS_SUMMARIZE = (
+    "次の会話を、要点を押さえた3〜5文で簡潔に要約してください。"
+)
+
+_SYS_KEYPOINTS = (
+    "次の会話から、事業上の意思決定・気づき・学びを箇条書きで抽出してください。"
+)
+
+
+def _conversation_to_text(conv: list[dict]) -> str:
+    """Serialize a safe_conversation list into a readable string."""
+    lines = []
+    for t in conv:
+        speaker = t.get("speaker", "unknown")
+        text = t.get("text", "").strip()
+        if not text:
+            continue
+        # Normalize role names for serialization
+        if speaker == "user":
+            label = "経営者"
+        elif speaker == "assistant":
+            label = "相手"
+        elif speaker == "unknown":
+            label = "話者"
+        else:
+            label = speaker
+        lines.append(f"{label}: {text}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Format: comprehensive — unchanged, sources from raw transcript
+# ---------------------------------------------------------------------------
+
+
+def to_comprehensive(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = True,
+    sanitized: dict | None = None,
+) -> dict | None:
+    """Convert a session to comprehensive JSONL format (1 dict per session).
+
+    Preserves raw transcript + tags for analysis/debugging. Not used for
+    fine-tuning directly.
+    """
     segments = transcript.get("segments", [])
     if not segments:
         return None
@@ -114,17 +315,20 @@ def to_comprehensive(session_id: str, transcript: dict,
         "num_speakers": meta["num_speakers"],
     }
 
-    tags_info = {}
-    for key in ("conversation_type", "outcomes", "domains", "importance", "decision_memo",
-                "topics", "activity", "mood", "quality", "entities", "summary", "intent",
-                "source_type", "business_domain", "confidentiality",
-                "decision_required", "decision_summary", "reasoning_summary",
-                "action_items", "outcome", "next_action"):
+    tags_info: dict[str, Any] = {}
+    for key in (
+        "conversation_type", "outcomes", "domains", "importance",
+        "decision_memo", "topics", "activity", "mood", "quality",
+        "entities", "summary", "intent", "source_type", "business_domain",
+        "confidentiality", "decision_required", "decision_summary",
+        "reasoning_summary", "action_items", "outcome", "next_action",
+        "external_audio_ratio",
+    ):
         val = tags.get(key)
         if val is not None and val != "" and val != []:
             tags_info[key] = val
 
-    return {
+    result: dict[str, Any] = {
         "session_id": session_id,
         "session": session_info,
         "tags": tags_info,
@@ -139,148 +343,197 @@ def to_comprehensive(session_id: str, transcript: dict,
             for t in turns
         ],
     }
+    if sanitized is not None:
+        result["sanitized"] = {
+            "risk": sanitized.get("risk"),
+            "summary": sanitized.get("summary_output"),
+            "keypoints": sanitized.get("keypoints") or [],
+            "knowledge_card_count": len(sanitized.get("knowledge_cards") or []),
+        }
+    return result
 
 
-def to_openai(session_id: str, transcript: dict,
-              speaker_mode: str = "conversation",
-              include_monologue: bool = False) -> dict | None:
-    """Convert a session to OpenAI fine-tuning JSONL format.
+# ---------------------------------------------------------------------------
+# Format: openai (messages) — sourced from sanitized KC + summary
+# ---------------------------------------------------------------------------
 
-    - is_user speaker → assistant role (AI learns this)
-    - other speakers → user role (input to AI)
-    - monologue → skipped by default (include_monologue=False)
+
+def to_openai(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = False,
+    sanitized: dict | None = None,
+) -> list[dict]:
+    """Emit {"messages": [...]} records derived from sanitized KC data.
+
+    Produces one record per task:
+    1. Q&A task from each knowledge_card
+    2. Summarization task (if safe_conversation + summary are both present)
+
+    Returns [] if no usable sanitized data is available (caller should skip).
     """
-    segments = transcript.get("segments", [])
-    if not segments:
-        return None
+    if sanitized is None:
+        return []
 
+    out: list[dict] = []
     meta = _session_meta(transcript)
     tags = meta["tags"]
-    turns = merge_turns(segments)
+    domains = tags.get("domains") or []
+    domain_str = ", ".join(domains) if isinstance(domains, list) else str(domains)
 
-    if not turns:
-        return None
+    system_qa = _SYS_QA
+    if domain_str:
+        system_qa = f"{_SYS_QA}\n事業領域: {domain_str}"
 
-    has_user = any(t["is_user"] for t in turns)
-    has_other = any(not t["is_user"] for t in turns)
-    is_monologue = has_user and not has_other
+    # 1. Knowledge-card driven Q&A tasks
+    for kc in sanitized.get("knowledge_cards") or []:
+        q = (kc.get("question") or "").strip()
+        a = (kc.get("answer") or "").strip()
+        if len(q) < 10 or len(a) < 15:
+            continue
+        out.append({"messages": [
+            {"role": "system", "content": system_qa},
+            {"role": "user", "content": q},
+            {"role": "assistant", "content": a},
+        ]})
 
-    if is_monologue and not include_monologue:
-        return None
+    # 2. Summarization task (needs both input conversation and output summary)
+    conv = sanitized.get("safe_conversation")
+    summary_out = (sanitized.get("summary_output") or "").strip()
+    if conv and summary_out and len(summary_out) >= 20:
+        conv_text = _conversation_to_text(conv)
+        if len(conv_text) >= 80:
+            out.append({"messages": [
+                {"role": "system", "content": _SYS_SUMMARIZE},
+                {"role": "user", "content": conv_text},
+                {"role": "assistant", "content": summary_out},
+            ]})
 
-    system_msg = _build_system_message(tags, is_monologue=is_monologue)
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_msg}]
-
-    if is_monologue:
-        # Monologue: synthesize user prompt, combine all speech as assistant
-        topics = tags.get("topics", [])
-        topic_str = ", ".join(topics) if topics else "日常"
-        messages.append({"role": "user", "content": f"{topic_str}について考えてください"})
-        all_text = " ".join(t["text"] for t in turns)
-        messages.append({"role": "assistant", "content": all_text})
-    else:
-        if speaker_mode == "user_only":
-            # Only user turns as assistant, skip others
-            for t in turns:
-                if t["is_user"]:
-                    messages.append({"role": "assistant", "content": t["text"]})
-        else:
-            # Full conversation
-            for t in turns:
-                role = "assistant" if t["is_user"] else "user"
-                messages.append({"role": role, "content": t["text"]})
-
-    # Must have at least one assistant message
-    if not any(m["role"] == "assistant" for m in messages):
-        return None
-
-    return {"messages": messages}
+    return out
 
 
-def to_conversation(session_id: str, transcript: dict,
-                    speaker_mode: str = "conversation",
-                    include_monologue: bool = False) -> dict | None:
-    """Convert a session to ShareGPT/LLaMA-Factory conversation format."""
-    segments = transcript.get("segments", [])
-    if not segments:
-        return None
+# ---------------------------------------------------------------------------
+# Format: conversation (ShareGPT / LLaMA-Factory)
+# ---------------------------------------------------------------------------
 
+
+def to_conversation(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = False,
+    sanitized: dict | None = None,
+) -> list[dict]:
+    """Emit ShareGPT-formatted records from sanitized KC data.
+
+    Format per LLaMA-Factory spec:
+        {"conversations": [{"from": "human", "value": ...},
+                           {"from": "gpt", "value": ...}],
+         "system": "..."}
+
+    Note: id/metadata are intentionally NOT top-level (not in the spec).
+    """
+    if sanitized is None:
+        return []
+
+    out: list[dict] = []
     meta = _session_meta(transcript)
     tags = meta["tags"]
-    turns = merge_turns(segments)
+    domains = tags.get("domains") or []
+    domain_str = ", ".join(domains) if isinstance(domains, list) else str(domains)
 
-    if not turns:
-        return None
+    system_qa = _SYS_QA
+    if domain_str:
+        system_qa = f"{_SYS_QA}\n事業領域: {domain_str}"
 
-    has_user = any(t["is_user"] for t in turns)
-    has_other = any(not t["is_user"] for t in turns)
-    is_monologue = has_user and not has_other
+    for kc in sanitized.get("knowledge_cards") or []:
+        q = (kc.get("question") or "").strip()
+        a = (kc.get("answer") or "").strip()
+        if len(q) < 10 or len(a) < 15:
+            continue
+        out.append({
+            "conversations": [
+                {"from": "human", "value": q},
+                {"from": "gpt", "value": a},
+            ],
+            "system": system_qa,
+        })
 
-    if is_monologue and not include_monologue:
-        return None
+    conv = sanitized.get("safe_conversation")
+    summary_out = (sanitized.get("summary_output") or "").strip()
+    if conv and summary_out and len(summary_out) >= 20:
+        conv_text = _conversation_to_text(conv)
+        if len(conv_text) >= 80:
+            out.append({
+                "conversations": [
+                    {"from": "human", "value": conv_text},
+                    {"from": "gpt", "value": summary_out},
+                ],
+                "system": _SYS_SUMMARIZE,
+            })
 
-    system_msg = _build_system_message(tags, is_monologue=is_monologue)
-    conversations: list[dict[str, str]] = []
-
-    if is_monologue:
-        topics = tags.get("topics", [])
-        topic_str = ", ".join(topics) if topics else "日常"
-        conversations.append({"from": "human", "value": f"{topic_str}について考えてください"})
-        all_text = " ".join(t["text"] for t in turns)
-        conversations.append({"from": "gpt", "value": all_text})
-    else:
-        if speaker_mode == "user_only":
-            for t in turns:
-                if t["is_user"]:
-                    conversations.append({"from": "gpt", "value": t["text"]})
-        else:
-            for t in turns:
-                role = "gpt" if t["is_user"] else "human"
-                conversations.append({"from": role, "value": t["text"]})
-
-    # Must have at least one gpt turn
-    if not any(c["from"] == "gpt" for c in conversations):
-        return None
-
-    metadata = {}
-    for key in ("conversation_type", "outcomes", "domains", "importance",
-                "topics", "activity", "quality", "mood"):
-        if tags.get(key):
-            metadata[key] = tags[key]
-
-    return {
-        "id": session_id,
-        "system": system_msg,
-        "conversations": conversations,
-        "metadata": metadata,
-    }
+    return out
 
 
-def to_knowledge(session_id: str, transcript: dict,
-                  speaker_mode: str = "conversation",
-                  include_monologue: bool = True) -> dict | None:
-    """Extract knowledge record from a session.
+# ---------------------------------------------------------------------------
+# Format: knowledge — RAG-ready records with QA + evidence
+# ---------------------------------------------------------------------------
 
-    Returns None if no summary is available.
+
+def to_knowledge(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = True,
+    sanitized: dict | None = None,
+) -> dict | None:
+    """Emit a knowledge record for RAG ingestion.
+
+    Prefers sanitized summary + keypoints + KC pairs. Falls back to tags.summary
+    from the raw transcript if no sanitized data exists.
     """
     meta = _session_meta(transcript)
     tags = meta["tags"]
 
-    summary = tags.get("summary", "")
-    if not summary:
-        return None
+    summary_text = ""
+    keypoints: list[str] = []
+    qa_pairs: list[dict] = []
 
-    segments = transcript.get("segments", [])
-    turns = merge_turns(segments)
-    body_parts = [t["text"] for t in turns]
+    if sanitized is not None:
+        summary_text = (sanitized.get("summary_output") or "").strip()
+        keypoints = sanitized.get("keypoints") or []
+        for kc in sanitized.get("knowledge_cards") or []:
+            q = (kc.get("question") or "").strip()
+            a = (kc.get("answer") or "").strip()
+            if q and a:
+                qa_pairs.append({
+                    "question": q,
+                    "answer": a,
+                    "evidence": kc.get("evidence") or [],
+                    "confidence": kc.get("confidence") or "medium",
+                })
+
+    if not summary_text:
+        summary_text = (tags.get("summary") or "").strip()
+
+    if not summary_text and not qa_pairs:
+        return None
 
     domains = tags.get("domains", [])
     category = ", ".join(domains) if domains else tags.get("business_domain", "other")
 
+    body_parts = []
+    if summary_text:
+        body_parts.append(summary_text)
+    if keypoints:
+        body_parts.append("\n".join(f"- {k}" for k in keypoints))
+
     return {
         "id": session_id,
-        "title": summary[:60],
-        "body": " ".join(body_parts),
+        "title": summary_text[:60] if summary_text else f"Session {session_id}",
+        "body": "\n\n".join(body_parts),
+        "qa_pairs": qa_pairs,
         "category": category,
         "topics": tags.get("topics", []),
         "entities": tags.get("entities", []),
@@ -290,17 +543,52 @@ def to_knowledge(session_id: str, transcript: dict,
     }
 
 
-def to_decision_log(session_id: str, transcript: dict,
-                     speaker_mode: str = "conversation",
-                     include_monologue: bool = True) -> dict | None:
-    """Extract decision log from a session.
+# ---------------------------------------------------------------------------
+# Format: decision_log — decisions + reasoning from tags + sanitized KC
+# ---------------------------------------------------------------------------
 
-    Returns None if no decision was required.
+
+def to_decision_log(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = True,
+    sanitized: dict | None = None,
+) -> dict | None:
+    """Extract a decision log entry.
+
+    Trigger conditions:
+        - tags.decision_memo is non-empty, OR
+        - tags.outcomes contains "意思決定あり", OR
+        - sanitized data has a knowledge_card with confidence=high
     """
     meta = _session_meta(transcript)
     tags = meta["tags"]
 
-    if not tags.get("decision_required"):
+    decision_memo = (tags.get("decision_memo") or "").strip()
+    outcomes = tags.get("outcomes") or []
+    has_decision_outcome = (
+        isinstance(outcomes, list) and "意思決定あり" in outcomes
+    )
+
+    # Legacy V1 fields (may not exist)
+    legacy_decision_required = tags.get("decision_required")
+    legacy_decision_summary = tags.get("decision_summary")
+
+    # Sanitized KC enrichment
+    kc_enrich: list[dict] = []
+    if sanitized is not None:
+        for kc in sanitized.get("knowledge_cards") or []:
+            if kc.get("confidence") in ("high", "medium"):
+                kc_enrich.append({
+                    "question": kc.get("question", ""),
+                    "answer": kc.get("answer", ""),
+                    "evidence": kc.get("evidence") or [],
+                    "confidence": kc.get("confidence"),
+                })
+
+    has_kc = bool(kc_enrich)
+    if not (decision_memo or has_decision_outcome or legacy_decision_required or has_kc):
         return None
 
     session = transcript.get("session", {})
@@ -308,48 +596,88 @@ def to_decision_log(session_id: str, transcript: dict,
     turns = merge_turns(segments)
     context = " ".join(t["text"] for t in turns[:3])[:200]
 
+    title = decision_memo[:60] or legacy_decision_summary or (
+        sanitized.get("summary_output", "")[:60] if sanitized else ""
+    ) or "Decision"
+
     return {
         "decision_id": session_id,
-        "title": tags.get("decision_summary") or tags.get("summary", "")[:60],
+        "title": title,
         "context": context,
-        "decision": tags.get("decision_summary"),
-        "reason": tags.get("reasoning_summary"),
-        "action_items": tags.get("action_items", []),
-        "outcome": tags.get("outcome"),
-        "next_action": tags.get("next_action"),
+        "decision": decision_memo or legacy_decision_summary or "",
+        "reasoning": tags.get("reasoning_summary") or "",
+        "outcomes": outcomes if isinstance(outcomes, list) else [],
+        "knowledge_cards": kc_enrich,
+        "summary": (sanitized.get("summary_output") or tags.get("summary", "")) if sanitized else tags.get("summary", ""),
+        "domains": tags.get("domains", []),
+        "importance": tags.get("importance", ""),
         "source_session": session_id,
         "date": session.get("start"),
     }
 
 
-def to_sop(session_id: str, transcript: dict,
-           speaker_mode: str = "conversation",
-           include_monologue: bool = True) -> dict | None:
-    """Extract SOP (Standard Operating Procedure) from a session.
+# ---------------------------------------------------------------------------
+# Format: sop — procedural knowledge from outcomes=TODO発生 + sanitized KC
+# ---------------------------------------------------------------------------
 
-    Returns None if no action_items or if casual_chat.
+
+def to_sop(
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = True,
+    sanitized: dict | None = None,
+) -> dict | None:
+    """Extract SOP (procedural knowledge) from a session.
+
+    Trigger conditions:
+        - tags.outcomes contains "TODO発生" or "方針転換", OR
+        - legacy tags.action_items is non-empty
     """
     meta = _session_meta(transcript)
     tags = meta["tags"]
 
-    action_items = tags.get("action_items", [])
-    if not action_items:
+    outcomes = tags.get("outcomes") or []
+    has_todo = isinstance(outcomes, list) and (
+        "TODO発生" in outcomes or "方針転換" in outcomes
+    )
+    legacy_action_items = tags.get("action_items") or []
+
+    if not has_todo and not legacy_action_items:
         return None
 
-    if tags.get("activity") == "casual_chat" or tags.get("source_type") == "casual_chat":
+    # Use sanitized keypoints as SOP steps if available, fall back to legacy
+    steps: list[str] = []
+    if sanitized is not None:
+        steps = list(sanitized.get("keypoints") or [])
+    if not steps and legacy_action_items:
+        steps = [str(a) for a in legacy_action_items if a]
+
+    if not steps:
         return None
 
     domains = tags.get("domains", [])
     domain = ", ".join(domains) if domains else tags.get("business_domain", "other")
 
+    context = ""
+    if sanitized:
+        context = sanitized.get("summary_output") or ""
+    if not context:
+        context = tags.get("summary", "")
+
     return {
         "id": session_id,
-        "title": tags.get("summary", "")[:60] or "Untitled SOP",
-        "steps": action_items,
-        "context": tags.get("summary", ""),
+        "title": (context[:60] if context else f"SOP {session_id}"),
+        "steps": steps,
+        "context": context,
         "domain": domain,
         "source_session": session_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
 
 
 FORMATTERS = {
@@ -361,17 +689,35 @@ FORMATTERS = {
     "sop": to_sop,
 }
 
+# Formats that may emit multiple JSONL lines per session
+_MULTI_LINE_FORMATS = {"openai", "conversation"}
 
-def export_session(fmt: str, session_id: str, transcript: dict,
-                   speaker_mode: str = "conversation",
-                   include_monologue: bool = False) -> str | None:
-    """Export a single session in the given format. Returns JSONL line or None."""
+
+def export_session(
+    fmt: str,
+    session_id: str,
+    transcript: dict,
+    speaker_mode: str = "conversation",
+    include_monologue: bool = False,
+    sanitized: dict | None = None,
+) -> list[str]:
+    """Export a single session in the given format.
+
+    Returns a list of JSONL lines (may be empty). Multi-line formats
+    (openai, conversation) can yield multiple lines per session.
+    """
     formatter = FORMATTERS.get(fmt)
     if not formatter:
         raise ValueError(f"Unknown format: {fmt}")
 
-    result = formatter(session_id, transcript, speaker_mode,
-                       include_monologue=include_monologue)
+    result = formatter(
+        session_id, transcript, speaker_mode,
+        include_monologue=include_monologue,
+        sanitized=sanitized,
+    )
+
     if result is None:
-        return None
-    return json.dumps(result, ensure_ascii=False)
+        return []
+    if isinstance(result, list):
+        return [json.dumps(r, ensure_ascii=False) for r in result if r]
+    return [json.dumps(result, ensure_ascii=False)]

@@ -593,6 +593,11 @@ class Indexer:
         min_segments: int = 3, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
         max_per_class: int = 0,
+        require_tagged: bool = False,
+        require_summary: bool = False,
+        exclude_personal_only: bool = False,
+        external_audio_max: float | None = None,
+        high_value_or: bool = False,
     ) -> dict:
         """Get stats for export preview (session count, segment count, date range, est size)."""
         where, params = self._build_export_where(
@@ -600,6 +605,11 @@ class Indexer:
             business_domain=business_domain,
             conversation_type=conversation_type, domain=domain,
             importance_v2=importance_v2,
+            require_tagged=require_tagged,
+            require_summary=require_summary,
+            exclude_personal_only=exclude_personal_only,
+            external_audio_max=external_audio_max,
+            high_value_or=high_value_or,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -649,8 +659,22 @@ class Indexer:
         min_segments: int = 3, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
         max_per_class: int = 0,
+        require_tagged: bool = False,
+        require_summary: bool = False,
+        exclude_personal_only: bool = False,
+        external_audio_max: float | None = None,
+        high_value_or: bool = False,
     ) -> list[tuple[str, str]]:
         """Get (date, time) pairs matching export filters.
+
+        New params (for KC extraction / sanitize targeting):
+            require_tagged: session_tagged = 1
+            require_summary: tags_summary non-empty
+            exclude_personal_only: drop sessions whose domains = ["個人"] only
+            external_audio_max: cap tags_external_audio (NULL allowed)
+            high_value_or: add OR clause (importance≥中 OR useful conv_type
+                OR decision_memo non-empty OR outcomes contains 意思決定/TODO/
+                方針転換/アイデア創出/問題提起). Captures "事業継承価値" sessions.
 
         If max_per_class > 0, limit each conversation_type to at most
         that many sessions (stratified sampling for balanced training data).
@@ -661,6 +685,11 @@ class Indexer:
             business_domain=business_domain,
             conversation_type=conversation_type, domain=domain,
             importance_v2=importance_v2,
+            require_tagged=require_tagged,
+            require_summary=require_summary,
+            exclude_personal_only=exclude_personal_only,
+            external_audio_max=external_audio_max,
+            high_value_or=high_value_or,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -693,6 +722,11 @@ class Indexer:
         quality: list[str] | None, activity: list[str] | None,
         min_segments: int, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
+        require_tagged: bool = False,
+        require_summary: bool = False,
+        exclude_personal_only: bool = False,
+        external_audio_max: float | None = None,
+        high_value_or: bool = False,
     ) -> tuple[list[str], list]:
         """Build WHERE clauses and params for export queries."""
         where: list[str] = []
@@ -733,6 +767,52 @@ class Indexer:
         if importance_v2:
             where.append("tags_importance_v2 = ?")
             params.append(importance_v2)
+
+        if require_tagged:
+            where.append("session_tagged = 1")
+
+        if require_summary:
+            where.append("tags_summary IS NOT NULL AND tags_summary != ''")
+
+        if exclude_personal_only:
+            # drop sessions where domains is only "個人"
+            where.append(
+                "NOT (tags_domains IN ('[\"個人\"]', '\"個人\"'))"
+            )
+
+        if external_audio_max is not None:
+            # NULL (not computed) is allowed, else must be below max
+            where.append(
+                "(tags_external_audio IS NULL OR tags_external_audio < ?)"
+            )
+            params.append(external_audio_max)
+
+        if high_value_or:
+            # 事業継承価値のあるセッションの OR 条件:
+            #   importance 中+ / 有用 conv_type / decision_memo 非空 /
+            #   outcomes に実質的アウトカムを含む
+            useful_conv_types = (
+                "ミーティング", "アイデア出し", "商談",
+                "顧客ヒアリング", "1on1", "外部セミナー",
+            )
+            useful_outcomes = (
+                "意思決定あり", "TODO発生", "方針転換",
+                "アイデア創出", "問題提起",
+            )
+            conv_placeholders = ",".join("?" for _ in useful_conv_types)
+            outcome_likes = " OR ".join(
+                "tags_outcomes LIKE ?" for _ in useful_outcomes
+            )
+            where.append(
+                "("
+                " tags_importance_v2 IN ('中','高')"
+                f" OR tags_conversation_type IN ({conv_placeholders})"
+                " OR (tags_decision_memo IS NOT NULL AND tags_decision_memo != '')"
+                f" OR ({outcome_likes})"
+                ")"
+            )
+            params.extend(useful_conv_types)
+            params.extend(f"%{o}%" for o in useful_outcomes)
 
         return where, params
 
