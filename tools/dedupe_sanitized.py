@@ -2,7 +2,7 @@
 """Semantic deduplication of sanitized knowledge cards.
 
 Reads one or more config/safe_training_*.jsonl files, embeds the KC
-questions via Gemini text-embedding-004, groups near-duplicates by
+questions via Gemini gemini-embedding-001, groups near-duplicates by
 cosine similarity, and writes a deduplicated JSONL where each session's
 knowledge_cards array contains only the highest-confidence KC from each
 cluster.
