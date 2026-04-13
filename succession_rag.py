@@ -385,18 +385,33 @@ class SuccessionRAG:
             f"## KC\nQ: {kc.question}\nA: {kc.answer}"
         )
         try:
+            # max_output_tokens must accommodate reasoning tokens + the
+            # actual text output. At effort="low" gpt-5-nano spends ~120-200
+            # reasoning tokens, so 150 left zero budget for visible output.
+            # 800 leaves headroom for ~600 reasoning + 200 output (the text
+            # output itself is <=80 chars by instruction).
             response = client.responses.create(
                 model=self._context_model,
                 instructions=_CONTEXTUALIZE_INSTRUCTIONS,
                 input=[{"role": "user", "content": user_input}],
                 reasoning={"effort": "low"},
-                max_output_tokens=150,
+                max_output_tokens=800,
                 store=False,
             )
             if response.status == "completed":
                 text = (response.output_text or "").strip()
                 # Truncate to 80 chars as a safety net
                 return text[:80]
+            elif response.status == "incomplete":
+                reason = ""
+                if response.incomplete_details:
+                    reason = getattr(
+                        response.incomplete_details, "reason", "unknown"
+                    )
+                log.warning(
+                    "Contextualize incomplete for %s: %s",
+                    kc.session_id, reason,
+                )
         except Exception as e:
             log.warning(
                 "Contextualize failed for %s: %s", kc.session_id, e
