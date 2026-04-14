@@ -60,6 +60,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | GPU | NVIDIA (VRAM 6GB 以上、large-v3 は 12GB 推奨) |
 | Docker | Docker + NVIDIA Container Toolkit |
 | OS | Linux / WSL2 |
+| OPUS デコード | `libopus0` / `libopus-dev` (Docker イメージに同梱済み) + `opuslib` |
 
 ## クイックスタート
 
@@ -221,6 +222,40 @@ open http://localhost:8092
 を過ぎているのに今日まだ完了していない」状態を検知して即時 catch-up 実行する。
 バッチ diarize 開始時には Whisper モデルを unload して RAM/VRAM を解放する
 (OOM 対策)。
+
+### SD カード一括アップロード (OPUS)
+
+Omi CV1 SD カードに溜めた OPUS 音声を HTTP で一括アップロードし、
+リアルタイム経路と同じ `SessionRecorder → batch_corrector` パイプラインに
+合流させるエンドポイント。新規 DB や別ワーカーは作らず、既存の LLM 補正・
+タグ付け・RAG インデックス化がそのまま適用される。
+
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/sdcard/upload` | OPUS フレーム列をデコード → 文字起こし → セッション保存 |
+
+**リクエスト**:
+
+- クエリ: `?token=<OMI_WHISPER_TOKEN>` (AUTH 有効時)
+- ヘッダ:
+  - `X-Device-Id`: デバイス一意 ID
+  - `X-Codec`: `opus` のみ
+  - `X-Sample-Rate`: `16000`
+  - `X-Channels`: `1`
+  - `X-Timestamp-Start`: 録音開始 Unix 秒
+  - `X-Frame-Format`: `length-prefixed`
+  - `X-Frame-Header`: `3byte` (Omi 3バイトヘッダ付き) | `none`
+- ボディ: `[4バイトLE 長][フレーム][4バイトLE 長][フレーム]...` (最大 100MB)
+
+**レスポンス**: `{"status", "session_id", "duration_seconds", "segments_count", "enqueued_for_batch"}`
+
+### リアルタイム WebSocket (OPUS 経路)
+
+既定は PCM 16bit/16kHz/mono。`?codec=opus&frame_header=3byte` を付けて接続すると、
+Omi CV1 BLE の生フレーム (`[2B packet_no][1B fragment_idx][OPUS payload]`) を
+そのまま送ることができる。サーバー側で剥がして `opuslib` でデコードし、
+以降は既存の VAD・Whisper・SessionRecorder 経路に合流する。
+PCM 既定経路は互換のため無改変。
 
 ### Safe Training Data (匿名化エクスポート)
 

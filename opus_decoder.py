@@ -1,0 +1,99 @@
+"""
+Omi CV1 の OPUSフレームを PCM16 にデコードする。
+
+Omiのパケット形式:
+  [2バイト LE: packet_no][1バイト: fragment_idx][OPUSペイロード]
+
+MTU超過時は複数パケットにフラグメント分割される。同一 packet_no の
+フラグメントを fragment_idx 順に結合してから OPUS デコーダに渡す。
+"""
+import logging
+
+import opuslib
+
+log = logging.getLogger(__name__)
+
+OMI_HEADER_SIZE = 3  # packet_no(2) + fragment_idx(1)
+OPUS_FRAME_MS = 10   # Omi CV1 は 10ms フレーム
+
+
+class OmiOpusStreamDecoder:
+    """
+    Omi CV1 の BLE生バイトストリームを PCM16 にデコードするステートフルデコーダ。
+
+    使い方:
+        decoder = OmiOpusStreamDecoder(sample_rate=16000, channels=1)
+        for raw_packet in ble_packets:
+            pcm_chunk = decoder.feed(raw_packet)
+            if pcm_chunk:
+                audio_buffer.extend(pcm_chunk)
+    """
+
+    def __init__(self, sample_rate: int = 16000, channels: int = 1):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.frame_size = sample_rate // 100  # 10ms
+        self._decoder = opuslib.Decoder(sample_rate, channels)
+        self._pending_packet_no: int | None = None
+        self._pending_fragments: list[bytes] = []
+        self._silence_bytes = b"\x00" * (self.frame_size * 2 * channels)
+
+    def feed(self, raw: bytes) -> bytes:
+        """
+        BLEから来た生バイトを1つ投入。完成したOPUSフレームがあればPCM16で返す。
+        未完成 (フラグメント途中) の場合は b"" を返す。
+        """
+        if len(raw) < OMI_HEADER_SIZE + 1:
+            return b""
+
+        packet_no = int.from_bytes(raw[0:2], "little")
+        fragment_idx = raw[2]
+        payload = raw[OMI_HEADER_SIZE:]
+
+        if fragment_idx == 0:
+            if self._pending_fragments:
+                log.debug("Discarding incomplete packet %s", self._pending_packet_no)
+            self._pending_packet_no = packet_no
+            self._pending_fragments = [payload]
+        else:
+            if self._pending_packet_no != packet_no:
+                log.debug("Fragment mismatch: expected %s got %s",
+                          self._pending_packet_no, packet_no)
+                self._pending_packet_no = None
+                self._pending_fragments = []
+                return b""
+            self._pending_fragments.append(payload)
+
+        return self._try_decode()
+
+    def _try_decode(self) -> bytes:
+        if not self._pending_fragments:
+            return b""
+        opus_frame = b"".join(self._pending_fragments)
+        try:
+            pcm = self._decoder.decode(opus_frame, self.frame_size)
+            self._pending_fragments = []
+            self._pending_packet_no = None
+            return pcm
+        except opuslib.OpusError:
+            return b""
+
+    def flush_silence(self) -> bytes:
+        """接続切断等でバッファを破棄してタイミング維持用の無音を返す。"""
+        self._pending_fragments = []
+        self._pending_packet_no = None
+        return self._silence_bytes
+
+    def decode_batch(self, opus_frames: list[bytes]) -> bytes:
+        """
+        SDカード同期用: 長さプレフィックス形式からパースした OPUSフレーム列を
+        一括デコードする。各フレームは既にヘッダ剥がし済みであること。
+        """
+        chunks = []
+        for frame in opus_frames:
+            try:
+                chunks.append(self._decoder.decode(frame, self.frame_size))
+            except opuslib.OpusError as e:
+                log.warning("OPUS decode error, inserting silence: %s", e)
+                chunks.append(self._silence_bytes)
+        return b"".join(chunks)
