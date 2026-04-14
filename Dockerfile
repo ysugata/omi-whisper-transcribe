@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv tzdata ffmpeg wget \
+    libopus0 libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,6 +31,7 @@ RUN pip3 install --no-cache-dir pykakasi neologdn
 
 
 COPY omi_whisper_bridge.py .
+COPY opus_decoder.py .
 COPY model_manager.py .
 COPY term_corrector.py .
 COPY llm_corrector.py .

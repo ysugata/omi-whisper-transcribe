@@ -13,3 +13,4 @@ accelerate>=0.26.0
 bitsandbytes
 soundfile
 rank-bm25>=0.2.2
+opuslib>=3.0.1

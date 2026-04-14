@@ -199,6 +199,7 @@ from succession_rag import SuccessionRAG
 from segment_screener import SegmentScreener
 from suggestion_learner import SuggestionLearner
 from keyword_learner import KeywordLearner
+from opus_decoder import OmiOpusStreamDecoder, OMI_HEADER_SIZE
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
 _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
@@ -621,18 +622,19 @@ def cleanup_old_recordings():
 class SessionRecorder:
     """1セッション分の音声と文字起こしを管理・保存する"""
 
-    def __init__(self):
+    def __init__(self, recorded_at: datetime | None = None, source: str | None = None):
         self.enabled = SAVE_AUDIO
         self.all_segments: list[dict] = []
         self.total_bytes = 0
         self._finalized = False
         self._audio_closed = False
         self.session_tags: dict | None = None  # set by _tag_session() before finalize
+        self.source = source  # e.g. "sdcard" - written to JSON metadata
 
         if not self.enabled:
             return
 
-        now = datetime.now()
+        now = recorded_at if recorded_at is not None else datetime.now()
         self.session_dir = Path(RECORDINGS_DIR) / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S")
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -746,6 +748,8 @@ class SessionRecorder:
         if self.session_tags:
             session_meta["tags"] = self.session_tags
             session_meta["session_tagged"] = True
+        if self.source:
+            session_meta["source"] = self.source
         output = {
             "session": session_meta,
             "segments": self.all_segments,
@@ -2783,10 +2787,12 @@ async def handle_connection(websocket):
     """
     remote = websocket.remote_address
 
+    # --- クエリパラメータ解析 (認証 + コーデック判定で共用) ---
+    ws_path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
+    params = parse_qs(urlparse(ws_path).query)
+
     # --- トークン認証 ---
     if AUTH_TOKEN:
-        ws_path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
-        params = parse_qs(urlparse(ws_path).query)
         token = params.get("token", [None])[0]
         if not token or not hmac.compare_digest(token, AUTH_TOKEN):
             log.warning(f"Rejected: invalid token from {remote}")
@@ -2795,6 +2801,26 @@ async def handle_connection(websocket):
         log.info(f"Authenticated connection from {remote}")
     else:
         log.info(f"Connection from {remote} (no auth)")
+
+    # --- コーデック判定 (pcm16 = 既存デフォルト / opus = Omi CV1 互換) ---
+    codec = params.get("codec", ["pcm16"])[0].lower()
+    opus_decoder_inst = None
+    if codec == "opus":
+        frame_header = params.get("frame_header", [""])[0]
+        if frame_header != "3byte":
+            log.warning(f"Rejected: codec=opus requires frame_header=3byte [{remote}]")
+            await websocket.close(4400, "frame_header=3byte required for opus")
+            return
+        try:
+            opus_decoder_inst = OmiOpusStreamDecoder(
+                sample_rate=SAMPLE_RATE,
+                channels=1,
+            )
+        except Exception as e:
+            log.error(f"Failed to init OPUS decoder: {e}", exc_info=True)
+            await websocket.close(1011, "OPUS decoder init failed")
+            return
+        log.info(f"OPUS mode enabled for {remote}")
 
     audio_buffer = bytearray()
     session_start = time.time()
@@ -2961,7 +2987,14 @@ async def handle_connection(websocket):
                 continue
 
             # バイナリ = 音声データ
-            audio_buffer.extend(message)
+            if opus_decoder_inst is not None:
+                # OPUSパス: Omi 3バイトヘッダ剥がし + デコード → PCM16 追加
+                pcm = opus_decoder_inst.feed(message)
+                if pcm:
+                    audio_buffer.extend(pcm)
+            else:
+                # PCMパス (既存): そのまま追加
+                audio_buffer.extend(message)
 
             buffer_duration = len(audio_buffer) / (SAMPLE_RATE * 2)
 
@@ -4386,7 +4419,168 @@ async def main():
         asyncio.create_task(_run_nightly_now())
         return web.json_response({"status": "started"})
 
-    mgmt_app = web.Application()
+    # --- SD カード一括アップロード ---
+    MAX_SDCARD_UPLOAD_BYTES = 100 * 1024 * 1024  # 100MB
+
+    def _parse_length_prefixed(data: bytes) -> list[bytes]:
+        frames = []
+        offset = 0
+        while offset + 4 <= len(data):
+            length = int.from_bytes(data[offset:offset + 4], "little")
+            offset += 4
+            if length == 0 or offset + length > len(data):
+                break
+            frames.append(data[offset:offset + length])
+            offset += length
+        return frames
+
+    def _strip_omi_header(frames: list[bytes]) -> list[bytes]:
+        return [f[OMI_HEADER_SIZE:] for f in frames if len(f) > OMI_HEADER_SIZE]
+
+    async def handle_sdcard_upload(request: web.Request) -> web.Response:
+        # 認証 (既存 WebSocket と同じ ?token= クエリ)
+        if AUTH_TOKEN:
+            token = request.query.get("token", "")
+            if not token or not hmac.compare_digest(token, AUTH_TOKEN):
+                return web.json_response({"error": "unauthorized"}, status=401)
+
+        # ヘッダ検証
+        headers = request.headers
+        try:
+            device_id = headers["X-Device-Id"]
+            upload_codec = headers["X-Codec"]
+            upload_sr = int(headers["X-Sample-Rate"])
+            upload_ch = int(headers.get("X-Channels", "1"))
+            timestamp_start = int(headers["X-Timestamp-Start"])
+            frame_format = headers.get("X-Frame-Format", "length-prefixed")
+            frame_header = headers.get("X-Frame-Header", "none")
+        except (KeyError, ValueError) as e:
+            return web.json_response({"error": f"bad headers: {e}"}, status=400)
+
+        if upload_codec != "opus":
+            return web.json_response(
+                {"error": "only codec=opus is supported"}, status=400,
+            )
+        if upload_sr != SAMPLE_RATE:
+            return web.json_response(
+                {"error": f"sample_rate must be {SAMPLE_RATE}"}, status=400,
+            )
+        if upload_ch != 1:
+            return web.json_response({"error": "only mono supported"}, status=400)
+        if frame_format != "length-prefixed":
+            return web.json_response(
+                {"error": "only frame_format=length-prefixed supported"}, status=400,
+            )
+
+        # Content-Length で早期拒否 (本体読み込み前)
+        if request.content_length is not None and request.content_length > MAX_SDCARD_UPLOAD_BYTES:
+            return web.json_response({"error": "payload too large"}, status=413)
+
+        body = await request.read()
+        if len(body) == 0:
+            return web.json_response({"error": "empty body"}, status=400)
+        if len(body) > MAX_SDCARD_UPLOAD_BYTES:
+            return web.json_response({"error": "payload too large"}, status=413)
+
+        raw_frames = _parse_length_prefixed(body)
+        if not raw_frames:
+            return web.json_response({"error": "no valid frames"}, status=400)
+
+        if frame_header == "3byte":
+            opus_frames = _strip_omi_header(raw_frames)
+        elif frame_header == "none":
+            opus_frames = raw_frames
+        else:
+            return web.json_response(
+                {"error": f"unknown frame_header: {frame_header}"}, status=400,
+            )
+
+        try:
+            decoder = OmiOpusStreamDecoder(sample_rate=upload_sr, channels=upload_ch)
+            pcm_data = decoder.decode_batch(opus_frames)
+        except Exception as e:
+            log.error(f"OPUS decode failed: {e}", exc_info=True)
+            return web.json_response({"error": "decode failed"}, status=500)
+
+        duration = len(pcm_data) / (upload_sr * upload_ch * 2)
+        log.info(
+            f"SD upload from {device_id}: {len(opus_frames)} frames, "
+            f"{duration:.1f}s, codec={upload_codec}"
+        )
+
+        # GPU/モデル確保 (既存パターン)
+        try:
+            model, executor = await model_manager.acquire(timeout=60)
+        except TimeoutError:
+            return web.json_response({"error": "gpu busy"}, status=503)
+        except Exception as e:
+            log.error(f"Failed to acquire model: {e}", exc_info=True)
+            return web.json_response({"error": "model unavailable"}, status=503)
+
+        try:
+            try:
+                recorded_at = datetime.fromtimestamp(timestamp_start)
+            except (ValueError, OSError, OverflowError):
+                recorded_at = None
+
+            recorder = SessionRecorder(recorded_at=recorded_at, source="sdcard")
+
+            # Hotwords (既存ロジック流用)
+            session_hotwords = ""
+            if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
+                session_hotwords = hotword_loader.get_hotwords_string()
+
+            # 録音書き込み
+            recorder.write_audio(pcm_data)
+
+            # 文字起こし (既存 transcribe_audio を流用)
+            loop = asyncio.get_running_loop()
+            if ENGINE == "qwen3asr":
+                raw_segments = await loop.run_in_executor(
+                    executor,
+                    lambda: model.transcribe_audio(
+                        pcm_data, SAMPLE_RATE, 0.0, session_hotwords,
+                        LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
+                        audio_preprocessor,
+                    ),
+                )
+            else:
+                raw_segments = await loop.run_in_executor(
+                    executor,
+                    lambda: transcribe_audio(pcm_data, model, 0.0, session_hotwords, ""),
+                )
+
+            if raw_segments:
+                rec_segments = _offset_segments(raw_segments, 0.0)
+                recorder.add_segments(rec_segments)
+
+            # Finalize + batch 投入 (既存 _finalize_and_enqueue と同じ流れ)
+            recorder.finalize()
+            session_id = None
+            enqueued = False
+            if (batch_corrector and recorder.enabled
+                    and hasattr(recorder, 'session_dir') and recorder.session_dir
+                    and len(recorder.all_segments) > 0
+                    and recorder.session_dir.exists()):
+                session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
+                batch_corrector.enqueue(session_id)
+                enqueued = True
+
+            return web.json_response({
+                "status": "ok",
+                "session_id": session_id,
+                "duration_seconds": round(duration, 2),
+                "segments_count": len(raw_segments) if raw_segments else 0,
+                "enqueued_for_batch": enqueued,
+            })
+
+        except Exception as e:
+            log.error(f"SD upload processing failed: {e}", exc_info=True)
+            return web.json_response({"error": "processing failed"}, status=500)
+        finally:
+            model_manager.release()
+
+    mgmt_app = web.Application(client_max_size=MAX_SDCARD_UPLOAD_BYTES)
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)
@@ -4460,6 +4654,8 @@ async def main():
     # Nightly scheduler API
     mgmt_app.router.add_get("/nightly/status", handle_nightly_status)
     mgmt_app.router.add_post("/nightly/trigger", handle_nightly_trigger)
+    # SD card batch upload (OPUS → 既存 SessionRecorder パイプライン合流)
+    mgmt_app.router.add_post("/sdcard/upload", handle_sdcard_upload)
 
     mgmt_runner = web.AppRunner(mgmt_app)
     await mgmt_runner.setup()
