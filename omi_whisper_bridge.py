@@ -688,7 +688,9 @@ class SessionRecorder:
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
-                log.error(f"ffmpeg failed: {result.stderr[:500]}")
+                # stderr の末尾を取る: 先頭は ffmpeg の version/configuration
+                # ヘッダで埋まっていて実エラーメッセージが見えないため。
+                log.error("ffmpeg failed (rc=%d): %s", result.returncode, result.stderr[-800:])
                 return False
             # 変換成功 → WAV 削除
             self.wav_path.unlink(missing_ok=True)
