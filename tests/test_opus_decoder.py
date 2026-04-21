@@ -10,7 +10,11 @@ sys.path.insert(0, str(ROOT))
 
 opuslib = pytest.importorskip("opuslib")
 
-from opus_decoder import OmiOpusStreamDecoder, OMI_HEADER_SIZE  # noqa: E402
+from opus_decoder import (  # noqa: E402
+    OmiOpusStreamDecoder,
+    OMI_HEADER_SIZE,
+    frame_samples_from_toc,
+)
 
 
 def _encode_silence(encoder, samples: int = 160) -> bytes:
@@ -87,3 +91,47 @@ def test_parse_length_prefixed_truncated():
     # 長さ5と宣言しているのに2バイトしかない → 打ち切り
     body = (5).to_bytes(4, "little") + b"ab"
     assert parse(body) == []
+
+
+def test_frame_samples_from_toc_known_configs():
+    # config 23 (CELT WB 20ms) -> toc = 23<<3 = 0xB8
+    assert frame_samples_from_toc(0xB8, 16000, 160) == 320
+    # config 20 (CELT WB 2.5ms) -> toc = 20<<3 = 0xA0
+    assert frame_samples_from_toc(0xA0, 16000, 160) == 40
+    # config 11 (SILK WB 60ms) -> toc = 11<<3 = 0x58
+    assert frame_samples_from_toc(0x58, 16000, 160) == 960
+
+
+def test_decode_batch_20ms_frame():
+    """Omi CV1 SD カード経由の 20ms フレーム (config 23: CELT WB) を模擬。"""
+    encoder = opuslib.Encoder(16000, 1, opuslib.APPLICATION_AUDIO)
+    # 20ms = 320samples, CELT が選ばれる範囲のビットレートで強制
+    encoder.bitrate = 32000
+    pcm_20ms = b"\x00\x00" * 320
+    opus_frame = encoder.encode(pcm_20ms, 320)
+
+    # エンコーダが 20ms フレーム (config 16-31 範囲) を出したことを確認
+    config = (opus_frame[0] >> 3) & 0x1F
+    assert _OPUS_CONFIG_FRAME_MS_MAP[config] == 20, (
+        f"encoder did not emit 20ms frame, got config={config}"
+    )
+
+    decoder = OmiOpusStreamDecoder(16000, 1)
+    pcm_out = decoder.decode_batch([opus_frame])
+    assert len(pcm_out) == 320 * 2  # 20ms * int16 mono
+
+
+# テスト側でconfig -> ms を参照するためのマップ (opus_decoder 側と同内容)
+_OPUS_CONFIG_FRAME_MS_MAP = {
+    i: ms for i, ms in enumerate((
+        10, 20, 40, 60,
+        10, 20, 40, 60,
+        10, 20, 40, 60,
+        10, 20,
+        10, 20,
+        2.5, 5, 10, 20,
+        2.5, 5, 10, 20,
+        2.5, 5, 10, 20,
+        2.5, 5, 10, 20,
+    ))
+}

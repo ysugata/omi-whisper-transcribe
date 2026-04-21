@@ -14,7 +14,30 @@ import opuslib
 log = logging.getLogger(__name__)
 
 OMI_HEADER_SIZE = 3  # packet_no(2) + fragment_idx(1)
-OPUS_FRAME_MS = 10   # Omi CV1 は 10ms フレーム
+OPUS_FRAME_MS = 10   # Omi CV1 BLE 経路は 10ms フレーム
+
+# RFC 6716 §3.1 TOC config(5bit) -> フレーム長(ms)。
+# SDカード経路は Omi CV1 側が CELT WB 20ms (config=23) 等の長フレームを
+# 使うことがあるので、TOC から出力バッファ長を決める必要がある。
+_OPUS_CONFIG_FRAME_MS = (
+    10, 20, 40, 60,   # 0-3   SILK NB
+    10, 20, 40, 60,   # 4-7   SILK MB
+    10, 20, 40, 60,   # 8-11  SILK WB
+    10, 20,           # 12-13 Hybrid SWB
+    10, 20,           # 14-15 Hybrid FB
+    2.5, 5, 10, 20,   # 16-19 CELT NB
+    2.5, 5, 10, 20,   # 20-23 CELT WB
+    2.5, 5, 10, 20,   # 24-27 CELT SWB
+    2.5, 5, 10, 20,   # 28-31 CELT FB
+)
+
+
+def frame_samples_from_toc(toc_byte: int, sample_rate: int, default_samples: int) -> int:
+    """OPUS TOC の config bits からデコード後サンプル数を返す。"""
+    config = (toc_byte >> 3) & 0x1F
+    if 0 <= config < len(_OPUS_CONFIG_FRAME_MS):
+        return int(sample_rate * _OPUS_CONFIG_FRAME_MS[config] / 1000)
+    return default_samples
 
 
 class OmiOpusStreamDecoder:
@@ -88,12 +111,16 @@ class OmiOpusStreamDecoder:
         """
         SDカード同期用: 長さプレフィックス形式からパースした OPUSフレーム列を
         一括デコードする。各フレームは既にヘッダ剥がし済みであること。
+        出力バッファ長は TOC バイトから自動判定する (CV1 SDは20msフレーム等)。
         """
         chunks = []
         for frame in opus_frames:
+            if not frame:
+                continue
+            samples = frame_samples_from_toc(frame[0], self.sample_rate, self.frame_size)
             try:
-                chunks.append(self._decoder.decode(frame, self.frame_size))
+                chunks.append(self._decoder.decode(frame, samples))
             except opuslib.OpusError as e:
                 log.warning("OPUS decode error, inserting silence: %s", e)
-                chunks.append(self._silence_bytes)
+                chunks.append(b"\x00" * (samples * 2 * self.channels))
         return b"".join(chunks)
