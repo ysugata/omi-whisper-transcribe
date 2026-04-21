@@ -1,33 +1,46 @@
+# syntax=docker/dockerfile:1.4
 FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt にも BuildKit cache mount を使い、archives/lists を再ダウンロードしない。
+# cache mount を使う場合は rm -rf /var/lib/apt/lists/* 禁止 (cache と衝突)。
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv tzdata ffmpeg wget \
-    libopus0 libopus-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libopus0 libopus-dev
 
 WORKDIR /app
 
+# pip ダウンロードキャッシュを BuildKit cache mount に永続化。
+# レイヤーキャッシュが外れても torch 等の wheel 再 HTTP DL を回避できる。
+# --no-cache-dir は外す (cache mount がキャッシュ本体を保持する役割)。
+
 # PyTorch with CUDA 12.4 (compatible with host driver 560.94 / CUDA 12.6)
-RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install all requirements (pyannote/whisperx will try to pull torch but pip
 # will see the constraint is already satisfied by 2.6.0+cu124)
 COPY requirements-docker.txt .
-RUN pip3 install --no-cache-dir -r requirements-docker.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install -r requirements-docker.txt
 
 # Restore torch to cu124 if any dependency overwrote it
-RUN pip3 install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Qwen3-ASR: install with --no-deps to skip heavy/unnecessary deps (gradio, flask, sox, soynlp)
 # then install only the runtime deps we actually need
-RUN pip3 install --no-cache-dir --no-deps qwen-asr>=0.0.6 \
-    && pip3 install --no-cache-dir qwen-omni-utils librosa nagisa
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install --no-deps qwen-asr>=0.0.6 \
+    && pip3 install qwen-omni-utils librosa nagisa
 
 # Phonetic correction + text normalization (CPU only, no GPU)
-RUN pip3 install --no-cache-dir pykakasi neologdn
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install pykakasi neologdn
 
 
 COPY omi_whisper_bridge.py .
