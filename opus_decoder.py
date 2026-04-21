@@ -125,8 +125,14 @@ class OmiOpusStreamDecoder:
         """
         SDカード同期用: 長さプレフィックス形式からパースした OPUSフレーム列を
         一括デコードする。各フレームは既にヘッダ剥がし済みであること。
-        出力バッファ長は TOC バイトから自動判定する (CV1 SDは20msフレーム等)。
+
+        opuslib への出力バッファ長は Opus の最大パケット長 (120ms) に固定する。
+        SD 経路は firmware がバッチング時に multi-frame packet (TOC code≥1) を
+        使うため、単一フレーム分の長さだと buffer_too_small が頻発する。
+        無音挿入時は TOC から推定した単フレーム長を使う (破損時の duration 推定)。
         """
+        # Opus spec: max packet duration = 120ms
+        max_samples = self.sample_rate * 120 // 1000
         chunks = []
         err_stats: dict[str, int] = {}
         err_samples: list[tuple] = []  # (idx, toc, config, code, stereo, frame_len, err)
@@ -137,7 +143,7 @@ class OmiOpusStreamDecoder:
             toc = frame[0]
             samples = frame_samples_from_toc(toc, self.sample_rate, self.frame_size)
             try:
-                chunks.append(self._decoder.decode(frame, samples))
+                chunks.append(self._decoder.decode(frame, max_samples))
             except opuslib.OpusError as e:
                 err_key = str(e)
                 err_stats[err_key] = err_stats.get(err_key, 0) + 1
