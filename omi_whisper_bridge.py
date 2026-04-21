@@ -4533,26 +4533,58 @@ async def main():
             # 録音書き込み
             recorder.write_audio(pcm_data)
 
-            # 文字起こし (既存 transcribe_audio を流用)
-            loop = asyncio.get_running_loop()
-            if ENGINE == "qwen3asr":
-                raw_segments = await loop.run_in_executor(
-                    executor,
-                    lambda: model.transcribe_audio(
-                        pcm_data, SAMPLE_RATE, 0.0, session_hotwords,
-                        LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
-                        audio_preprocessor,
-                    ),
-                )
-            else:
-                raw_segments = await loop.run_in_executor(
-                    executor,
-                    lambda: transcribe_audio(pcm_data, model, 0.0, session_hotwords, ""),
-                )
+            # 文字起こし: リアルタイム経路と同等の品質を得るため、
+            # 30s 単位で chunk 分割し prompt_carry を引き継ぐ。
+            # faster-whisper 内部 VAD に丸投げで一括処理すると、長尺音声で
+            # 幻覚/欠落が増える & 固有名詞・文脈がチャンクをまたげないため。
+            SDCARD_CHUNK_SEC = 30.0
+            chunk_bytes = int(SAMPLE_RATE * 2 * SDCARD_CHUNK_SEC)
 
-            if raw_segments:
-                rec_segments = _offset_segments(raw_segments, 0.0)
-                recorder.add_segments(rec_segments)
+            loop = asyncio.get_running_loop()
+            prompt_carry_text = ""
+            chunk_offset_sec = 0.0
+            total_segments = 0
+            num_chunks = 0
+
+            for start_i in range(0, len(pcm_data), chunk_bytes):
+                chunk = pcm_data[start_i:start_i + chunk_bytes]
+                chunk_duration = len(chunk) / (SAMPLE_RATE * 2)
+                num_chunks += 1
+
+                if ENGINE == "qwen3asr":
+                    raw_segments = await loop.run_in_executor(
+                        executor,
+                        lambda c=chunk: model.transcribe_audio(
+                            c, SAMPLE_RATE, 0.0, session_hotwords,
+                            LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
+                            audio_preprocessor,
+                        ),
+                    )
+                else:
+                    _carry = prompt_carry_text
+                    raw_segments = await loop.run_in_executor(
+                        executor,
+                        lambda c=chunk, p=_carry: transcribe_audio(
+                            c, model, 0.0, session_hotwords, p,
+                        ),
+                    )
+
+                if raw_segments:
+                    rec_segments = _offset_segments(raw_segments, chunk_offset_sec)
+                    recorder.add_segments(rec_segments)
+                    total_segments += len(raw_segments)
+                    # Whisper only: 次チャンク用に末尾テキストを引き継ぎ
+                    if ENGINE != "qwen3asr":
+                        prompt_carry_text = " ".join(
+                            s.get("text", "") for s in raw_segments
+                        )[-200:]
+
+                chunk_offset_sec += chunk_duration
+
+            log.info(
+                f"SD transcribe: {total_segments} segment(s) across "
+                f"{num_chunks} chunk(s) of {SDCARD_CHUNK_SEC:.0f}s"
+            )
 
             # Finalize + batch 投入 (既存 _finalize_and_enqueue と同じ流れ)
             recorder.finalize()
@@ -4570,7 +4602,7 @@ async def main():
                 "status": "ok",
                 "session_id": session_id,
                 "duration_seconds": round(duration, 2),
-                "segments_count": len(raw_segments) if raw_segments else 0,
+                "segments_count": total_segments,
                 "enqueued_for_batch": enqueued,
             })
 
