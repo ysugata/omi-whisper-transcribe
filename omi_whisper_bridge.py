@@ -1243,6 +1243,65 @@ def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
     ]
 
 
+def _split_pcm_on_silence(
+    pcm_data: bytes,
+    sample_rate: int,
+    target_sec: float = 25.0,
+    max_sec: float = 45.0,
+) -> list[tuple[int, int]]:
+    """
+    PCM16 を silero VAD で無音境界分割し、(start_byte, end_byte) のリストを返す。
+
+    realtime 経路の VAD_SEG ロジックをバッチ向けに書き換えたもの:
+    - 25 秒以上溜まったら、次の無音区間で切る (文の途中切りを回避)
+    - 45 秒を超えたら無音が無くても強制分割 (Whisper 内部 window に任せる)
+    - 全体が無音 or 単一 speech の場合は 1 チャンクのみ
+
+    タイムスタンプはサンプル単位。int16 mono なので byte offset = sample * 2。
+    """
+    if len(pcm_data) == 0:
+        return []
+
+    audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+    vad_opts = VadOptions(
+        threshold=VAD_THRESHOLD,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+        speech_pad_ms=0,
+    )
+    speech_ts = get_speech_timestamps(audio_np, vad_opts)
+
+    total_bytes = len(pcm_data)
+    target_samples = int(target_sec * sample_rate)
+    max_samples = int(max_sec * sample_rate)
+
+    if not speech_ts:
+        return [(0, total_bytes)]
+
+    chunks: list[tuple[int, int]] = []
+    current_start_sample = 0
+
+    for i in range(1, len(speech_ts)):
+        prev_end = speech_ts[i - 1]["end"]
+        curr_start = speech_ts[i]["start"]
+        chunk_len = prev_end - current_start_sample
+
+        # target 到達 → 無音中間点で切る
+        if chunk_len >= target_samples:
+            cut_sample = (prev_end + curr_start) // 2
+            chunks.append((current_start_sample * 2, cut_sample * 2))
+            current_start_sample = cut_sample
+        # max 超過 → 無音が無くても 次の speech 前で切る
+        elif chunk_len >= max_samples:
+            chunks.append((current_start_sample * 2, curr_start * 2))
+            current_start_sample = curr_start
+
+    # 最後の chunk: 残り全部
+    chunks.append((current_start_sample * 2, total_bytes))
+
+    return chunks
+
+
 # ============================================================
 # バックグラウンド話者分離
 # ============================================================
@@ -4533,23 +4592,21 @@ async def main():
             # 録音書き込み
             recorder.write_audio(pcm_data)
 
-            # 文字起こし: リアルタイム経路と同等の品質を得るため、
-            # 30s 単位で chunk 分割し prompt_carry を引き継ぐ。
-            # faster-whisper 内部 VAD に丸投げで一括処理すると、長尺音声で
-            # 幻覚/欠落が増える & 固有名詞・文脈がチャンクをまたげないため。
-            SDCARD_CHUNK_SEC = 30.0
-            chunk_bytes = int(SAMPLE_RATE * 2 * SDCARD_CHUNK_SEC)
+            # 文字起こし: realtime 経路と同等の品質を出すため、silero VAD で
+            # 無音境界分割 → 各 chunk に prompt_carry を引き継ぎながら transcribe。
+            # 固定長 chunk だと文の途中で切れて語尾欠落・幻覚が出やすいため、
+            # 発話の切れ目で分割する。
+            chunk_ranges = _split_pcm_on_silence(pcm_data, SAMPLE_RATE)
 
             loop = asyncio.get_running_loop()
             prompt_carry_text = ""
-            chunk_offset_sec = 0.0
             total_segments = 0
-            num_chunks = 0
 
-            for start_i in range(0, len(pcm_data), chunk_bytes):
-                chunk = pcm_data[start_i:start_i + chunk_bytes]
-                chunk_duration = len(chunk) / (SAMPLE_RATE * 2)
-                num_chunks += 1
+            for start_byte, end_byte in chunk_ranges:
+                chunk = pcm_data[start_byte:end_byte]
+                if len(chunk) == 0:
+                    continue
+                chunk_offset_sec = start_byte / (SAMPLE_RATE * 2)
 
                 if ENGINE == "qwen3asr":
                     raw_segments = await loop.run_in_executor(
@@ -4573,17 +4630,14 @@ async def main():
                     rec_segments = _offset_segments(raw_segments, chunk_offset_sec)
                     recorder.add_segments(rec_segments)
                     total_segments += len(raw_segments)
-                    # Whisper only: 次チャンク用に末尾テキストを引き継ぎ
                     if ENGINE != "qwen3asr":
                         prompt_carry_text = " ".join(
                             s.get("text", "") for s in raw_segments
                         )[-200:]
 
-                chunk_offset_sec += chunk_duration
-
             log.info(
                 f"SD transcribe: {total_segments} segment(s) across "
-                f"{num_chunks} chunk(s) of {SDCARD_CHUNK_SEC:.0f}s"
+                f"{len(chunk_ranges)} VAD-split chunk(s)"
             )
 
             # Finalize + batch 投入 (既存 _finalize_and_enqueue と同じ流れ)
