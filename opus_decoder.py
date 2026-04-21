@@ -130,12 +130,17 @@ class OmiOpusStreamDecoder:
         SD 経路は firmware がバッチング時に multi-frame packet (TOC code≥1) を
         使うため、単一フレーム分の長さだと buffer_too_small が頻発する。
         無音挿入時は TOC から推定した単フレーム長を使う (破損時の duration 推定)。
+
+        ロギング方針:
+          - corrupted_stream のみ: INFO サマリー (firmware 由来で想定内の雑音)
+          - 他エラー種 (buffer_too_small 等) が混ざる: WARNING + 上位8件の詳細
+            (想定外。回帰や新規バグのサインなので調査できるようにする)
         """
         # Opus spec: max packet duration = 120ms
         max_samples = self.sample_rate * 120 // 1000
         chunks = []
         err_stats: dict[str, int] = {}
-        err_samples: list[tuple] = []  # (idx, toc, config, code, stereo, frame_len, err)
+        err_samples: list[tuple] = []  # (idx, pos%, toc, config, code, stereo, frame_len, err)
         total = len(opus_frames)
         for idx, frame in enumerate(opus_frames):
             if not frame:
@@ -158,11 +163,19 @@ class OmiOpusStreamDecoder:
                 chunks.append(b"\x00" * (samples * 2 * self.channels))
         if err_stats:
             summary = ", ".join(f"{k}={v}" for k, v in err_stats.items())
-            log.warning("decode_batch errors: total=%d, %s", sum(err_stats.values()), summary)
-            for idx, pos_pct, toc, config, code, stereo, flen, err in err_samples:
-                log.warning(
-                    "  sample idx=%d pos=%.1f%% toc=0x%02x config=%d code=%d stereo=%d "
-                    "frame_bytes=%d err=%s",
-                    idx, pos_pct, toc, config, code, stereo, flen, err,
+            total_errs = sum(err_stats.values())
+            only_corrupted = set(err_stats.keys()) <= {"b'corrupted stream'"}
+            if only_corrupted:
+                log.info(
+                    "decode_batch: %d corrupted frame(s) out of %d (silence-filled)",
+                    total_errs, total,
                 )
+            else:
+                log.warning("decode_batch errors: total=%d, %s", total_errs, summary)
+                for idx, pos_pct, toc, config, code, stereo, flen, err in err_samples:
+                    log.warning(
+                        "  sample idx=%d pos=%.1f%% toc=0x%02x config=%d code=%d "
+                        "stereo=%d frame_bytes=%d err=%s",
+                        idx, pos_pct, toc, config, code, stereo, flen, err,
+                    )
         return b"".join(chunks)
