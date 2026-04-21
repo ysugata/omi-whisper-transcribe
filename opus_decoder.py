@@ -55,11 +55,12 @@ class OmiOpusStreamDecoder:
     def __init__(self, sample_rate: int = 16000, channels: int = 1):
         self.sample_rate = sample_rate
         self.channels = channels
-        self.frame_size = sample_rate // 100  # 10ms
+        self.frame_size = sample_rate // 100  # 10ms (フォールバック用)
         self._decoder = opuslib.Decoder(sample_rate, channels)
         self._pending_packet_no: int | None = None
         self._pending_fragments: list[bytes] = []
         self._silence_bytes = b"\x00" * (self.frame_size * 2 * channels)
+        self._decode_error_count = 0  # ログ rate-limit 用カウンタ
 
     def feed(self, raw: bytes) -> bytes:
         """
@@ -93,12 +94,25 @@ class OmiOpusStreamDecoder:
         if not self._pending_fragments:
             return b""
         opus_frame = b"".join(self._pending_fragments)
+        # TOC から出力バッファ長を決定 (BLE 側も 20ms 等の長フレームの可能性)
+        samples = frame_samples_from_toc(
+            opus_frame[0], self.sample_rate, self.frame_size,
+        )
         try:
-            pcm = self._decoder.decode(opus_frame, self.frame_size)
+            pcm = self._decoder.decode(opus_frame, samples)
             self._pending_fragments = []
             self._pending_packet_no = None
             return pcm
-        except opuslib.OpusError:
+        except opuslib.OpusError as e:
+            # sampling しつつログ出力 (BLE で毎フレーム失敗する状況を可視化)
+            self._decode_error_count += 1
+            if self._decode_error_count <= 5 or self._decode_error_count % 500 == 0:
+                log.warning(
+                    "OPUS feed decode error (#%d): %s (toc=0x%02x, samples=%d, frame_bytes=%d)",
+                    self._decode_error_count, e, opus_frame[0], samples, len(opus_frame),
+                )
+            self._pending_fragments = []
+            self._pending_packet_no = None
             return b""
 
     def flush_silence(self) -> bytes:
