@@ -128,13 +128,35 @@ class OmiOpusStreamDecoder:
         出力バッファ長は TOC バイトから自動判定する (CV1 SDは20msフレーム等)。
         """
         chunks = []
-        for frame in opus_frames:
+        err_stats: dict[str, int] = {}
+        err_samples: list[tuple] = []  # (idx, toc, config, code, stereo, frame_len, err)
+        total = len(opus_frames)
+        for idx, frame in enumerate(opus_frames):
             if not frame:
                 continue
-            samples = frame_samples_from_toc(frame[0], self.sample_rate, self.frame_size)
+            toc = frame[0]
+            samples = frame_samples_from_toc(toc, self.sample_rate, self.frame_size)
             try:
                 chunks.append(self._decoder.decode(frame, samples))
             except opuslib.OpusError as e:
-                log.warning("OPUS decode error, inserting silence: %s", e)
+                err_key = str(e)
+                err_stats[err_key] = err_stats.get(err_key, 0) + 1
+                if len(err_samples) < 8:
+                    config = (toc >> 3) & 0x1F
+                    stereo = (toc >> 2) & 0x01
+                    code = toc & 0x03
+                    pos_pct = (idx / total * 100) if total else 0
+                    err_samples.append(
+                        (idx, pos_pct, toc, config, code, stereo, len(frame), err_key)
+                    )
                 chunks.append(b"\x00" * (samples * 2 * self.channels))
+        if err_stats:
+            summary = ", ".join(f"{k}={v}" for k, v in err_stats.items())
+            log.warning("decode_batch errors: total=%d, %s", sum(err_stats.values()), summary)
+            for idx, pos_pct, toc, config, code, stereo, flen, err in err_samples:
+                log.warning(
+                    "  sample idx=%d pos=%.1f%% toc=0x%02x config=%d code=%d stereo=%d "
+                    "frame_bytes=%d err=%s",
+                    idx, pos_pct, toc, config, code, stereo, flen, err,
+                )
         return b"".join(chunks)
