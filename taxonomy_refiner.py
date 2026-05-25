@@ -35,7 +35,7 @@ class TaxonomyRefiner:
         rag_classifier,
         sample_ratio: float = 0.2,
         proposal_model: str = "gemini-2.5-flash",
-        validation_model: str = "gemini-3.1-flash-lite-preview",
+        validation_model: str = "gemini-3.1-flash-lite",
     ) -> None:
         self._api_key = api_key
         self._recordings_dir = recordings_dir
