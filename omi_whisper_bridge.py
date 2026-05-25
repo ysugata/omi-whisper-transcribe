@@ -79,7 +79,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LLM_API_KEY = GEMINI_API_KEY  # Default LLM uses Gemini
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite-preview")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "B")        # Pipeline stages to run (A/B/C)
@@ -90,7 +90,7 @@ RECOVERY_SCAN_DAYS = int(os.environ.get("RECOVERY_SCAN_DAYS", "7"))     # Startu
 
 # --- セッションタグ付け設定 ---
 TAGGING_ENABLED = os.environ.get("TAGGING_ENABLED", "true").lower() in ("true", "1", "yes")
-TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-3.1-flash-lite-preview")
+TAGGING_MODEL = os.environ.get("TAGGING_MODEL", "gemini-3.1-flash-lite")
 DOMAIN_PREFILTER_ENABLED = os.environ.get("DOMAIN_PREFILTER_ENABLED", "true").lower() in ("true", "1", "yes")
 DOMAIN_PREFILTER_MIN_MATCHES = int(os.environ.get("DOMAIN_PREFILTER_MIN_MATCHES", "1"))
 
@@ -104,7 +104,7 @@ RAG_MIN_SESSIONS = int(os.environ.get("RAG_MIN_SESSIONS", "20"))
 TAXONOMY_REFINE_ENABLED = os.environ.get("TAXONOMY_REFINE_ENABLED", "true").lower() in ("true", "1", "yes")
 TAXONOMY_SAMPLE_RATIO = float(os.environ.get("TAXONOMY_SAMPLE_RATIO", "0.2"))
 TAXONOMY_PROPOSAL_MODEL = os.environ.get("TAXONOMY_PROPOSAL_MODEL", "gemini-2.5-flash")
-TAXONOMY_VALIDATION_MODEL = os.environ.get("TAXONOMY_VALIDATION_MODEL", "gemini-3.1-flash-lite-preview")
+TAXONOMY_VALIDATION_MODEL = os.environ.get("TAXONOMY_VALIDATION_MODEL", "gemini-3.1-flash-lite")
 
 # --- 音響シーン分類設定 ---
 AUDIO_SCENE_ENABLED = os.environ.get("AUDIO_SCENE_ENABLED", "true").lower() in ("true", "1", "yes")

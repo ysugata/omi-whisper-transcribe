@@ -523,7 +523,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `LLM_ENABLED` | `true` | LLM 後処理の有効化 |
-| `LLM_MODEL` | `gemini-3.1-flash-lite-preview` | LLM モデル名 |
+| `LLM_MODEL` | `gemini-3.1-flash-lite` | LLM モデル名 |
 | `LLM_TIMEOUT` | `10` | リクエストタイムアウト (秒) |
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
@@ -568,7 +568,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
-| `TAGGING_MODEL` | `gemini-3.1-flash-lite-preview` | タグ付け用 LLM モデル名 |
+| `TAGGING_MODEL` | `gemini-3.1-flash-lite` | タグ付け用 LLM モデル名 |
 | `DOMAIN_PREFILTER_ENABLED` | `true` | ドメイン事前フィルタ (keyword_anchors によるキーワード走査) |
 | `DOMAIN_PREFILTER_MIN_MATCHES` | `1` | 候補ドメインとなる最小キーワードヒット数 |
 | `RAG_ENABLED` | `true` | RAG 分類 (過去セッション埋め込みベースの k-NN 加重投票) |
@@ -583,7 +583,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `TAXONOMY_REFINE_ENABLED` | `true` | タクソノミー自動精緻化機能の有効/無効 |
 | `TAXONOMY_SAMPLE_RATIO` | `0.2` | サンプリング率 (各 conversation_type から何割抽出するか) |
 | `TAXONOMY_PROPOSAL_MODEL` | `gemini-2.5-flash` | Step 3 (提案生成) に使う LLM モデル |
-| `TAXONOMY_VALIDATION_MODEL` | `gemini-3.1-flash-lite-preview` | Step 4 (検証) に使う LLM モデル |
+| `TAXONOMY_VALIDATION_MODEL` | `gemini-3.1-flash-lite` | Step 4 (検証) に使う LLM モデル |
 
 ### 深夜スケジューラ
 
