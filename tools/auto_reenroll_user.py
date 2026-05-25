@@ -60,23 +60,24 @@ def find_candidates(recordings_dir: Path, limit: int) -> list[dict]:
         for time_dir in sorted(day_dir.iterdir(), reverse=True):
             if not time_dir.is_dir():
                 continue
-            sess_json = load_json(time_dir / "session.json")
-            if not sess_json:
-                continue
+            # audio_scene lives in session.json
+            sess_json = load_json(time_dir / "session.json") or {}
             scene = sess_json.get("audio_scene") or {}
             if scene.get("scene_label_en") != "conversation":
                 continue
             if (scene.get("music") or {}).get("detected"):
                 continue
-            num_sp = sess_json.get("num_speakers")
-            if num_sp is not None and num_sp != 1:
-                continue
-            duration = sess_json.get("duration_seconds") or 0
-            if duration < MIN_DURATION or duration > MAX_DURATION:
-                continue
 
+            # duration + num_speakers + segments live in transcript.json
             transcript = load_json(time_dir / "transcript.json")
             if not transcript:
+                continue
+            tsess = transcript.get("session") or {}
+            duration = tsess.get("duration_seconds") or 0
+            if duration < MIN_DURATION or duration > MAX_DURATION:
+                continue
+            num_sp = tsess.get("num_speakers")
+            if num_sp is not None and num_sp != 1:
                 continue
             segments = transcript.get("segments") or []
             usable_segs = [s for s in segments if (s.get("end", 0) - s.get("start", 0)) >= 0.5]
