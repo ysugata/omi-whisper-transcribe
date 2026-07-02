@@ -661,7 +661,8 @@ def _policy_sessions(rec_dir):
         "quality": "noisy",
         "tag_version": 2,
     })
-    # 3. Casual BUT high external audio -> stays (needs human eyes)
+    # 3. Casual + high external audio -> skipped by default
+    #    (低+casual と分類済みの TV 混入はレビュー価値なし)
     _make_session(rec_dir, TODAY, "12-00-00", tags={
         "conversation_type": "雑談・移動中メモ",
         "outcomes": [],
@@ -684,7 +685,7 @@ def _policy_sessions(rec_dir):
 
 @pytest.mark.asyncio
 async def test_queue_policy_default_admission(tmp_env):
-    """Default policy: rag>=0.8 auto-accepted, 低+casual skipped, external audio kept."""
+    """Default policy: rag>=0.8 auto-accepted, 低+casual skipped (even with external audio)."""
     db_path, rec_dir = tmp_env
     _policy_sessions(rec_dir)
 
@@ -694,13 +695,39 @@ async def test_queue_policy_default_admission(tmp_env):
 
     queue = await indexer.get_review_queue(limit=10, offset=0)
     times = sorted(item["time"] for item in queue)
-    assert times == ["12-00-00", "13-00-00"], \
-        f"expected only external-audio + low-sim sessions in queue, got {times}"
+    assert times == ["13-00-00"], \
+        f"expected only the important low-sim session in queue, got {times}"
 
     stats = await indexer.get_review_stats()
-    assert stats["total_pending"] == 2
+    assert stats["total_pending"] == 1
     assert stats["total_raw"] == 4
     assert stats["policy_excluded"]["auto_accepted"] == 1
+    assert stats["policy_excluded"]["skipped_casual"] == 2
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_policy_casual_keep_external_audio(tmp_env):
+    """casual_keep_external_audio=True keeps suspicious-audio casual sessions queued."""
+    db_path, rec_dir = tmp_env
+    _policy_sessions(rec_dir)
+    _write_policy(rec_dir, {
+        "auto_accept_rag_similarity": 0.8,
+        "skip_low_importance_casual": True,
+        "casual_keep_external_audio": True,
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    times = sorted(item["time"] for item in queue)
+    assert times == ["12-00-00", "13-00-00"], \
+        f"external-audio casual session should stay queued, got {times}"
+
+    stats = await indexer.get_review_stats()
     assert stats["policy_excluded"]["skipped_casual"] == 1
 
     await indexer.close()
