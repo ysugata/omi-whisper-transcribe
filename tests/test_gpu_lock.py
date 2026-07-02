@@ -3,10 +3,10 @@
 Verifies that:
 1. diarizer._free_vram() calls torch.cuda.synchronize() before empty_cache()
 2. speaker_filter._free_vram() and _unload_model() call torch.cuda.synchronize()
-3. _batch_diarize_task() acquires gpu_lock per-session (not for entire batch)
+3. _batch_diarize_task() holds gpu_lock for the whole batch, loads the pyannote
+   pipeline once, and unloads it in a finally block
 4. _batch_tag_task() acquires gpu_lock per-session (load→process→unload per session)
 5. ModelManager.force_unload() ignores session_count and always unloads
-6. Batch tasks use force_unload() once before the loop, then per-session locks
 """
 
 import asyncio
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch, call
 
@@ -174,13 +175,14 @@ class TestSpeakerFilterVram:
 # =====================================================================
 
 class TestBatchDiarizeLock:
-    """Verify gpu_lock is acquired per-session to avoid system freeze."""
+    """Verify gpu_lock is held for the whole batch and the pipeline is
+    loaded once / unloaded in a finally block."""
 
     @pytest.fixture
     def recordings_dir(self, tmp_path):
         """Create a temp recordings dir with 2 sessions."""
         for i, time_name in enumerate(["10-00-00", "11-00-00"]):
-            session_dir = tmp_path / "2026-03-29" / time_name
+            session_dir = tmp_path / datetime.now().strftime("%Y-%m-%d") / time_name  # within BATCH_MAX_DAYS window
             session_dir.mkdir(parents=True)
             (session_dir / "audio.ogg").write_bytes(b"\x00" * 100)
             transcript = {
@@ -191,9 +193,20 @@ class TestBatchDiarizeLock:
                 json.dump(transcript, f)
         return tmp_path
 
+    @staticmethod
+    def _make_diarizer(pipeline_result=None):
+        mock_pipeline = MagicMock()
+        mock_diarizer = MagicMock()
+        mock_diarizer.load_pipeline.return_value = mock_pipeline
+        mock_diarizer.diarize_with_pipeline.return_value = pipeline_result or (
+            [{"text": "test", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}],
+            True,
+        )
+        return mock_diarizer
+
     @pytest.mark.asyncio
     async def test_gpu_lock_per_session(self, recordings_dir):
-        """gpu_lock must be acquired per-session (1 for force_unload + 1 per session)."""
+        """gpu_lock is acquired once for the whole batch; pipeline loaded once."""
         _mock_bridge_deps()
 
         lock_events = []
@@ -211,15 +224,9 @@ class TestBatchDiarizeLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = TrackingLock()
-        mock_mm.force_unload = AsyncMock(return_value=True)
-        # Prevent per-session force_unload inside loop (loaded is False after initial unload)
-        mock_mm.loaded = False
+        mock_mm.unload_model = AsyncMock(return_value=True)
 
-        mock_diarizer = MagicMock()
-        mock_diarizer.diarize.return_value = (
-            [{"text": "test", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}],
-            True,
-        )
+        mock_diarizer = self._make_diarizer()
 
         import omi_whisper_bridge as bridge
         original_mm = bridge.model_manager
@@ -237,19 +244,20 @@ class TestBatchDiarizeLock:
             bridge.diarizer = original_diarizer
             bridge.RECORDINGS_DIR = original_recordings
 
-        # 1 acquire for force_unload + 2 acquires for 2 sessions = 3
-        assert lock_events.count("acquire") == 3, \
-            f"gpu_lock should be acquired 3 times (1 force_unload + 2 sessions), got {lock_events.count('acquire')}"
-        assert lock_events.count("release") == 3, \
-            f"gpu_lock should be released 3 times, got {lock_events.count('release')}"
-        assert mock_mm.force_unload.call_count == 1, \
-            f"force_unload should be called once, got {mock_mm.force_unload.call_count}"
-        assert mock_diarizer.diarize.call_count == 2, \
-            f"Both sessions should be processed, got {mock_diarizer.diarize.call_count}"
+        assert lock_events == ["acquire", "release"], \
+            f"gpu_lock should be held once for the whole batch, got {lock_events}"
+        assert mock_mm.unload_model.await_count == 1, \
+            "Whisper should be unloaded once before loading the pipeline"
+        assert mock_diarizer.load_pipeline.call_count == 1, \
+            "pyannote pipeline should be loaded once for the whole batch"
+        assert mock_diarizer.diarize_with_pipeline.call_count == 2, \
+            f"Both sessions should be processed, got {mock_diarizer.diarize_with_pipeline.call_count}"
+        assert mock_diarizer.unload_pipeline.call_count == 1, \
+            "Pipeline must be unloaded after the batch"
 
     @pytest.mark.asyncio
     async def test_lock_released_between_sessions(self, recordings_dir):
-        """gpu_lock must be released between sessions so WS handlers can run."""
+        """diarize runs while gpu_lock is held; lock is released after the batch."""
         _mock_bridge_deps()
 
         lock_held = []
@@ -270,16 +278,14 @@ class TestBatchDiarizeLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = tracking_lock
-        mock_mm.force_unload = AsyncMock(return_value=True)
+        mock_mm.unload_model = AsyncMock(return_value=True)
 
-        session_count = [0]
         def diarize_check_lock(*args, **kwargs):
             lock_held.append(tracking_lock.is_locked)
-            session_count[0] += 1
             return ([{"text": "t", "start": 0, "end": 1, "speaker": "SPEAKER_00"}], True)
 
-        mock_diarizer = MagicMock()
-        mock_diarizer.diarize.side_effect = diarize_check_lock
+        mock_diarizer = self._make_diarizer()
+        mock_diarizer.diarize_with_pipeline.side_effect = diarize_check_lock
 
         import omi_whisper_bridge as bridge
         original_mm = bridge.model_manager
@@ -297,17 +303,18 @@ class TestBatchDiarizeLock:
             bridge.diarizer = original_diarizer
             bridge.RECORDINGS_DIR = original_recordings
 
-        assert all(lock_held), "diarize() must run while gpu_lock is held"
+        assert lock_held and all(lock_held), \
+            "diarize_with_pipeline() must run while gpu_lock is held"
         assert not tracking_lock.is_locked, "gpu_lock must be released after batch"
 
     @pytest.mark.asyncio
     async def test_cancel_breaks_loop_releases_lock(self, recordings_dir):
-        """Cancel should break the loop and release the lock."""
+        """Cancel should break the loop, unload the pipeline and release the lock."""
         _mock_bridge_deps()
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = asyncio.Lock()
-        mock_mm.force_unload = AsyncMock(return_value=True)
+        mock_mm.unload_model = AsyncMock(return_value=True)
 
         import omi_whisper_bridge as bridge
 
@@ -315,8 +322,8 @@ class TestBatchDiarizeLock:
             bridge._batch_state["cancel_requested"] = True
             return ([{"text": "t", "start": 0, "end": 1, "speaker": "SPEAKER_00"}], True)
 
-        mock_diarizer = MagicMock()
-        mock_diarizer.diarize.side_effect = diarize_with_cancel
+        mock_diarizer = self._make_diarizer()
+        mock_diarizer.diarize_with_pipeline.side_effect = diarize_with_cancel
 
         original_mm = bridge.model_manager
         original_diarizer = bridge.diarizer
@@ -334,7 +341,9 @@ class TestBatchDiarizeLock:
             bridge.RECORDINGS_DIR = original_recordings
 
         assert not mock_mm.gpu_lock.locked(), "gpu_lock must be released after cancel"
-        assert mock_diarizer.diarize.call_count == 1
+        assert mock_diarizer.diarize_with_pipeline.call_count == 1
+        assert mock_diarizer.unload_pipeline.call_count == 1, \
+            "Pipeline must be unloaded even when the batch is cancelled"
 
 
 # =====================================================================
@@ -347,7 +356,7 @@ class TestBatchTagLock:
     @pytest.fixture
     def recordings_dir(self, tmp_path):
         for i, time_name in enumerate(["10-00-00", "11-00-00"]):
-            session_dir = tmp_path / "2026-03-29" / time_name
+            session_dir = tmp_path / datetime.now().strftime("%Y-%m-%d") / time_name  # within BATCH_MAX_DAYS window
             session_dir.mkdir(parents=True)
             (session_dir / "audio.ogg").write_bytes(b"\x00" * 100)
             transcript = {
@@ -360,7 +369,7 @@ class TestBatchTagLock:
 
     @pytest.mark.asyncio
     async def test_gpu_lock_per_session_tag(self, recordings_dir):
-        """gpu_lock must be acquired per-session (1 for force_unload + 1 per session)."""
+        """gpu_lock must be acquired per-session (load→process→unload each time)."""
         _mock_bridge_deps()
 
         lock_events = []
@@ -384,9 +393,6 @@ class TestBatchTagLock:
 
         mock_mm = MagicMock()
         mock_mm.gpu_lock = tracking_lock
-        mock_mm.force_unload = AsyncMock(return_value=True)
-        # Prevent per-session force_unload inside loop (loaded is False after initial unload)
-        mock_mm.loaded = False
 
         mock_inference = MagicMock()
 
@@ -414,13 +420,12 @@ class TestBatchTagLock:
             bridge.speaker_filter = original_sf
             bridge.RECORDINGS_DIR = original_recordings
 
-        # 1 acquire for force_unload + 2 acquires for 2 sessions = 3
-        assert lock_events.count("acquire") == 3, \
-            f"gpu_lock should be acquired 3 times, got {lock_events.count('acquire')}"
-        assert lock_events.count("release") == 3
+        # 1 acquire per session = 2 (Whisper stays loaded; embedding model is small)
+        assert lock_events.count("acquire") == 2, \
+            f"gpu_lock should be acquired 2 times, got {lock_events.count('acquire')}"
+        assert lock_events.count("release") == 2
         assert all(processing_while_locked), \
             f"All tag operations must happen while gpu_lock is held, got {processing_while_locked}"
-        assert mock_mm.force_unload.call_count == 1
         # Model loaded/unloaded per session
         assert mock_sf._load_model.call_count == 2
         assert mock_sf._unload_model.call_count == 2

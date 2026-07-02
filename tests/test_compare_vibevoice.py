@@ -65,12 +65,12 @@ class TestParseVibevoiceOutput:
         result = _parse_vibevoice_output("")
         assert result == []
 
-    def test_plain_text_fallback(self):
+    def test_plain_text_returns_empty(self):
+        # Unparseable output returns [] instead of fabricating a segment
+        # (avoids corrupted timestamps/speakers in comparison results)
         text = "This is plain transcription text"
         result = _parse_vibevoice_output(text)
-        assert len(result) == 1
-        assert result[0]["Content"] == text
-        assert result[0]["Start"] == 0
+        assert result == []
 
 
 # ---------------------------------------------------------------------------

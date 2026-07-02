@@ -21,6 +21,7 @@ from sanitize_schema import (
     KC_EXTRACTION_SCHEMA,
     KC_MIN_KEYPOINTS,
     SANITIZE_SCHEMA,
+    filter_knowledge_cards,
     run_quality_gates,
     should_keep_knowledge_card,
     validate_knowledge_card,
@@ -172,17 +173,23 @@ class TestKCExtractionSchema:
         assert KC_EXTRACTION_SCHEMA["strict"] is True
 
     def test_schema_required_fields(self):
+        """Multi-card format: response level has extractable + cards."""
         required = KC_EXTRACTION_SCHEMA["schema"]["required"]
-        for field in ["extractable", "question", "answer", "evidence", "confidence"]:
+        for field in ["extractable", "cards"]:
             assert field in required
 
+    def test_card_required_fields(self):
+        card_schema = KC_EXTRACTION_SCHEMA["schema"]["properties"]["cards"]["items"]
+        for field in ["question", "answer", "evidence", "confidence"]:
+            assert field in card_schema["required"]
+
     def test_confidence_enum(self):
-        conf = KC_EXTRACTION_SCHEMA["schema"]["properties"]["confidence"]
-        assert conf["enum"] == ["none", "low", "medium", "high"]
+        card_props = KC_EXTRACTION_SCHEMA["schema"]["properties"]["cards"]["items"]["properties"]
+        assert card_props["confidence"]["enum"] == ["none", "low", "medium", "high"]
 
     def test_evidence_is_array(self):
-        ev = KC_EXTRACTION_SCHEMA["schema"]["properties"]["evidence"]
-        assert ev["type"] == "array"
+        card_props = KC_EXTRACTION_SCHEMA["schema"]["properties"]["cards"]["items"]["properties"]
+        assert card_props["evidence"]["type"] == "array"
 
 
 class TestValidateSchema:
@@ -220,8 +227,9 @@ class TestKnowledgeCardValidation:
         assert should_keep_knowledge_card(FIXTURE_KC_EXTRACTABLE) is True
 
     def test_not_extractable(self):
-        warnings = validate_knowledge_card(FIXTURE_KC_NOT_EXTRACTABLE)
-        assert len(warnings) == 0  # extractable=false → no validation
+        # extractable=false is handled at the response level: no cards survive
+        assert filter_knowledge_cards({"extractable": False, "cards": []}) == []
+        # A card without evidence never passes the per-card gate either
         assert should_keep_knowledge_card(FIXTURE_KC_NOT_EXTRACTABLE) is False
 
     def test_weak_confidence_rejected(self):
