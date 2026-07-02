@@ -826,50 +826,9 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
 
     # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
-    try:
-        info = indexer._parse_transcript(date, time)
-        info["last_modified"] = transcript_path.stat().st_mtime
-        await indexer._db.execute(
-            """INSERT OR REPLACE INTO sessions
-               (date, time, start_at, end_at, duration_seconds,
-                audio_size_mb, model, language, transcript_text, segment_count,
-                tags_topics, tags_activity, tags_intent, tags_mood,
-                tags_quality, tags_entities, tags_summary, session_tagged,
-                tags_user, speakers, last_modified,
-                tags_source_type, tags_business_domain, tags_importance,
-                tags_confidentiality, tags_decision_required,
-                tags_decision_summary, tags_action_items, tags_outcome,
-                tags_conversation_type, tags_outcomes, tags_domains,
-                tags_decision_memo, tags_importance_v2, tags_version,
-                tags_external_audio,
-                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                tags_audio_noise_sources, tags_audio_events,
-                tags_audio_music_detected, tags_audio_speaker_count,
-                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
-                tags_review_outcome)
-               VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
-                       :audio_size_mb, :model, :language, :transcript_text, :segment_count,
-                       :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                       :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                       :tags_user, :speakers, :last_modified,
-                       :tags_source_type, :tags_business_domain, :tags_importance,
-                       :tags_confidentiality, :tags_decision_required,
-                       :tags_decision_summary, :tags_action_items, :tags_outcome,
-                       :tags_conversation_type, :tags_outcomes, :tags_domains,
-                       :tags_decision_memo, :tags_importance_v2, :tags_version,
-                       :tags_external_audio,
-                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                       :tags_audio_noise_sources, :tags_audio_events,
-                       :tags_audio_music_detected, :tags_audio_speaker_count,
-                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
-                       :tags_review_outcome)""",
-            info,
-        )
-        await indexer._db.commit()
-        if not was_already_corrected:
-            indexer.record_review_feedback(info, was_corrected=True)
-    except Exception as e:
-        logger.warning(f"Re-index after session-tags update failed: {e}")
+    info = await indexer.reindex_session(date, time)
+    if info and not was_already_corrected:
+        indexer.record_review_feedback(info, was_corrected=True)
 
     # Notify Bridge for keyword learning if domains changed
     new_domains = list(tags.get("domains", []))
@@ -1132,49 +1091,9 @@ async def handle_review_accept(request: web.Request) -> web.Response:
 
     # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
-    try:
-        info = indexer._parse_transcript(date, time_val)
-        info["last_modified"] = transcript_path.stat().st_mtime
-        await indexer._db.execute(
-            """INSERT OR REPLACE INTO sessions
-               (date, time, start_at, end_at, duration_seconds,
-                audio_size_mb, model, language, transcript_text, segment_count,
-                tags_topics, tags_activity, tags_intent, tags_mood,
-                tags_quality, tags_entities, tags_summary, session_tagged,
-                tags_user, speakers, last_modified,
-                tags_source_type, tags_business_domain, tags_importance,
-                tags_confidentiality, tags_decision_required,
-                tags_decision_summary, tags_action_items, tags_outcome,
-                tags_conversation_type, tags_outcomes, tags_domains,
-                tags_decision_memo, tags_importance_v2, tags_version,
-                tags_external_audio,
-                tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                tags_audio_noise_sources, tags_audio_events,
-                tags_audio_music_detected, tags_audio_speaker_count,
-                tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
-                tags_review_outcome)
-               VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
-                       :audio_size_mb, :model, :language, :transcript_text, :segment_count,
-                       :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                       :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                       :tags_user, :speakers, :last_modified,
-                       :tags_source_type, :tags_business_domain, :tags_importance,
-                       :tags_confidentiality, :tags_decision_required,
-                       :tags_decision_summary, :tags_action_items, :tags_outcome,
-                       :tags_conversation_type, :tags_outcomes, :tags_domains,
-                       :tags_decision_memo, :tags_importance_v2, :tags_version,
-                       :tags_external_audio,
-                       :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                       :tags_audio_noise_sources, :tags_audio_events,
-                       :tags_audio_music_detected, :tags_audio_speaker_count,
-                       :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
-                       :tags_review_outcome)""",
-            info,
-        )
-        await indexer._db.commit()
+    info = await indexer.reindex_session(date, time_val)
+    if info:
         indexer.record_review_feedback(info, was_corrected=False)
-    except Exception as e:
-        logger.warning(f"Re-index after review accept failed: {e}")
 
     return web.json_response({"status": "ok"})
 

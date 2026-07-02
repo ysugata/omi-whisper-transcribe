@@ -244,17 +244,9 @@ _TERM_CORRECTIONS_PATH = os.path.join(CONFIG_DIR, "term_corrections.json")
 
 term_corrector = TermCorrector(_TERM_CORRECTIONS_PATH)
 
-# Layer 3: LLM 後処理 (API キー未設定なら自動的に無効)
-llm_corrector: LLMCorrector | None = None
-if LLM_ENABLED and LLM_API_KEY:
-    llm_corrector = LLMCorrector(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=LLM_MODEL,
-        timeout=LLM_TIMEOUT,
-    )
-
 # Layer 3 Pipeline: 3-stage LLM correction (batch post-processing)
+# (レガシーの LLMCorrector インスタンスは廃止。detect_corrections の
+#  静的メソッドのみ _save_llm_suggestions で使用)
 llm_pipeline: LLMPipeline | None = None
 if LLM_ENABLED and LLM_API_KEY:
     llm_pipeline = LLMPipeline(
@@ -563,8 +555,6 @@ _PENDING_SUGGESTIONS_PATH = os.path.join(CONFIG_DIR, "pending_suggestions.json")
 
 def _save_llm_suggestions(originals: list[str], corrected_segments: list[dict]) -> None:
     """LLM が修正した差分を pending_suggestions.json に追記する。"""
-    from llm_corrector import LLMCorrector
-
     new_suggestions = []
     for orig_text, seg in zip(originals, corrected_segments):
         corrected_text = seg.get("text", "")

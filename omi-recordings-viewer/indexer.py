@@ -130,6 +130,42 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_review_outcome TEXT",
 ]
 
+# Single source of truth for the sessions upsert. Any column change must be
+# mirrored in SCHEMA + MIGRATION_ADD_TAGS + _parse_transcript.
+SESSION_UPSERT_SQL = """INSERT OR REPLACE INTO sessions
+   (date, time, start_at, end_at, duration_seconds,
+    audio_size_mb, model, language, transcript_text, segment_count,
+    tags_topics, tags_activity, tags_intent, tags_mood,
+    tags_quality, tags_entities, tags_summary, session_tagged,
+    tags_user, speakers, last_modified,
+    tags_source_type, tags_business_domain, tags_importance,
+    tags_confidentiality, tags_decision_required,
+    tags_decision_summary, tags_action_items, tags_outcome,
+    tags_conversation_type, tags_outcomes, tags_domains,
+    tags_decision_memo, tags_importance_v2, tags_version,
+    tags_external_audio,
+    tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
+    tags_audio_noise_sources, tags_audio_events,
+    tags_audio_music_detected, tags_audio_speaker_count,
+    tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
+    tags_review_outcome)
+   VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
+           :audio_size_mb, :model, :language, :transcript_text, :segment_count,
+           :tags_topics, :tags_activity, :tags_intent, :tags_mood,
+           :tags_quality, :tags_entities, :tags_summary, :session_tagged,
+           :tags_user, :speakers, :last_modified,
+           :tags_source_type, :tags_business_domain, :tags_importance,
+           :tags_confidentiality, :tags_decision_required,
+           :tags_decision_summary, :tags_action_items, :tags_outcome,
+           :tags_conversation_type, :tags_outcomes, :tags_domains,
+           :tags_decision_memo, :tags_importance_v2, :tags_version,
+           :tags_external_audio,
+           :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
+           :tags_audio_noise_sources, :tags_audio_events,
+           :tags_audio_music_detected, :tags_audio_speaker_count,
+           :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
+           :tags_review_outcome)"""
+
 # FTS5 was set up historically but never used for search (Japanese text has
 # no word boundaries, so the unicode61 tokenizer cannot serve substring
 # queries; search uses LIKE instead). Drop leftovers to remove the
@@ -356,42 +392,7 @@ class Indexer:
                 continue
 
             info["last_modified"] = mtime
-            await self._db.execute(
-                """INSERT OR REPLACE INTO sessions
-                   (date, time, start_at, end_at, duration_seconds,
-                    audio_size_mb, model, language, transcript_text, segment_count,
-                    tags_topics, tags_activity, tags_intent, tags_mood,
-                    tags_quality, tags_entities, tags_summary, session_tagged,
-                    tags_user, speakers, last_modified,
-                    tags_source_type, tags_business_domain, tags_importance,
-                    tags_confidentiality, tags_decision_required,
-                    tags_decision_summary, tags_action_items, tags_outcome,
-                    tags_conversation_type, tags_outcomes, tags_domains,
-                    tags_decision_memo, tags_importance_v2, tags_version,
-                    tags_external_audio,
-                    tags_audio_scene, tags_audio_scene_spatial, tags_audio_scene_confidence,
-                    tags_audio_noise_sources, tags_audio_events,
-                    tags_audio_music_detected, tags_audio_speaker_count,
-                    tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
-                    tags_review_outcome)
-                   VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
-                           :audio_size_mb, :model, :language, :transcript_text, :segment_count,
-                           :tags_topics, :tags_activity, :tags_intent, :tags_mood,
-                           :tags_quality, :tags_entities, :tags_summary, :session_tagged,
-                           :tags_user, :speakers, :last_modified,
-                           :tags_source_type, :tags_business_domain, :tags_importance,
-                           :tags_confidentiality, :tags_decision_required,
-                           :tags_decision_summary, :tags_action_items, :tags_outcome,
-                           :tags_conversation_type, :tags_outcomes, :tags_domains,
-                           :tags_decision_memo, :tags_importance_v2, :tags_version,
-                           :tags_external_audio,
-                           :tags_audio_scene, :tags_audio_scene_spatial, :tags_audio_scene_confidence,
-                           :tags_audio_noise_sources, :tags_audio_events,
-                           :tags_audio_music_detected, :tags_audio_speaker_count,
-                           :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
-                           :tags_review_outcome)""",
-                info,
-            )
+            await self._db.execute(SESSION_UPSERT_SQL, info)
             count += 1
 
             # Yield to event loop periodically to prevent blocking
@@ -539,6 +540,24 @@ class Indexer:
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, path.read_text, "utf-8")
         return json.loads(data)
+
+    async def reindex_session(self, date: str, time: str) -> dict | None:
+        """Re-parse one session's transcript.json and upsert its DB row.
+
+        Used after handlers modify transcript.json in place (tag edits,
+        review accepts). Returns the parsed row dict, or None on failure.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            info = await loop.run_in_executor(None, self._parse_transcript, date, time)
+            path = self.recordings_dir / date / time / "transcript.json"
+            info["last_modified"] = path.stat().st_mtime if path.exists() else 0
+            await self._db.execute(SESSION_UPSERT_SQL, info)
+            await self._db.commit()
+            return info
+        except Exception:
+            logger.exception("Failed to reindex %s/%s", date, time)
+            return None
 
     async def get_taxonomy_label_counts(self) -> dict:
         """Get session counts per taxonomy label for all 4 axes."""
