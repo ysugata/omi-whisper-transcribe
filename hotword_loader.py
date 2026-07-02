@@ -1,7 +1,12 @@
 """Hotword ローダーモジュール
 
-config/hotwords.json (JMnedict 由来) と config/hotwords_custom.json を
-読み込み、faster-whisper の hotwords パラメータ用文字列を生成する。
+config/hotwords.json (JMnedict 由来)、config/hotwords_custom.json、
+config/term_corrections.json (用語補正辞書の正解表記) を読み込み、
+faster-whisper の hotwords パラメータ用文字列を生成する。
+
+用語辞書の正解表記をデコーダバイアスに使うことで、辞書で事後補正して
+いた誤認識を発生源 (ASR) で減らす。トークン予算が限られるため、誤認識
+バリアント数が多い語 (= 慢性的に間違われる語) を優先する。
 
 TermCorrector と同じく mtime ベースの自動リロードに対応。
 """
@@ -18,6 +23,8 @@ _DEFAULT_SETTINGS = {
     "max_total": 500,
     "max_tokens": 200,  # Whisper max_length=448; leave room for decoding
     "min_length": 3,  # Filter out short entries that cause noise contamination
+    # term_corrections.json 由来の正解表記 (カスタム語の次に優先)
+    "dictionary": {"enabled": True, "max": 50},
     "categories": {
         "place": {"enabled": True, "max": 200},
         "company": {"enabled": True, "max": 100},
@@ -46,15 +53,18 @@ class HotwordLoader:
         self._hotwords_path = self._config_dir / "hotwords.json"
         self._custom_path = self._config_dir / "hotwords_custom.json"
         self._settings_path = self._config_dir / "hotwords_settings.json"
+        self._terms_path = self._config_dir / "term_corrections.json"
 
         # mtime 追跡
         self._hotwords_mtime: float = 0.0
         self._custom_mtime: float = 0.0
         self._settings_mtime: float = 0.0
+        self._terms_mtime: float = 0.0
 
         # キャッシュ
         self._hotwords_data: dict = {}
         self._custom_words: list[str] = []
+        self._dict_terms: list[str] = []  # 正解表記 (優先度順)
         self._settings: dict = dict(_DEFAULT_SETTINGS)
         self._cached_string: str = ""
         self._cached_list: list[str] = []
@@ -66,8 +76,41 @@ class HotwordLoader:
         """全ファイルを読み込む。"""
         self._load_hotwords()
         self._load_custom()
+        self._load_terms()
         self._load_settings()
         self._rebuild_cache()
+
+    def _load_terms(self) -> None:
+        """config/term_corrections.json から正解表記を優先度順に読み込む。
+
+        優先度 = 誤認識バリアント数の多い順 (同数なら短い語・辞書順)。
+        バリアントが多い語ほど ASR が慢性的に間違えている語であり、
+        デコーダバイアスの効果が大きい。
+        """
+        try:
+            if self._terms_path.exists():
+                data = json.loads(self._terms_path.read_text(encoding="utf-8"))
+                counts: dict[str, int] = {}
+                if isinstance(data, dict):
+                    for _wrong, correct in data.items():
+                        if isinstance(correct, str):
+                            c = correct.strip()
+                            # 1文字語 (例: "X") はバイアス効率が悪いので除外
+                            if len(c) >= 2:
+                                counts[c] = counts.get(c, 0) + 1
+                self._dict_terms = [
+                    t for t, _ in sorted(
+                        counts.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0])
+                    )
+                ]
+                self._terms_mtime = self._terms_path.stat().st_mtime
+                log.info(f"Hotwords: {len(self._dict_terms)} dictionary terms loaded")
+            else:
+                self._dict_terms = []
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"Dictionary terms load error: {e}")
+            self._dict_terms = []
+        self._dirty = True
 
     def _load_hotwords(self) -> None:
         """config/hotwords.json を読み込む。"""
@@ -109,6 +152,11 @@ class HotwordLoader:
                 # デフォルト設定とマージ
                 merged = dict(_DEFAULT_SETTINGS)
                 merged.update(data)
+                # dictionary は部分指定でもデフォルトと deep-merge する
+                merged["dictionary"] = {
+                    **_DEFAULT_SETTINGS["dictionary"],
+                    **(data.get("dictionary") or {}),
+                }
                 # categories も個別にマージ
                 merged_cats = dict(_DEFAULT_SETTINGS["categories"])
                 for cat, val in data.get("categories", {}).items():
@@ -156,6 +204,10 @@ class HotwordLoader:
                 mt = self._custom_path.stat().st_mtime
                 if mt > self._custom_mtime:
                     self._load_custom()
+            if self._terms_path.exists():
+                mt = self._terms_path.stat().st_mtime
+                if mt > self._terms_mtime:
+                    self._load_terms()
             if self._settings_path.exists():
                 mt = self._settings_path.stat().st_mtime
                 if mt > self._settings_mtime:
@@ -212,6 +264,19 @@ class HotwordLoader:
             if w:
                 _try_add(w)
 
+        # Phase 1.5: 用語辞書の正解表記 (ユーザー確認済みの語なので min_length 対象外)
+        dict_cfg = self._settings.get("dictionary", {})
+        dict_added = 0
+        if dict_cfg.get("enabled", True):
+            dict_max = dict_cfg.get("max", 50)
+            for w in self._dict_terms:
+                if dict_added >= dict_max:
+                    break
+                if token_count >= max_tokens:
+                    break
+                if _try_add(w):
+                    dict_added += 1
+
         # Phase 2: カテゴリ語を追加 (残りのトークン予算で)
         categories = self._hotwords_data.get("categories", {})
         filtered_count = 0
@@ -236,7 +301,8 @@ class HotwordLoader:
             log.info(f"Hotwords: filtered {filtered_count} entries shorter than {min_length} chars")
 
         log.info(f"Hotwords: {len(result)} words, ~{token_count} tokens "
-                 f"(budget {max_tokens}, custom {len(self._custom_words)})")
+                 f"(budget {max_tokens}, custom {len(self._custom_words)}, "
+                 f"dictionary {dict_added}/{len(self._dict_terms)})")
 
         self._cached_list = result
         self._cached_string = ", ".join(result)
@@ -270,6 +336,13 @@ class HotwordLoader:
             self._settings["max_total"] = int(settings["max_total"])
         if "min_length" in settings:
             self._settings["min_length"] = max(1, int(settings["min_length"]))
+        if "dictionary" in settings and isinstance(settings["dictionary"], dict):
+            # 新しい dict を作る (モジュールデフォルトとの共有参照を避ける)
+            self._settings["dictionary"] = {
+                **_DEFAULT_SETTINGS["dictionary"],
+                **self._settings.get("dictionary", {}),
+                **settings["dictionary"],
+            }
         if "categories" in settings:
             for cat, val in settings["categories"].items():
                 if cat in self._settings["categories"]:
@@ -306,11 +379,19 @@ class HotwordLoader:
         return list(self._custom_words)
 
     def get_category_stats(self) -> dict:
-        """カテゴリ別の統計情報を返す。"""
+        """カテゴリ別の統計情報を返す (用語辞書由来は "dictionary" 擬似カテゴリ)。"""
         self._reload_if_changed()
         categories = self._hotwords_data.get("categories", {})
         cat_settings = self._settings.get("categories", {})
         stats = {}
+        dict_cfg = self._settings.get("dictionary", {})
+        stats["dictionary"] = {
+            "total": len(self._dict_terms),
+            "enabled": dict_cfg.get("enabled", True),
+            "max": dict_cfg.get("max", 50),
+            "active": min(len(self._dict_terms), dict_cfg.get("max", 50))
+            if dict_cfg.get("enabled", True) else 0,
+        }
         for cat_name, cat_words in categories.items():
             cs = cat_settings.get(cat_name, {})
             stats[cat_name] = {
