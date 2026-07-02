@@ -10,3 +10,16 @@ build/
 venv/
 config/safe_training_*.jsonl
 config/model_comparison_*
+
+# Runtime state / generated artifacts (written by Bridge & tools at runtime)
+config/compare_*.json
+config/batch_llm_queue.json
+config/nightly_state.json
+config/pending_keyword_suggestions.json
+config/pending_taxonomy.json
+config/rag_embeddings.npz
+config/rag_metadata.json
+config/review_weights.json
+config/succession_index.json
+config/succession_index.npz
+config/taxonomy_reports/

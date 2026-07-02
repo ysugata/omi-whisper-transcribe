@@ -3,12 +3,17 @@
 import json
 import os
 import sys
+from datetime import datetime
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "omi-recordings-viewer"))
 
 from indexer import Indexer
+
+# Use today's date so time-dependent scoring (90-day freshness decay) matches
+# the conditions the assertions were written for.
+TODAY = datetime.now().strftime("%Y-%m-%d")
 
 
 def _make_session(rec_dir, date, time, tags=None, segments=None, audio_scene=None):
@@ -40,7 +45,7 @@ async def test_review_queue_priority_ordering(tmp_env):
     db_path, rec_dir = tmp_env
 
     # Session 1: RAG with very low similarity (highest model uncertainty)
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "その他",
         "outcomes": ["情報共有"],
         "domains": [],
@@ -51,7 +56,7 @@ async def test_review_queue_priority_ordering(tmp_env):
     })
 
     # Session 2: LLM with noisy quality (medium priority)
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "業務会話",
         "outcomes": ["意思決定"],
         "domains": ["個人"],
@@ -62,7 +67,7 @@ async def test_review_queue_priority_ordering(tmp_env):
     })
 
     # Session 3: RAG with high similarity (lowest priority)
-    _make_session(rec_dir, "2026-04-01", "12-00-00", tags={
+    _make_session(rec_dir, TODAY, "12-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": ["情報共有"],
         "domains": [],
@@ -95,7 +100,7 @@ async def test_review_queue_excludes_reviewed(tmp_env):
     db_path, rec_dir = tmp_env
 
     # Session 1: not reviewed
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -104,13 +109,13 @@ async def test_review_queue_excludes_reviewed(tmp_env):
     })
 
     # Session 2: already reviewed
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "業務会話",
         "outcomes": [],
         "importance": "中",
         "tag_source": "llm",
         "manually_corrected": True,
-        "corrected_at": "2026-04-01T12:00:00",
+        "corrected_at": f"{TODAY}T12:00:00",
         "tag_version": 2,
     })
 
@@ -131,7 +136,7 @@ async def test_review_queue_excludes_v1_and_untagged(tmp_env):
     db_path, rec_dir = tmp_env
 
     # Session 1: V2 tagged (should appear)
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -139,13 +144,13 @@ async def test_review_queue_excludes_v1_and_untagged(tmp_env):
     })
 
     # Session 2: V1 tagged (should NOT appear)
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "activity": "meeting",
         "tag_version": 1,
     })
 
     # Session 3: untagged (should NOT appear)
-    _make_session(rec_dir, "2026-04-01", "12-00-00")
+    _make_session(rec_dir, TODAY, "12-00-00")
 
     indexer = Indexer(db_path, str(rec_dir))
     await indexer.open()
@@ -164,7 +169,7 @@ async def test_review_queue_excludes_empty_sessions(tmp_env):
     db_path, rec_dir = tmp_env
 
     # Session 1: has segments
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -172,7 +177,7 @@ async def test_review_queue_excludes_empty_sessions(tmp_env):
     })
 
     # Session 2: no segments
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -196,13 +201,13 @@ async def test_review_stats(tmp_env):
     db_path, rec_dir = tmp_env
 
     # 2 pending, 1 reviewed (today)
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話", "tag_version": 2,
     })
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "業務会話", "tag_version": 2,
     })
-    _make_session(rec_dir, "2026-04-01", "12-00-00", tags={
+    _make_session(rec_dir, TODAY, "12-00-00", tags={
         "conversation_type": "日常会話",
         "manually_corrected": True,
         "corrected_at": "2099-01-01T00:00:00",
@@ -227,11 +232,11 @@ async def test_review_queue_offset(tmp_env):
     """Offset should skip the first N items."""
     db_path, rec_dir = tmp_env
 
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "その他", "tag_version": 2,
         "tag_source": "rag", "rag_similarity": 0.3,
     })
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話", "tag_version": 2,
         "tag_source": "llm",
     })
@@ -261,12 +266,12 @@ async def test_new_columns_in_parse_transcript(tmp_env):
     """Verify that _parse_transcript correctly extracts new review columns."""
     db_path, rec_dir = tmp_env
 
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "tag_source": "rag",
         "rag_similarity": 0.72,
         "manually_corrected": True,
-        "corrected_at": "2026-04-01T10:00:00",
+        "corrected_at": f"{TODAY}T10:00:00",
         "tag_version": 2,
     })
 
@@ -274,11 +279,11 @@ async def test_new_columns_in_parse_transcript(tmp_env):
     await indexer.open()
     await indexer.sync()
 
-    s = await indexer.get_session("2026-04-01", "10-00-00")
+    s = await indexer.get_session(TODAY, "10-00-00")
     assert s["tags_tag_source"] == "rag"
     assert abs(s["tags_rag_similarity"] - 0.72) < 0.001
     assert s["tags_manually_corrected"] == 1
-    assert s["tags_corrected_at"] == "2026-04-01T10:00:00"
+    assert s["tags_corrected_at"] == f"{TODAY}T10:00:00"
 
     await indexer.close()
 
@@ -295,7 +300,7 @@ async def test_continuous_rag_similarity(tmp_env):
 
     for i, sim in enumerate([0.10, 0.40, 0.60, 0.90]):
         time_str = f"1{i}-00-00"
-        _make_session(rec_dir, "2026-04-01", time_str, tags={
+        _make_session(rec_dir, TODAY, time_str, tags={
             "conversation_type": "日常会話",
             "outcomes": [],
             "importance": "低",
@@ -328,7 +333,7 @@ async def test_importance_affects_priority(tmp_env):
     """importance_v2=高 should produce 1.5/0.8 = 1.875x higher score than importance_v2=低."""
     db_path, rec_dir = tmp_env
 
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "高",
@@ -336,7 +341,7 @@ async def test_importance_affects_priority(tmp_env):
         "quality": "clean",
         "tag_version": 2,
     })
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -373,7 +378,7 @@ async def test_importance_multiplier_overrides_quality(tmp_env):
     db_path, rec_dir = tmp_env
 
     # Important + clean
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "業務会話",
         "outcomes": ["意思決定"],
         "importance": "高",
@@ -383,7 +388,7 @@ async def test_importance_multiplier_overrides_quality(tmp_env):
     })
 
     # Unimportant + noisy (was previously ranked higher under additive model)
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -411,7 +416,7 @@ async def test_external_audio_bonus(tmp_env):
     """Sessions with external_audio >= 0.5 should get higher priority."""
     db_path, rec_dir = tmp_env
 
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -420,7 +425,7 @@ async def test_external_audio_bonus(tmp_env):
         "external_audio_ratio": 0.8,
         "tag_version": 2,
     })
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -448,7 +453,7 @@ async def test_interaction_term(tmp_env):
     db_path, rec_dir = tmp_env
 
     # With interaction: RAG low sim + noisy
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -459,7 +464,7 @@ async def test_interaction_term(tmp_env):
     })
 
     # Without interaction: RAG low sim only (no noisy)
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -492,7 +497,7 @@ async def test_segment_count_complexity(tmp_env):
 
     # 30 segments
     segs_30 = [{"start": i, "end": i + 1, "text": f"seg {i}"} for i in range(30)]
-    _make_session(rec_dir, "2026-04-01", "10-00-00", tags={
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",
@@ -502,7 +507,7 @@ async def test_segment_count_complexity(tmp_env):
     }, segments=segs_30)
 
     # 1 segment
-    _make_session(rec_dir, "2026-04-01", "11-00-00", tags={
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
         "conversation_type": "日常会話",
         "outcomes": [],
         "importance": "低",

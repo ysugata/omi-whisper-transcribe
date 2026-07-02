@@ -14,7 +14,7 @@ import jinja2
 from aiohttp import web
 
 from exporter import SanitizedIndex, export_session
-from indexer import Indexer
+from indexer import DATE_RE, TIME_RE, Indexer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +65,25 @@ _INITIAL_DICT = {
     "ウィスパー": "Whisper", "ウイスパー": "Whisper",
 }
 
+# デフォルトタクソノミー (session_tagger._DEFAULT_TAXONOMY と同じもの。
+# Viewer コンテナには session_tagger.py が入らないため import せず複製する)
+_DEFAULT_TAXONOMY = {
+    "version": 1,
+    "conversation_type": [
+        "商談", "社内ミーティング", "1on1", "アイデア出し",
+        "顧客ヒアリング", "採用面接", "雑談・移動中メモ",
+        "外部セミナー", "電話", "独り言・メモ", "その他",
+    ],
+    "outcomes": [
+        "意思決定あり", "TODO発生", "方針転換", "情報共有のみ",
+        "問題提起", "アイデア創出", "感情共有", "なし",
+    ],
+    "domains": [
+        "水中超音波", "物販", "SNS集客", "観光業", "ダクト設備", "投資", "経営", "AI", "個人",
+    ],
+    "importance": ["高", "中", "低"],
+}
+
 
 def _read_json(path: Path, default):
     """JSON ファイルを読み込む。存在しない・壊れている場合はデフォルトを返す。"""
@@ -80,6 +99,15 @@ def _write_json(path: Path, data) -> None:
     """JSON ファイルに書き込む。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _valid_session_id(date: str, time: str) -> bool:
+    """date/time がセッションディレクトリ形式か検証する。
+
+    ファイルシステムパスの組み立てに使う値のため、パストラバーサル
+    (%2e%2e 等) を弾く。
+    """
+    return bool(DATE_RE.match(date) and TIME_RE.match(time))
 
 
 # ============================================================
@@ -157,11 +185,11 @@ async def handle_audio_scene_labels(request: web.Request) -> web.Response:
 async def handle_audio_scene_status(request: web.Request) -> web.Response:
     """Proxy audio scene status from bridge."""
     bridge_url = request.app["bridge_url"]
+    session: aiohttp.ClientSession = request.app["bridge_session"]
     try:
-        async with aiohttp.ClientSession() as cs:
-            async with cs.get(f"{bridge_url}/audio-scene/status") as resp:
-                data = await resp.json()
-                return web.json_response(data)
+        async with session.get(f"{bridge_url}/audio-scene/status") as resp:
+            data = await resp.json()
+            return web.json_response(data)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=502)
 
@@ -170,6 +198,8 @@ async def handle_api_session_detail(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
     date = request.match_info["date"]
     time = request.match_info["time"]
+    if not _valid_session_id(date, time):
+        return web.json_response({"error": "invalid date/time"}, status=400)
 
     session = await indexer.get_session(date, time)
     if not session:
@@ -186,9 +216,13 @@ async def handle_audio(request: web.Request) -> web.FileResponse:
     date = request.match_info["date"]
     time = request.match_info["time"]
     filename = request.match_info["filename"]
+    if not _valid_session_id(date, time) or "/" in filename or filename.startswith(".."):
+        raise web.HTTPBadRequest(text="invalid path")
 
     session_dir = Path(RECORDINGS_DIR) / date / time
-    audio_path = session_dir / filename
+    audio_path = (session_dir / filename).resolve()
+    if not str(audio_path).startswith(str(Path(RECORDINGS_DIR).resolve())):
+        raise web.HTTPBadRequest(text="invalid path")
     if not audio_path.exists():
         raise web.HTTPNotFound(text="audio not found")
 
@@ -200,6 +234,8 @@ async def handle_audio_auto(request: web.Request) -> web.FileResponse:
     """Auto-detect audio file (ogg preferred, wav fallback)."""
     date = request.match_info["date"]
     time = request.match_info["time"]
+    if not _valid_session_id(date, time):
+        raise web.HTTPBadRequest(text="invalid path")
 
     session_dir = Path(RECORDINGS_DIR) / date / time
     for name in ("audio.ogg", "audio.wav"):
@@ -529,8 +565,6 @@ async def handle_get_tag_taxonomy(request: web.Request) -> web.Response:
     """GET /api/tag-taxonomy — return current taxonomy."""
     data = _read_json(_TAG_TAXONOMY_PATH, None)
     if data is None:
-        # Return default taxonomy
-        from session_tagger import _DEFAULT_TAXONOMY
         data = dict(_DEFAULT_TAXONOMY)
         _write_json(_TAG_TAXONOMY_PATH, data)
     return web.json_response(data)
@@ -722,6 +756,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     """PUT /api/sessions/{date}/{time}/session-tags — update V2 session tags (partial)."""
     date = request.match_info["date"]
     time = request.match_info["time"]
+    if not _valid_session_id(date, time):
+        return web.json_response({"error": "invalid date/time"}, status=400)
     body = await request.json()
 
     # Load taxonomy for validation
@@ -1068,6 +1104,8 @@ async def handle_review_accept(request: web.Request) -> web.Response:
 
     if not date or not time_val:
         return web.json_response({"error": "date and time are required"}, status=400)
+    if not _valid_session_id(date, time_val):
+        return web.json_response({"error": "invalid date/time"}, status=400)
 
     transcript_path = Path(RECORDINGS_DIR) / date / time_val / "transcript.json"
     if not transcript_path.exists():
@@ -1403,7 +1441,6 @@ async def handle_export_training(request: web.Request) -> web.Response:
             "Content-Disposition": f'attachment; filename="training_{fmt}.zip"',
         },
     )
-    return response
 
 
 # ============================================================

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_decision_memo TEXT,
     tags_importance_v2 TEXT,
     tags_version INTEGER DEFAULT 0,
+    tags_external_audio REAL,
     tags_audio_scene TEXT,
     tags_audio_scene_spatial TEXT,
     tags_audio_scene_confidence REAL,
@@ -776,8 +777,10 @@ class Indexer:
 
         if exclude_personal_only:
             # drop sessions where domains is only "個人"
+            # (tags_domains is comma-joined; a lone 個人 means personal-only.
+            #  NULL = untagged, which is kept.)
             where.append(
-                "NOT (tags_domains IN ('[\"個人\"]', '\"個人\"'))"
+                "(tags_domains IS NULL OR tags_domains != '個人')"
             )
 
         if external_audio_max is not None:
