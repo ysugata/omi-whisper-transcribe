@@ -168,6 +168,11 @@ VOICE_FILTER_THRESHOLD = float(os.environ.get("VOICE_FILTER_THRESHOLD", "0"))  #
 AUTH_TOKEN = os.environ.get("OMI_WHISPER_TOKEN", "")                     # 空文字 = 認証なし (LAN内専用)
 # トークン生成例: python -c "import secrets; print(secrets.token_urlsafe(48))"
 
+# 管理 API (8091) のトークン認証。空文字 = 認証なし (従来どおり LAN 内前提)。
+# 設定すると全管理エンドポイントで Authorization: Bearer <token>
+# または ?token=<token> が必須になる。
+MANAGEMENT_TOKEN = os.environ.get("MANAGEMENT_TOKEN", "")
+
 # ============================================================
 # ログ設定
 # ============================================================
@@ -177,6 +182,39 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("omi-whisper")
+
+
+# ============================================================
+# 管理 API 認証
+# ============================================================
+
+def _extract_mgmt_token(headers, query) -> str:
+    """リクエストから管理 API トークンを取り出す (Bearer ヘッダー優先)。"""
+    auth = headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):]
+    return query.get("token", "")
+
+
+def _mgmt_auth_ok(supplied: str, expected: str) -> bool:
+    """タイミング攻撃耐性のあるトークン比較。expected 空 = 認証なし。"""
+    if not expected:
+        return True
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def make_mgmt_auth_middleware(token: str):
+    """MANAGEMENT_TOKEN が設定されている場合の認証 middleware を返す。"""
+    from aiohttp import web as _web
+
+    @_web.middleware
+    async def _auth_middleware(request, handler):
+        supplied = _extract_mgmt_token(request.headers, request.query)
+        if not _mgmt_auth_ok(supplied, token):
+            return _web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+
+    return _auth_middleware
 
 # ============================================================
 # Layer 1 + Layer 2: 固有名詞改善
@@ -4668,7 +4706,13 @@ async def main():
         finally:
             model_manager.release()
 
-    mgmt_app = web.Application(client_max_size=MAX_SDCARD_UPLOAD_BYTES)
+    mgmt_middlewares = []
+    if MANAGEMENT_TOKEN:
+        mgmt_middlewares.append(make_mgmt_auth_middleware(MANAGEMENT_TOKEN))
+        log.info("Management API: token auth enabled")
+    mgmt_app = web.Application(
+        client_max_size=MAX_SDCARD_UPLOAD_BYTES, middlewares=mgmt_middlewares
+    )
     mgmt_app.router.add_post("/model/load", handle_model_load)
     mgmt_app.router.add_post("/model/unload", handle_model_unload)
     mgmt_app.router.add_get("/model/status", handle_model_status)

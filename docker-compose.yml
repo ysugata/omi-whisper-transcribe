@@ -80,6 +80,7 @@ services:
       - AUDIO_SCENE_DEVICE=${AUDIO_SCENE_DEVICE:-cpu}
       - AUDIO_SCENE_THRESHOLD=${AUDIO_SCENE_THRESHOLD:-0.3}
       - OMI_WHISPER_TOKEN=${OMI_WHISPER_TOKEN:-}
+      - MANAGEMENT_TOKEN=${MANAGEMENT_TOKEN:-}
     deploy:
       resources:
         reservations:
@@ -105,6 +106,7 @@ services:
       - CONFIG_DIR=/app/config
       - DB_PATH=/app/data/index.db
       - BRIDGE_MGMT_URL=http://omi-whisper-transcribe:${MANAGEMENT_PORT:-8091}
+      - BRIDGE_MGMT_TOKEN=${MANAGEMENT_TOKEN:-}
       - KNOWLEDGE_DIR=/app/knowledge
     restart: unless-stopped
 

@@ -27,6 +27,9 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/config")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/index.db")
 PORT = int(os.environ.get("PORT", "8092"))
 BRIDGE_MGMT_URL = os.environ.get("BRIDGE_MGMT_URL", "")
+# Bridge の MANAGEMENT_TOKEN と同じ値を設定すると全プロキシ呼び出しに
+# Authorization ヘッダーを付与する (Bridge 側が認証なしなら空のままで良い)
+BRIDGE_MGMT_TOKEN = os.environ.get("BRIDGE_MGMT_TOKEN", "")
 
 _TERM_CORRECTIONS_PATH = Path(CONFIG_DIR) / "term_corrections.json"
 _PENDING_SUGGESTIONS_PATH = Path(CONFIG_DIR) / "pending_suggestions.json"
@@ -1593,7 +1596,10 @@ async def on_startup(app: web.Application):
 
     app["indexer"] = indexer
     app["sync_task"] = asyncio.create_task(indexer.periodic_sync())
-    app["bridge_session"] = aiohttp.ClientSession()
+    headers = (
+        {"Authorization": f"Bearer {BRIDGE_MGMT_TOKEN}"} if BRIDGE_MGMT_TOKEN else None
+    )
+    app["bridge_session"] = aiohttp.ClientSession(headers=headers)
     app["bridge_url"] = BRIDGE_MGMT_URL
 
 
