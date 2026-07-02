@@ -7,6 +7,8 @@ Omi の `custom_stt` モードを使い、クラウド STT を完全にバイパ
 - **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** (large-v3, デフォルト) — 高精度・Hotwords デコーダバイアス対応
 - **[Qwen3-ASR 1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)** — 軽量 (~3.4 GB VRAM)・52言語対応・context boost 対応
 
+> **初めての方へ**: セットアップから日常運用までの手順は **[使い方マニュアル (docs/USAGE.md)](docs/USAGE.md)** にまとまっています。本 README は機能・環境変数・API のリファレンスです。
+
 ## アーキテクチャ
 
 ```

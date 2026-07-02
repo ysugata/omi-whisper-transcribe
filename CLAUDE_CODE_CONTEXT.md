@@ -146,16 +146,14 @@ custom_stt=enabled の場合、バックエンドは STT サービスを使わ�
 
 ## 現在の制限・改善候補
 
-### 既知の制限
-- 話者分離 (diarization) 未対応: 全セグメントが SPEAKER_00 固定
-- Opus デコード未対応: Omi が Opus で送ってくる場合は別途デコード処理が必要
-- WAV 非圧縮保存: 長期保存にはストレージ消費が大きい (Opus/FLAC 変換未実装)
+> **注**: 本ドキュメントは初期設計時のコンテキスト。以下のうち
+> 話者分離 (diarizer.py, pyannote)、Opus デコード (opus_decoder.py)、
+> OGG 圧縮保存、検索 UI (omi-recordings-viewer/) はその後すべて実装済み。
+> 現在の機能一覧は README.md、使い方は docs/USAGE.md を参照。
+
+### 既知の制限 (残存)
 - 単一セッション前提: 同時接続は未テスト
 
-### 改善候補
-- 話者分離: pyannote-audio または WhisperX 統合
-- 音声圧縮: 録音後バックグラウンドで Opus/FLAC に変換するジョブ
+### 改善候補 (未実装)
 - NAS 保存: docker-compose のマウント先を SMB 共有に変更
-- 検索UI: recordings/ 内の JSON を全文検索する簡易 Web UI
 - Prometheus メトリクス: RTF、セッション数、VRAM 使用率の監視
-- Omi からの Opus 受信対応: opuslib でデコードしてから Whisper に渡す
