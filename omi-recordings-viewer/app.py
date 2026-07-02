@@ -1586,7 +1586,7 @@ async def handle_sanitize_download(request: web.Request) -> web.Response:
 # ============================================================
 
 async def on_startup(app: web.Application):
-    indexer = Indexer(DB_PATH, RECORDINGS_DIR)
+    indexer = Indexer(DB_PATH, RECORDINGS_DIR, CONFIG_DIR)
     await indexer.open()
     n = await indexer.sync()
     logger.info("Initial sync: indexed %d new sessions", n)

@@ -130,34 +130,24 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_review_outcome TEXT",
 ]
 
-FTS_SCHEMA = """
-CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-    transcript_text, content=sessions, content_rowid=id
-);
-"""
-
-FTS_TRIGGERS = """
-CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts(rowid, transcript_text)
-    VALUES (new.id, new.transcript_text);
-END;
-CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
-    INSERT INTO sessions_fts(sessions_fts, rowid, transcript_text)
-    VALUES ('delete', old.id, old.transcript_text);
-END;
-CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
-    INSERT INTO sessions_fts(sessions_fts, rowid, transcript_text)
-    VALUES ('delete', old.id, old.transcript_text);
-    INSERT INTO sessions_fts(rowid, transcript_text)
-    VALUES (new.id, new.transcript_text);
-END;
+# FTS5 was set up historically but never used for search (Japanese text has
+# no word boundaries, so the unicode61 tokenizer cannot serve substring
+# queries; search uses LIKE instead). Drop leftovers to remove the
+# per-write trigger overhead on existing DBs.
+FTS_CLEANUP = """
+DROP TRIGGER IF EXISTS sessions_ai;
+DROP TRIGGER IF EXISTS sessions_ad;
+DROP TRIGGER IF EXISTS sessions_au;
+DROP TABLE IF EXISTS sessions_fts;
 """
 
 
 class Indexer:
-    def __init__(self, db_path: str, recordings_dir: str):
+    def __init__(self, db_path: str, recordings_dir: str, config_dir: str | None = None):
         self.db_path = db_path
         self.recordings_dir = Path(recordings_dir)
+        # Default keeps the historical layout (config/ next to recordings/)
+        self.config_dir = Path(config_dir) if config_dir else self.recordings_dir.parent / "config"
         self._db: aiosqlite.Connection | None = None
 
     async def open(self):
@@ -166,8 +156,7 @@ class Indexer:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
-        await self._db.executescript(FTS_SCHEMA)
-        await self._db.executescript(FTS_TRIGGERS)
+        await self._db.executescript(FTS_CLEANUP)
         # Migrate: add tag columns if missing
         await self._migrate_tags()
         # Create indexes on migrated columns (must be after migration)
@@ -829,18 +818,83 @@ class Indexer:
         "temporal_freshness": 0.13,
     }
 
-    def _get_review_weights(self) -> dict:
-        """Load adjusted review weights from config, or return defaults."""
-        weights_path = self.recordings_dir.parent / "config" / "review_weights.json"
+    # Queue admission policy: keep the human review workload realistic by
+    # not queueing sessions whose review is unlikely to change anything.
+    # Tunable via the "queue_policy" key of config/review_weights.json.
+    # Measured basis (correction_rates feedback): rag_high_sim sessions are
+    # almost never corrected, while high_external_audio sessions almost
+    # always are — so external-audio sessions always stay in the queue.
+    _DEFAULT_QUEUE_POLICY = {
+        # RAG classification with similarity >= this is treated as trusted
+        # and excluded from the queue (0 or null = disabled).
+        "auto_accept_rag_similarity": 0.8,
+        # Skip importance=低 casual sessions (the bulk of daily recordings).
+        "skip_low_importance_casual": True,
+        "casual_types": ["雑談・移動中メモ", "独り言・メモ"],
+        # Sessions with external_audio >= this are always kept in the queue
+        # (mis-recorded TV/media audio needs human eyes).
+        "keep_external_audio_min": 0.5,
+        # Drop queue entries below this priority score (0 = disabled).
+        "min_priority_score": 0.0,
+    }
+
+    def _read_review_weights_file(self) -> dict:
+        weights_path = self.config_dir / "review_weights.json"
         try:
             if weights_path.exists():
-                data = json.loads(weights_path.read_text(encoding="utf-8"))
-                adjusted = data.get("adjusted_weights")
-                if adjusted and len(adjusted) == 5:
-                    return adjusted
+                return json.loads(weights_path.read_text(encoding="utf-8"))
         except Exception:
             logger.warning("Failed to load review_weights.json, using defaults")
+        return {}
+
+    def _get_review_weights(self) -> dict:
+        """Load adjusted review weights from config, or return defaults."""
+        data = self._read_review_weights_file()
+        adjusted = data.get("adjusted_weights")
+        if adjusted and len(adjusted) == 5:
+            return adjusted
         return dict(self._DEFAULT_REVIEW_WEIGHTS)
+
+    def _get_queue_policy(self) -> dict:
+        """Load queue admission policy, merged over defaults."""
+        policy = dict(self._DEFAULT_QUEUE_POLICY)
+        data = self._read_review_weights_file()
+        user_policy = data.get("queue_policy")
+        if isinstance(user_policy, dict):
+            policy.update(user_policy)
+        return policy
+
+    def _queue_policy_clauses(self, policy: dict) -> tuple[list[str], list]:
+        """Build SQL exclusion clauses for the queue admission policy.
+
+        Returns (clauses, params); each clause is TRUE for sessions that
+        should REMAIN in the queue.
+        """
+        clauses: list[str] = []
+        params: list = []
+        ext_min = float(policy.get("keep_external_audio_min") or 0.5)
+
+        sim = policy.get("auto_accept_rag_similarity")
+        if sim:
+            clauses.append(
+                "NOT (tags_tag_source = 'rag'"
+                " AND COALESCE(tags_rag_similarity, 0) >= ?"
+                " AND COALESCE(tags_external_audio, 0) < ?)"
+            )
+            params.extend([float(sim), ext_min])
+
+        casual_types = policy.get("casual_types") or []
+        if policy.get("skip_low_importance_casual") and casual_types:
+            placeholders = ",".join("?" for _ in casual_types)
+            clauses.append(
+                "NOT (COALESCE(tags_importance_v2, '低') = '低'"
+                f" AND tags_conversation_type IN ({placeholders})"
+                " AND COALESCE(tags_external_audio, 0) < ?)"
+            )
+            params.extend(list(casual_types))
+            params.append(ext_min)
+
+        return clauses, params
 
     async def get_review_queue(self, limit: int = 1, offset: int = 0) -> list[dict]:
         """Get sessions ordered by review priority (highest uncertainty first).
@@ -863,6 +917,11 @@ class Indexer:
         w_c = w["content_complexity"]
         w_d = w["audio_scene_ambiguity"]
         w_e = w["temporal_freshness"]
+
+        policy = self._get_queue_policy()
+        policy_clauses, policy_params = self._queue_policy_clauses(policy)
+        policy_sql = "".join(f" AND {c}\n" for c in policy_clauses)
+        min_score = float(policy.get("min_priority_score") or 0.0)
 
         sql = f"""
             SELECT *,
@@ -925,27 +984,75 @@ class Indexer:
             WHERE tags_version >= 2
               AND COALESCE(tags_manually_corrected, 0) = 0
               AND segment_count > 0
-            ORDER BY priority_score DESC, start_at DESC
-            LIMIT ? OFFSET ?
+{policy_sql}
         """
-        cursor = await self._db.execute(sql, (limit, offset))
+        params = list(policy_params)
+        # priority_score is a SELECT alias, so filter it in an outer query
+        outer = f"SELECT * FROM ({sql}) scored"
+        if min_score > 0:
+            outer += " WHERE priority_score >= ?"
+            params.append(min_score)
+        outer += " ORDER BY priority_score DESC, start_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        cursor = await self._db.execute(outer, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def get_review_stats(self) -> dict:
-        """Get review queue statistics."""
+        """Get review queue statistics.
+
+        total_pending reflects the queue admission policy; the sessions the
+        policy filtered out are reported separately (auto_accepted /
+        skipped_casual) so nothing is silently hidden.
+        """
+        policy = self._get_queue_policy()
+        policy_clauses, policy_params = self._queue_policy_clauses(policy)
+        base = ("tags_version >= 2 AND COALESCE(tags_manually_corrected, 0) = 0"
+                " AND segment_count > 0")
+        policy_sql = "".join(f" AND {c}" for c in policy_clauses)
+
         rows = await self._db.execute_fetchall(
-            """SELECT
-                   SUM(CASE WHEN tags_version >= 2 AND COALESCE(tags_manually_corrected, 0) = 0 AND segment_count > 0 THEN 1 ELSE 0 END) AS total_pending,
+            f"""SELECT
+                   SUM(CASE WHEN {base}{policy_sql} THEN 1 ELSE 0 END) AS total_pending,
+                   SUM(CASE WHEN {base} THEN 1 ELSE 0 END) AS total_raw,
                    SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 THEN 1 ELSE 0 END) AS total_reviewed,
                    SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 AND tags_corrected_at >= date('now') THEN 1 ELSE 0 END) AS reviewed_today
-               FROM sessions"""
+               FROM sessions""",
+            policy_params,
         )
         r = rows[0]
+
+        # Breakdown of policy-excluded sessions (for transparency)
+        breakdown: dict[str, int] = {}
+        ext_min = float(policy.get("keep_external_audio_min") or 0.5)
+        sim = policy.get("auto_accept_rag_similarity")
+        if sim:
+            b = await self._db.execute_fetchall(
+                f"""SELECT COUNT(*) c FROM sessions WHERE {base}
+                    AND tags_tag_source = 'rag'
+                    AND COALESCE(tags_rag_similarity, 0) >= ?
+                    AND COALESCE(tags_external_audio, 0) < ?""",
+                (float(sim), ext_min),
+            )
+            breakdown["auto_accepted"] = b[0]["c"] or 0
+        casual_types = policy.get("casual_types") or []
+        if policy.get("skip_low_importance_casual") and casual_types:
+            placeholders = ",".join("?" for _ in casual_types)
+            b = await self._db.execute_fetchall(
+                f"""SELECT COUNT(*) c FROM sessions WHERE {base}
+                    AND COALESCE(tags_importance_v2, '低') = '低'
+                    AND tags_conversation_type IN ({placeholders})
+                    AND COALESCE(tags_external_audio, 0) < ?""",
+                (*casual_types, ext_min),
+            )
+            breakdown["skipped_casual"] = b[0]["c"] or 0
+
         return {
             "total_pending": r["total_pending"] or 0,
+            "total_raw": r["total_raw"] or 0,
             "total_reviewed": r["total_reviewed"] or 0,
             "reviewed_today": r["reviewed_today"] or 0,
+            "policy_excluded": breakdown,
         }
 
     @staticmethod
@@ -986,7 +1093,7 @@ class Indexer:
             session: dict with session DB columns (tags_tag_source, etc.)
             was_corrected: True if user edited tags, False if accepted as-is
         """
-        weights_path = self.recordings_dir.parent / "config" / "review_weights.json"
+        weights_path = self.config_dir / "review_weights.json"
         ema_alpha = 0.15
 
         # Load or initialize
