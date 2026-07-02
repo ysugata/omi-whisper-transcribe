@@ -619,16 +619,8 @@
         });
     }
 
-    function showNotification(msg) {
-        var el = document.createElement("div");
-        el.className = "notification show";
-        el.textContent = msg;
-        document.body.appendChild(el);
-        setTimeout(function () {
-            el.classList.remove("show");
-            setTimeout(function () { el.remove(); }, 400);
-        }, 3000);
-    }
+    // showNotification is defined in the "Notification helper" section below
+    // (function declarations are hoisted, so it is usable from here too).
 
     function updateVoiceprintSpeakerSelect() {
         var sel = document.getElementById("voiceprint-speaker-select");
