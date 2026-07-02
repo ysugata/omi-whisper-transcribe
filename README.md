@@ -34,7 +34,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | 音声前処理 | ラウドネス正規化 + ノイズ除去 (スペクトルゲーティング) |
 | ハルシネーションフィルタ | 異常出力・ギブリッシュ仮名・句読点のみ等を除去 |
 | セグメント分割 | 長いセグメントを文境界で自然に分割 |
-| Hotwords | JMnedict 辞書ベースの固有名詞バイアス |
+| Hotwords | JMnedict 辞書 + 用語補正辞書の正解表記による固有名詞デコーダバイアス (慢性的な誤認識語を発生源で低減) |
 | LLM 後処理 (3段階パイプライン) | 用語候補抽出 → 表記補正 → 品質監査の3段階で文字起こし精度を向上 |
 | LLM スクリーニング | 辞書補正 + 信頼度スコアで LLM 不要なセグメントを自動スキップ (API call 60-80% 削減) |
 | セッションタグ (3軸分類) | LLM による日本語3軸タグ付け (会話種類・成果物・事業領域 + 要約・判断メモ) |
@@ -52,7 +52,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | Safe Training Data エクスポート | LLM で匿名化・構造化 + evidence-based knowledge_card 抽出 (2-step pipeline) |
 | 事業継承 RAG (Succession RAG) | sanitized KC をベクター検索 → gpt-5-nano で根拠付き回答する Q&A システム (月コスト ~$1) |
 | LLM Wiki ビルダー (Phase 2) | Karpathy 型 LLM Wiki: sanitized KC を atomic topic の markdown に自動コンパイルして `~/knowledge/` に出力 (Claude Skills 対応) |
-| タグレビューキュー | 優先度付きレビューモードで不確実なタグを効率的に承認・修正 (キーボードショートカット対応) |
+| タグレビューキュー | 優先度付きレビューモードで不確実なタグを効率的に承認・修正 (キーボードショートカット対応)。投入ポリシーで低価値セッションを自動除外しレビュー件数を現実的に保つ |
 | 録音 Viewer | 録音一覧・再生・検索・設定管理の Web UI |
 
 ## 必要環境
@@ -418,7 +418,7 @@ python tools/build_wiki.py --mode full --domain 物販 --dry-run
 | メソッド | パス | 説明 |
 |----------|------|------|
 | GET | `/api/review/queue?limit=1&offset=0` | 優先度順にレビュー対象セッションを返却 (transcript 付き) |
-| GET | `/api/review/stats` | キュー統計 (残数、済数、今日の処理数) |
+| GET | `/api/review/stats` | キュー統計 (残数、ポリシー除外内訳 `policy_excluded`、済数、今日の処理数) |
 | POST | `/api/review/accept` | セッションを承認 (`{"date","time"}`) → `manually_corrected` + `review_outcome` を書き込み + フィードバック記録 |
 | POST | `/api/review/skip` | スキップ (永続化なし、メモリのみ。リロードで再表示) |
 
@@ -446,6 +446,33 @@ python tools/build_wiki.py --mode full --domain 物販 --dry-run
 | 低 / NULL | 0.8 |
 
 重みはフィードバックループ (`config/review_weights.json`) により EMA で自動調整されます。Accept/Edit 操作のたびにシグナルバケット別の修正率が更新され、修正頻度の高い軸の重みが増加します。
+
+#### キュー投入ポリシー (queue_policy)
+
+レビュー対象を「人手レビューの価値があるセッション」に絞り込み、レビュー件数を現実的な量に保ちます。
+`config/review_weights.json` の `queue_policy` キーで調整できます (デフォルト有効):
+
+```json
+{
+  "queue_policy": {
+    "auto_accept_rag_similarity": 0.8,
+    "skip_low_importance_casual": true,
+    "casual_types": ["雑談・移動中メモ", "独り言・メモ"],
+    "keep_external_audio_min": 0.5,
+    "min_priority_score": 0.0
+  }
+}
+```
+
+| キー | デフォルト | 説明 |
+|------|-----------|------|
+| `auto_accept_rag_similarity` | `0.8` | RAG 分類で類似度がこれ以上のセッションは信頼してキュー除外 (実測の修正率 ~15%)。`0` で無効 |
+| `skip_low_importance_casual` | `true` | importance=低 かつ `casual_types` の会話種類をスキップ |
+| `casual_types` | 雑談・独り言 | スキップ対象の会話種類 |
+| `keep_external_audio_min` | `0.5` | 外部音声比率がこれ以上のセッションは常にキューに残す (TV 誤録音は実測の修正率 ~86%) |
+| `min_priority_score` | `0.0` | priority_score がこれ未満のエントリを除外 (0=無効) |
+
+除外分は隠されず、`/api/review/stats` の `total_raw` と `policy_excluded` (auto_accepted / skipped_casual の内訳) で確認できます。
 
 ## 環境変数
 
@@ -661,7 +688,8 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `HOST` | `0.0.0.0` | バインドアドレス |
 | `PORT` | `8090` | WebSocket ポート |
 | `MANAGEMENT_PORT` | `8091` | 管理 API ポート |
-| `OMI_WHISPER_TOKEN` | (空) | 認証トークン (空=認証なし) |
+| `OMI_WHISPER_TOKEN` | (空) | WebSocket 認証トークン (空=認証なし) |
+| `MANAGEMENT_TOKEN` | (空) | 管理 API (8091) の認証トークン。設定すると全エンドポイントで `Authorization: Bearer` または `?token=` が必須。Viewer へは同じ値が `BRIDGE_MGMT_TOKEN` として渡る (docker-compose で自動配線) |
 
 ### モデル選択の目安
 
@@ -752,12 +780,19 @@ Whisper 出力後に `is_user` フラグの付いた登録声紋とコサイン�
 
 ## Hotwords
 
-[JMnedict](https://www.edrdg.org/enamdict/enamdict_doc.html) (CC-BY-SA 3.0) から抽出した日本語固有名詞で faster-whisper のデコーダロジットをバイアスし、固有名詞の認識精度を向上させます。
+[JMnedict](https://www.edrdg.org/enamdict/enamdict_doc.html) (CC-BY-SA 3.0) から抽出した日本語固有名詞と、**用語補正辞書 (`term_corrections.json`) の正解表記**で faster-whisper のデコーダロジットをバイアスし、固有名詞の認識精度を向上させます。
+
+優先順位 (トークン予算内で上から順に採用):
+
+1. **カスタム語** (`hotwords_custom.json`) — ユーザーが明示登録した語
+2. **用語辞書の正解表記** — 誤認識バリアント数が多い語 (= 慢性的に間違われる語) から優先。
+   辞書で事後補正していた語をデコーダ段階で正しく出すことで、誤認識を発生源で減らす
+3. **JMnedict カテゴリ語** (地名、企業名、駅名、姓、名、製品名)
 
 - `tools/build_hotwords.py` で `config/hotwords.json` を生成
-- カテゴリ別 ON/OFF (地名、企業名、駅名、姓、名、製品名)
-- カスタム語の追加も可能 (カテゴリ語より優先的にトークン予算に含まれる)
+- カテゴリ別 ON/OFF、辞書由来は `hotwords_settings.json` の `dictionary` (`enabled` / `max`, デフォルト 50語) で制御
 - トークン予算制限 (`max_tokens=200`): Whisper の内部上限 (448 トークン) を超えないよう自動制御
+- 用語辞書・カスタム語の更新は mtime 検知で自動反映 (再起動不要)
 - `HOTWORDS_ENABLED=false` で無効化
 
 ## LLM 後処理 (3段階パイプライン)
