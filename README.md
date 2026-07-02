@@ -476,7 +476,8 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `CONDITION_ON_PREVIOUS_TEXT` | `true` | 前セグメントの文脈を使って認識精度を向上 |
 | `REPETITION_PENALTY` | `1.1` | 繰り返しペナルティ (1.0=無効) |
 | `HALLUCINATION_SILENCE_THRESHOLD` | `1.0` | 無音区間ハルシネーション検出閾値 (秒、空=無効) |
-| `PROMPT_CARRY_ENABLED` | `true` | チャンク間コンテキスト引き継ぎ (前チャンク出力を次の initial_prompt に) |
+| `PROMPT_CARRY_ENABLED` | `false` | チャンク間コンテキスト引き継ぎ (前チャンク出力を次の initial_prompt に) |
+| `SEGMENT_MAX_DURATION` | `15.0` | 長セグメントの文境界分割の最大長 (秒、0=無効) |
 | `WHISPER_VAD_MIN_SPEECH_MS` | `250`/`500` | Whisper 内部 VAD 最小発話長 (ms)。VAD_SEG 有効時は 250、無効時は 500 |
 | `WHISPER_VAD_MIN_SILENCE_MS` | `500` | Whisper 内部 VAD 最小無音長 (ms) |
 | `WHISPER_VAD_SPEECH_PAD_MS` | `200` | Whisper 内部 VAD 発話パディング (ms) |
@@ -508,6 +509,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `SAVE_AUDIO` | `true` | 録音保存 |
 | `RECORDINGS_DIR` | `./recordings` | 保存先 |
 | `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効) |
+| `CONFIG_DIR` | `./config` | ランタイム設定 (JSON) の保存先。Bridge と Viewer で共有 |
 
 ### 音声前処理
 
@@ -528,7 +530,8 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
 | `LLM_BATCH_SIZE` | `20` | バッチフラッシュのセグメント数 |
-| `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査) |
+| `LLM_PIPELINE_STAGES` | `B` | パイプラインステージ (A=候補抽出, B=補正, C=監査)。docker-compose のデフォルトは `AB` |
+| `STAGE_C_AUTO` | `true` | Stage C (品質監査) の自動トリガー (補正密度・候補数に応じて実行) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 | `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
 | `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引) |
@@ -590,6 +593,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `NIGHTLY_SCHEDULE_HOUR` | `4` | 深夜バッチ実行時刻 (0=無効, 1-23=実行時刻) |
+| `BATCH_MAX_DAYS` | `7` | バッチ処理の走査対象日数 (0=無制限)。これより古いセッションはバッチ対象外 |
 
 ### リアルタイム声紋フィルタ
 
@@ -641,7 +645,12 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `HF_AUTH_TOKEN` | (空) | HuggingFace トークン (話者分離・声紋登録に必須) |
 | `GEMINI_API_KEY` | (空) | Google Gemini API キー (LLM 後処理・セッションタグ・Chat Completions 匿名化に必須) |
 | `OPENAI_API_KEY` | (空) | OpenAI API キー (Responses API 匿名化に使用、設定時は Gemini より優先) |
-| `SANITIZE_MODEL` | `gemini-2.5-flash` | Chat Completions 匿名化で使うモデル名 |
+| `SANITIZE_MODEL` | `gemini-2.5-flash` | 匿名化で使うモデル名 (`gemini-2.5-flash` \| `gpt-5-nano`) |
+| `SANITIZE_USE_RESPONSES_API` | `auto` | OpenAI Responses API の使用 (`auto`=モデル名が `gpt-*` なら有効 \| `true` \| `false`) |
+| `OPENAI_REASONING_EFFORT` | `low` | Responses API の reasoning effort (`none`〜`xhigh`) |
+| `OPENAI_MAX_OUTPUT_TOKENS` | `1800` | Responses API の max_output_tokens |
+| `OPENAI_TIMEOUT_MS` | `60000` | Responses API のタイムアウト (ms) |
+| `KNOWLEDGE_DIR` | `/app/knowledge` | LLM Wiki (knowledge repo) の読み取り専用マウントパス |
 
 ### ネットワーク・認証
 
@@ -1143,13 +1152,36 @@ python tools/dedupe_sanitized.py \
 | `tools/build_hotwords.py` | JMnedict から `config/hotwords.json` を生成 |
 | `tools/retranscribe_all.py` | 全セッションの再文字起こし (`--restore` で復元、`--verify` で検証) |
 | `tools/tag_all.py` | 全セッションの一括タグ付け (CLI) |
+| `tools/auto_reenroll_user.py` | 声紋モデル変更後のユーザー声紋の自動再エンロール |
+| `tools/build_succession_index.py` | 事業継承 RAG インデックスの再構築 (CLI) |
+| `tools/build_wiki.py` | LLM Wiki のビルド (`~/knowledge/` へ markdown 出力) |
+| `tools/wiki_clustering.py` | Wiki ビルドの LLM トピッククラスタリング (build_wiki の補助) |
+| `tools/cron_wiki_update.sh` | 深夜バッチ後の Wiki 自動更新用 crontab ラッパー |
+| `tools/dedupe_sanitized.py` | sanitized KC の意味的重複排除 (gemini-embedding-001) |
+| `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
 | `tools/verify_screening.py` | LLM スクリーニングの精度検証 (パターンマッチ分析) |
 | `tools/verify_confidence_screening.py` | 信頼度スコアベースのスクリーニング効果検証 |
-| `tools/sanitize_jsonl.py` | 生成済み JSONL ファイルの再サニタイズ |
-| `tools/compare_*.py` | 各種品質比較スクリプト (パイプライン、スクリーニング、サニタイズ等) |
-| `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, NF4) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
+| `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 (カタカナ以外の誤り検出) |
+| `tools/test_panns_real_audio.py` | PANNs 音響シーン分類の実音声テスト (6次元) |
+| `tools/benchmark_vibevoice.py` | VibeVoice-ASR の速度・精度ベンチマーク |
+
+比較ツール (`tools/compare_*.py`):
+
+| スクリプト | 用途 |
+|-----------|------|
 | `tools/compare_engines.py` | Whisper vs Qwen3-ASR 精度比較 (`--sessions N`, `--ids ID...`, `--hotwords`) |
-| `tools/deep_verify_screening.py` | スクリーニング精度の深掘り検証 |
+| `tools/compare_fair.py` | Whisper 素 vs Qwen3-ASR 素 (LLM なし、Layer 1+2 のみ) の公平比較 |
+| `tools/compare_vibevoice.py` | VibeVoice-ASR (9B, NF4) vs Whisper 精度比較 (`--sessions N`, `--ids ID...`) |
+| `tools/compare_whisper_models.py` | Whisper モデルバリアント比較 (large-v3 基準) |
+| `tools/compare_llm_pipeline.py` | 旧単発 LLM 補正 vs 3段階パイプライン (品質 + トークンコスト) |
+| `tools/compare_ab_abc.py` | AB vs ABC パイプライン構成の比較 |
+| `tools/compare_llm_corrector_opt.py` | LLM 補正のプロンプト/フォーマットチューニング |
+| `tools/compare_screening_quality.py` | スクリーニング有無での LLM 補正品質比較 |
+| `tools/compare_screening_rules.py` | 新旧スクリーニングルールの実データ比較 |
+| `tools/compare_sanitize_models.py` | 匿名化品質の比較 (Gemini 2.5 Flash vs GPT-5 nano) |
+| `tools/compare_3way.py` | 匿名化プロンプト/フォーマット設定の3-way 品質比較 |
+
+比較結果は `config/compare_*_<timestamp>.json` に保存されます (git 管理外)。
 
 ## GPU 共有デプロイ
 
@@ -1209,6 +1241,7 @@ omi_whisper_transcribe/
 ├── omi_whisper_bridge.py     # メイン: WebSocket + 文字起こし + 管理 API
 ├── gpu_manager.py            # GPU リソース管理 (レガシー、未使用)
 ├── model_manager.py          # Whisper モデルのロード/アンロード管理
+├── opus_decoder.py           # Omi CV1 OPUS フレームのデコード (BLE/SD カード)
 ├── audio_preprocessor.py     # ノイズ除去 + ラウドネス正規化
 ├── llm_pipeline.py           # 3段階 LLM パイプライン (候補抽出→補正→監査)
 ├── llm_pipeline_schema.py    # パイプライン用 JSON Schema 定義
@@ -1235,6 +1268,10 @@ omi_whisper_transcribe/
 ├── transcriber_qwen3asr.py   # Qwen3-ASR 1.7B リアルタイム文字起こし (bfloat16, ~3.4 GB VRAM)
 ├── hotword_loader.py         # Hotwords ロード・管理
 ├── term_corrector.py         # 用語辞書管理
+├── phonetic_corrector.py     # 音韻類似 (ローマ字編集距離) による用語補正
+├── text_normalizer.py        # 日本語テキスト正規化 (半角/全角等)
+├── succession_rag.py         # 事業継承 RAG (Contextual Retrieval + BM25 + RRF)
+├── wiki_index.py             # LLM Wiki (~/knowledge) の読み取り専用インデックス
 ├── tts_proxy.py              # TTS プロキシ (レガシー、未使用)
 ├── config/                   # 設定ファイル (JSON)
 │   ├── tag_taxonomy.json     # セッションタグ3軸分類 (会話種類・成果物・事業領域)
