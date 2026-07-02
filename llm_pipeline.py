@@ -567,10 +567,8 @@ class LLMPipeline:
 
         Triggers:
         - 3+ broken_katakana or misrecognized candidates from 3-A
-        - 3-B correction density > 30% of eligible segments
-        - Any correction whose corrected text is NOT in known glossary
         - 2+ low-confidence candidates from 3-A
-        - Multiple katakana variants for the same word in one segment
+        - 3-B correction density > 30% of eligible segments
         """
         reasons = []
 

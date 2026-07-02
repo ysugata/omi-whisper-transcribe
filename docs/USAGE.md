@@ -182,6 +182,16 @@ curl -X POST http://localhost:8091/sdcard/upload \
 
 タグの確からしさが低いセッションから優先的に提示されます（不確実度・新規性・鮮度などのスコア順）。
 
+**キューには「人手レビューの価値があるセッション」だけが入ります**（投入ポリシー）:
+
+- RAG 分類が過去パターンに強く一致（類似度 ≥ 0.8）したセッションは信頼して自動承認扱い
+- importance=低 の雑談・独り言はスキップ
+- ただし外部音声（TV 等）混入が疑われるセッションは必ずキューに残る
+
+これにより「全部が対象で消化不能」だったキューが、実際に確認すべき数十〜百件程度に絞られます。
+除外された件数はレビュー統計（`policy_excluded`）で確認でき、しきい値は
+`config/review_weights.json` の `queue_policy` で調整（無効化も）できます。詳細は README を参照。
+
 | キー | 動作 |
 |------|------|
 | `A` | 現在のタグを承認 (Accept) |
@@ -195,8 +205,8 @@ curl -X POST http://localhost:8091/sdcard/upload \
 | タブ | 内容 |
 |------|------|
 | ASR Engine | 現在の Whisper/Qwen3-ASR 設定の確認、エンジン切り替え |
-| 用語補正 | 誤認識→正しい表記の辞書 (`term_corrections.json`) の追加・編集・削除 |
-| Hotwords | 固有名詞バイアスのカテゴリ設定・カスタム hotword の追加 |
+| 用語補正 | 誤認識→正しい表記の辞書 (`term_corrections.json`) の追加・編集・削除。正解表記は自動で hotwords 候補になり、次回以降の認識精度に反映される |
+| Hotwords | 固有名詞バイアスのカテゴリ設定・カスタム hotword の追加（dictionary 擬似カテゴリ = 用語辞書由来） |
 | LLM 提案 | LLM が検出した表記ゆれ候補の承認・拒否（承認すると辞書と hotwords に反映） |
 | Taxonomy | タグ分類軸（会話種類・成果物・事業領域・キーワードアンカー）の編集、キーワード候補の承認 |
 | RAG | RAG 分類のインデックス状態確認・再構築 |
@@ -262,7 +272,7 @@ KC からトピック別 markdown を生成でき、Wiki のトピックが RAG 
 
 ## 管理 API チートシート
 
-管理 API (`:8091`) はすべて認証なしの HTTP です。よく使うもの:
+管理 API (`:8091`) は HTTP です（`MANAGEMENT_TOKEN` 設定時は `-H 'Authorization: Bearer <TOKEN>'` を付与）。よく使うもの:
 
 ```bash
 # モデル状態 / 設定
@@ -295,9 +305,11 @@ curl -X POST http://localhost:8091/succession/ask \
 
 ## セキュリティ上の注意
 
-- **管理 API (8091) と Viewer (8092) には認証がありません。**
+- **管理 API (8091) はデフォルトでは認証なし、Viewer (8092) は常に認証なしです。**
   LAN 外に公開しないでください。外部公開するのは Cloudflare Tunnel 経由の
   `/transcribe`（トークン認証あり）のみにし、8091/8092 はファイアウォールで塞ぐこと。
+  管理 API は `.env` に `MANAGEMENT_TOKEN` を設定するとトークン認証を有効化できます
+  （Viewer には同じトークンが自動で渡ります）。
 - 録音には会話がそのまま含まれます。`recordings/` と `config/`（辞書・声紋・キュー）を
   バックアップ対象・アクセス制御対象として扱ってください。
 - 外部にデータを出すのは Gemini / OpenAI API 呼び出し（LLM 補正・タグ・匿名化・RAG）のみです。

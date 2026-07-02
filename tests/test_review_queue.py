@@ -32,6 +32,23 @@ def _make_session(rec_dir, date, time, tags=None, segments=None, audio_scene=Non
     )
 
 
+def _write_policy(rec_dir, policy):
+    """Write a queue_policy into the config dir next to recordings/."""
+    config_dir = rec_dir.parent / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "review_weights.json").write_text(
+        json.dumps({"version": 1, "queue_policy": policy}, ensure_ascii=False)
+    )
+
+
+# Disables all admission filtering — for tests that verify pure score ordering
+_POLICY_OFF = {
+    "auto_accept_rag_similarity": 0,
+    "skip_low_importance_casual": False,
+    "min_priority_score": 0.0,
+}
+
+
 @pytest.fixture
 def tmp_env(tmp_path):
     rec_dir = tmp_path / "recordings"
@@ -77,6 +94,7 @@ async def test_review_queue_priority_ordering(tmp_env):
         "tag_version": 2,
     })
 
+    _write_policy(rec_dir, _POLICY_OFF)  # test pure ordering, not admission
     indexer = Indexer(db_path, str(rec_dir))
     await indexer.open()
     await indexer.sync()
@@ -309,6 +327,7 @@ async def test_continuous_rag_similarity(tmp_env):
             "tag_version": 2,
         })
 
+    _write_policy(rec_dir, _POLICY_OFF)  # test pure ordering, not admission
     indexer = Indexer(db_path, str(rec_dir))
     await indexer.open()
     await indexer.sync()
@@ -616,3 +635,135 @@ def test_classify_session_signals():
         "tags_importance_v2": "低",
     })
     assert "llm_clean" in signals
+
+
+# ---------------------------------------------------------------------------
+# Queue admission policy (queue_policy in review_weights.json)
+# ---------------------------------------------------------------------------
+
+def _policy_sessions(rec_dir):
+    """4 sessions covering each admission rule."""
+    # 1. RAG high similarity, no external audio -> auto-accepted (excluded)
+    _make_session(rec_dir, TODAY, "10-00-00", tags={
+        "conversation_type": "ミーティング",
+        "outcomes": ["情報共有のみ"],
+        "importance": "中",
+        "tag_source": "rag",
+        "rag_similarity": 0.9,
+        "tag_version": 2,
+    })
+    # 2. Low-importance casual -> skipped (excluded)
+    _make_session(rec_dir, TODAY, "11-00-00", tags={
+        "conversation_type": "独り言・メモ",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "noisy",
+        "tag_version": 2,
+    })
+    # 3. Casual BUT high external audio -> stays (needs human eyes)
+    _make_session(rec_dir, TODAY, "12-00-00", tags={
+        "conversation_type": "雑談・移動中メモ",
+        "outcomes": [],
+        "importance": "低",
+        "tag_source": "llm",
+        "quality": "noisy",
+        "external_audio_ratio": 0.8,
+        "tag_version": 2,
+    })
+    # 4. Important meeting, low RAG similarity -> stays
+    _make_session(rec_dir, TODAY, "13-00-00", tags={
+        "conversation_type": "ミーティング",
+        "outcomes": ["意思決定あり"],
+        "importance": "高",
+        "tag_source": "rag",
+        "rag_similarity": 0.3,
+        "tag_version": 2,
+    })
+
+
+@pytest.mark.asyncio
+async def test_queue_policy_default_admission(tmp_env):
+    """Default policy: rag>=0.8 auto-accepted, 低+casual skipped, external audio kept."""
+    db_path, rec_dir = tmp_env
+    _policy_sessions(rec_dir)
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    times = sorted(item["time"] for item in queue)
+    assert times == ["12-00-00", "13-00-00"], \
+        f"expected only external-audio + low-sim sessions in queue, got {times}"
+
+    stats = await indexer.get_review_stats()
+    assert stats["total_pending"] == 2
+    assert stats["total_raw"] == 4
+    assert stats["policy_excluded"]["auto_accepted"] == 1
+    assert stats["policy_excluded"]["skipped_casual"] == 1
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_policy_disabled(tmp_env):
+    """Policy off -> all sessions queued (backward-compatible behavior)."""
+    db_path, rec_dir = tmp_env
+    _policy_sessions(rec_dir)
+    _write_policy(rec_dir, _POLICY_OFF)
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert len(queue) == 4
+
+    stats = await indexer.get_review_stats()
+    assert stats["total_pending"] == 4
+    assert stats["policy_excluded"] == {}
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_policy_min_priority_score(tmp_env):
+    """min_priority_score drops low-scoring entries from the queue."""
+    db_path, rec_dir = tmp_env
+    _policy_sessions(rec_dir)
+    _write_policy(rec_dir, {**_POLICY_OFF, "min_priority_score": 10.0})
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    assert queue == [], "threshold above any possible score must empty the queue"
+
+    await indexer.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_policy_custom_casual_types(tmp_env):
+    """casual_types is configurable."""
+    db_path, rec_dir = tmp_env
+    _policy_sessions(rec_dir)
+    _write_policy(rec_dir, {
+        "auto_accept_rag_similarity": 0,
+        "skip_low_importance_casual": True,
+        "casual_types": ["ミーティング"],  # unusual on purpose
+    })
+
+    indexer = Indexer(db_path, str(rec_dir))
+    await indexer.open()
+    await indexer.sync()
+
+    queue = await indexer.get_review_queue(limit=10, offset=0)
+    times = sorted(item["time"] for item in queue)
+    # Session 1 (ミーティング but importance=中) stays; casual 低 sessions stay
+    # because 独り言/雑談 are no longer in casual_types.
+    # Session 13 is ミーティング importance=高 -> stays.
+    assert "11-00-00" in times and "12-00-00" in times
+
+    await indexer.close()
