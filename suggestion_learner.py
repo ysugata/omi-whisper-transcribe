@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from term_corrector import compile_boundary_pattern
+
 log = logging.getLogger(__name__)
 
 # Minimum occurrences before a suggestion is considered learned
@@ -92,14 +94,21 @@ class SuggestionLearner:
     def apply_learned(self, text: str) -> tuple[str, int]:
         """Apply learned corrections to text.
 
+        Word-boundary aware: katakana patterns do not match inside larger
+        katakana compounds (same rule as TermCorrector).
+
         Returns:
             (corrected_text, number_of_corrections_applied)
         """
         self._reload_if_changed()
         corrections = 0
         for wrong in sorted(self._learned, key=len, reverse=True):
-            if wrong in text:
-                text = text.replace(wrong, self._learned[wrong])
+            correct = self._learned[wrong]
+            if not wrong or wrong == correct:
+                continue
+            pattern = compile_boundary_pattern(wrong)
+            text, n = pattern.subn(lambda _m, _c=correct: _c, text)
+            if n:
                 corrections += 1
         return text, corrections
 
