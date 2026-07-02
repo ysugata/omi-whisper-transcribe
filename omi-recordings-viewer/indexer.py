@@ -850,8 +850,13 @@ class Indexer:
         # Skip importance=低 casual sessions (the bulk of daily recordings).
         "skip_low_importance_casual": True,
         "casual_types": ["雑談・移動中メモ", "独り言・メモ"],
-        # Sessions with external_audio >= this are always kept in the queue
-        # (mis-recorded TV/media audio needs human eyes).
+        # True にすると外部音声疑いの casual セッションもキューに残す。
+        # デフォルトは False: TV 混入でも 低+雑談/独り言 と分類済みなら
+        # 人手レビューの価値はない (エクスポートからも除外される)。
+        "casual_keep_external_audio": False,
+        # RAG auto-accept is suppressed when external_audio >= this
+        # (suspicious audio should not be silently trusted). Real-data
+        # correction rate for high-external-audio reviews is ~86%.
         "keep_external_audio_min": 0.5,
         # Drop queue entries below this priority score (0 = disabled).
         "min_priority_score": 0.0,
@@ -905,13 +910,16 @@ class Indexer:
         casual_types = policy.get("casual_types") or []
         if policy.get("skip_low_importance_casual") and casual_types:
             placeholders = ",".join("?" for _ in casual_types)
-            clauses.append(
+            clause = (
                 "NOT (COALESCE(tags_importance_v2, '低') = '低'"
                 f" AND tags_conversation_type IN ({placeholders})"
-                " AND COALESCE(tags_external_audio, 0) < ?)"
             )
             params.extend(list(casual_types))
-            params.append(ext_min)
+            if policy.get("casual_keep_external_audio"):
+                clause += " AND COALESCE(tags_external_audio, 0) < ?"
+                params.append(ext_min)
+            clause += ")"
+            clauses.append(clause)
 
         return clauses, params
 
@@ -1057,13 +1065,16 @@ class Indexer:
         casual_types = policy.get("casual_types") or []
         if policy.get("skip_low_importance_casual") and casual_types:
             placeholders = ",".join("?" for _ in casual_types)
-            b = await self._db.execute_fetchall(
-                f"""SELECT COUNT(*) c FROM sessions WHERE {base}
-                    AND COALESCE(tags_importance_v2, '低') = '低'
-                    AND tags_conversation_type IN ({placeholders})
-                    AND COALESCE(tags_external_audio, 0) < ?""",
-                (*casual_types, ext_min),
+            sql = (
+                f"SELECT COUNT(*) c FROM sessions WHERE {base}"
+                " AND COALESCE(tags_importance_v2, '低') = '低'"
+                f" AND tags_conversation_type IN ({placeholders})"
             )
+            cparams: list = [*casual_types]
+            if policy.get("casual_keep_external_audio"):
+                sql += " AND COALESCE(tags_external_audio, 0) < ?"
+                cparams.append(ext_min)
+            b = await self._db.execute_fetchall(sql, cparams)
             breakdown["skipped_casual"] = b[0]["c"] or 0
 
         return {

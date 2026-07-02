@@ -458,6 +458,7 @@ python tools/build_wiki.py --mode full --domain 物販 --dry-run
     "auto_accept_rag_similarity": 0.8,
     "skip_low_importance_casual": true,
     "casual_types": ["雑談・移動中メモ", "独り言・メモ"],
+    "casual_keep_external_audio": false,
     "keep_external_audio_min": 0.5,
     "min_priority_score": 0.0
   }
@@ -469,7 +470,8 @@ python tools/build_wiki.py --mode full --domain 物販 --dry-run
 | `auto_accept_rag_similarity` | `0.8` | RAG 分類で類似度がこれ以上のセッションは信頼してキュー除外 (実測の修正率 ~15%)。`0` で無効 |
 | `skip_low_importance_casual` | `true` | importance=低 かつ `casual_types` の会話種類をスキップ |
 | `casual_types` | 雑談・独り言 | スキップ対象の会話種類 |
-| `keep_external_audio_min` | `0.5` | 外部音声比率がこれ以上のセッションは常にキューに残す (TV 誤録音は実測の修正率 ~86%) |
+| `casual_keep_external_audio` | `false` | `true` にすると外部音声疑いの casual セッションはスキップせず残す。デフォルトは「低+雑談と分類済みの TV 混入はレビュー価値なし」としてスキップ |
+| `keep_external_audio_min` | `0.5` | 外部音声比率がこれ以上のセッションは RAG 自動承認の対象外 (疑わしい音声を黙って信頼しない。実測の修正率 ~86%) |
 | `min_priority_score` | `0.0` | priority_score がこれ未満のエントリを除外 (0=無効) |
 
 除外分は隠されず、`/api/review/stats` の `total_raw` と `policy_excluded` (auto_accepted / skipped_casual の内訳) で確認できます。
