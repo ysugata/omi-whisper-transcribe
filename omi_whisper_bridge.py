@@ -18,6 +18,7 @@ Omi バックエンドが期待する JSON 形式で返します。
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -135,6 +136,13 @@ SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "true").lower() in ("true", "1", "yes"
 RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "./recordings")        # 保存先ディレクトリ
 MAX_RECORDING_DAYS = int(os.environ.get("MAX_RECORDING_DAYS", "30"))     # 自動削除: この日数より古い録音を起動時に削除 (0=無効)
 
+# --- SD カードアップロード設定 ---
+# デバイス時計はリセットで大きく狂うことがある (79日遅れの実例あり)。
+# timestamp がこの日数より古い/未来なら受信時刻にフォールバックする (0=無効)
+SDCARD_TS_MAX_AGE_DAYS = int(os.environ.get("SDCARD_TS_MAX_AGE_DAYS", "7"))
+# バックグラウンド処理待ちの同時アップロード上限 (PCM をメモリ保持するため)
+SDCARD_MAX_PENDING = int(os.environ.get("SDCARD_MAX_PENDING", "4"))
+
 # --- 音声前処理設定 ---
 NORMALIZE_ENABLED = os.environ.get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
 NORMALIZE_TARGET_DBFS = float(os.environ.get("NORMALIZE_TARGET_DBFS", "-16.0"))
@@ -220,6 +228,7 @@ def make_mgmt_auth_middleware(token: str):
 # Layer 1 + Layer 2: 固有名詞改善
 # ============================================================
 
+from sdcard_registry import SdcardUploadRegistry, make_key as sdcard_make_key, resolve_recorded_at
 from term_corrector import TermCorrector
 from llm_corrector import LLMCorrector
 from llm_pipeline import LLMPipeline
@@ -634,6 +643,19 @@ def cleanup_old_recordings():
         try:
             day_date = datetime.strptime(day_dir.name, "%Y-%m-%d")
             if day_date.timestamp() < cutoff:
+                # Old-dated dirs can hold freshly ingested sessions: SD card
+                # uploads carry the (possibly wrong) device clock as the dir
+                # name.  The dir mtime reflects when sessions were last
+                # added, so keep recently written dirs.
+                try:
+                    if day_dir.stat().st_mtime >= cutoff:
+                        log.info(
+                            f"Cleanup skipped {day_dir.name}: "
+                            f"recently written (mtime)"
+                        )
+                        continue
+                except OSError:
+                    pass
                 shutil.rmtree(day_dir)
                 removed += 1
         except ValueError:
@@ -650,7 +672,8 @@ def cleanup_old_recordings():
 class SessionRecorder:
     """1セッション分の音声と文字起こしを管理・保存する"""
 
-    def __init__(self, recorded_at: datetime | None = None, source: str | None = None):
+    def __init__(self, recorded_at: datetime | None = None, source: str | None = None,
+                 extra_meta: dict | None = None):
         self.enabled = SAVE_AUDIO
         self.all_segments: list[dict] = []
         self.total_bytes = 0
@@ -658,6 +681,7 @@ class SessionRecorder:
         self._audio_closed = False
         self.session_tags: dict | None = None  # set by _tag_session() before finalize
         self.source = source  # e.g. "sdcard" - written to JSON metadata
+        self.extra_meta = extra_meta  # e.g. device_timestamp/uploaded_at for sdcard
 
         if not self.enabled:
             return
@@ -780,6 +804,8 @@ class SessionRecorder:
             session_meta["session_tagged"] = True
         if self.source:
             session_meta["source"] = self.source
+        if self.extra_meta:
+            session_meta.update(self.extra_meta)
         output = {
             "session": session_meta,
             "segments": self.all_segments,
@@ -4526,6 +4552,117 @@ async def main():
     def _strip_omi_header(frames: list[bytes]) -> list[bytes]:
         return [f[OMI_HEADER_SIZE:] for f in frames if len(f) > OMI_HEADER_SIZE]
 
+    # 再送重複排除レジストリ (recordings/ 直下に永続化、日付 dir と混ざらない)
+    sdcard_registry = SdcardUploadRegistry(
+        Path(RECORDINGS_DIR) / ".sdcard_registry.json"
+    )
+    sdcard_tasks: set[asyncio.Task] = set()
+
+    async def _process_sdcard_upload(
+        key: str,
+        pcm_data: bytes,
+        recorded_at: datetime,
+        device_recorded_at: datetime | None,
+        device_id: str,
+    ) -> None:
+        """Transcribe one SD upload in the background (client already ACKed)."""
+        try:
+            model, executor = await model_manager.acquire(timeout=600)
+        except Exception as e:
+            log.error(f"SD background: model acquire failed: {e}")
+            sdcard_registry.mark_failed(key, f"model acquire: {e}")
+            return
+
+        try:
+            extra_meta = {
+                "uploaded_at": datetime.now().isoformat(),
+                "device_id": device_id,
+            }
+            if device_recorded_at is not None:
+                # Device clock was rejected as implausible; keep it for reference
+                extra_meta["device_timestamp"] = device_recorded_at.isoformat()
+            recorder = SessionRecorder(
+                recorded_at=recorded_at, source="sdcard", extra_meta=extra_meta,
+            )
+
+            # Hotwords (既存ロジック流用)
+            session_hotwords = ""
+            if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
+                session_hotwords = hotword_loader.get_hotwords_string()
+
+            # 録音書き込み
+            recorder.write_audio(pcm_data)
+
+            loop = asyncio.get_running_loop()
+
+            # 文字起こし: realtime 経路と同等の品質を出すため、silero VAD で
+            # 無音境界分割 → 各 chunk に prompt_carry を引き継ぎながら transcribe。
+            # 固定長 chunk だと文の途中で切れて語尾欠落・幻覚が出やすいため、
+            # 発話の切れ目で分割する。(30分音声の VAD は数秒かかるので executor で)
+            chunk_ranges = await loop.run_in_executor(
+                None, _split_pcm_on_silence, pcm_data, SAMPLE_RATE,
+            )
+
+            prompt_carry_text = ""
+            total_segments = 0
+
+            for start_byte, end_byte in chunk_ranges:
+                chunk = pcm_data[start_byte:end_byte]
+                if len(chunk) == 0:
+                    continue
+                chunk_offset_sec = start_byte / (SAMPLE_RATE * 2)
+
+                if ENGINE == "qwen3asr":
+                    raw_segments = await loop.run_in_executor(
+                        executor,
+                        lambda c=chunk: model.transcribe_audio(
+                            c, SAMPLE_RATE, 0.0, session_hotwords,
+                            LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
+                            audio_preprocessor,
+                        ),
+                    )
+                else:
+                    _carry = prompt_carry_text
+                    raw_segments = await loop.run_in_executor(
+                        executor,
+                        lambda c=chunk, p=_carry: transcribe_audio(
+                            c, model, 0.0, session_hotwords, p,
+                        ),
+                    )
+
+                if raw_segments:
+                    rec_segments = _offset_segments(raw_segments, chunk_offset_sec)
+                    recorder.add_segments(rec_segments)
+                    total_segments += len(raw_segments)
+                    if ENGINE != "qwen3asr":
+                        prompt_carry_text = " ".join(
+                            s.get("text", "") for s in raw_segments
+                        )[-200:]
+
+            log.info(
+                f"SD transcribe: {total_segments} segment(s) across "
+                f"{len(chunk_ranges)} VAD-split chunk(s)"
+            )
+
+            # Finalize + batch 投入 (既存 _finalize_and_enqueue と同じ流れ)
+            recorder.finalize()
+            session_id = None
+            if (batch_corrector and recorder.enabled
+                    and hasattr(recorder, 'session_dir') and recorder.session_dir
+                    and len(recorder.all_segments) > 0
+                    and recorder.session_dir.exists()):
+                session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
+                batch_corrector.enqueue(session_id)
+
+            sdcard_registry.mark_done(key, session_id, total_segments)
+            log.info(f"SD processed: session={session_id}, {total_segments} segment(s)")
+
+        except Exception as e:
+            log.error(f"SD upload processing failed: {e}", exc_info=True)
+            sdcard_registry.mark_failed(key, str(e))
+        finally:
+            model_manager.release()
+
     async def handle_sdcard_upload(request: web.Request) -> web.Response:
         # 認証 (既存 WebSocket と同じ ?token= クエリ)
         if AUTH_TOKEN:
@@ -4571,6 +4708,29 @@ async def main():
         if len(body) > MAX_SDCARD_UPLOAD_BYTES:
             return web.json_response({"error": "payload too large"}, status=413)
 
+        # 同一ファイルの再送は即 ACK。文字起こしはバックグラウンドで進むため、
+        # アプリ側の HTTP タイムアウト → 再送でも二重処理しない。
+        key = sdcard_make_key(
+            device_id, timestamp_start, hashlib.sha256(body).hexdigest(),
+        )
+        existing = sdcard_registry.lookup(key)
+        if existing is not None:
+            log.info(f"SD upload duplicate ({existing['state']}): {key}")
+            return web.json_response({
+                "status": "ok",
+                "duplicate": True,
+                "state": existing["state"],
+                "session_id": existing.get("session_id"),
+            })
+
+        # 未処理ファイルの受け入れは同時 SDCARD_MAX_PENDING 件まで
+        # (30分ファイル1件で PCM 約58MB をメモリに保持するため)。
+        # 503 を返せばアプリが後で再送してくる。
+        if len(sdcard_tasks) >= SDCARD_MAX_PENDING:
+            return web.json_response(
+                {"error": "too many pending uploads, retry later"}, status=503,
+            )
+
         raw_frames = _parse_length_prefixed(body)
         if not raw_frames:
             return web.json_response({"error": "no valid frames"}, status=400)
@@ -4592,109 +4752,40 @@ async def main():
             return web.json_response({"error": "decode failed"}, status=500)
 
         duration = len(pcm_data) / (upload_sr * upload_ch * 2)
+
+        # デバイス時計の妥当性チェック (大きく狂っていたら受信時刻で保存)
+        recorded_at, device_recorded_at = resolve_recorded_at(
+            timestamp_start, SDCARD_TS_MAX_AGE_DAYS or 36500,
+        )
+        session_id_hint = (
+            recorded_at.strftime("%Y-%m-%d/%H-%M-%S") if SAVE_AUDIO else None
+        )
         log.info(
             f"SD upload from {device_id}: {len(opus_frames)} frames, "
             f"{duration:.1f}s, codec={upload_codec}"
+            + (f" (device clock {device_recorded_at} rejected, using now)"
+               if device_recorded_at else "")
         )
 
-        # GPU/モデル確保 (既存パターン)
-        try:
-            model, executor = await model_manager.acquire(timeout=60)
-        except TimeoutError:
-            return web.json_response({"error": "gpu busy"}, status=503)
-        except Exception as e:
-            log.error(f"Failed to acquire model: {e}", exc_info=True)
-            return web.json_response({"error": "model unavailable"}, status=503)
+        sdcard_registry.mark_processing(
+            key, device_id=device_id,
+            duration_seconds=round(duration, 2),
+            session_id=session_id_hint,
+        )
+        task = asyncio.create_task(_process_sdcard_upload(
+            key, pcm_data, recorded_at, device_recorded_at, device_id,
+        ))
+        sdcard_tasks.add(task)
+        task.add_done_callback(sdcard_tasks.discard)
 
-        try:
-            try:
-                recorded_at = datetime.fromtimestamp(timestamp_start)
-            except (ValueError, OSError, OverflowError):
-                recorded_at = None
-
-            recorder = SessionRecorder(recorded_at=recorded_at, source="sdcard")
-
-            # Hotwords (既存ロジック流用)
-            session_hotwords = ""
-            if HOTWORDS_ENABLED and hotword_loader.get_settings().get("enabled", True):
-                session_hotwords = hotword_loader.get_hotwords_string()
-
-            # 録音書き込み
-            recorder.write_audio(pcm_data)
-
-            # 文字起こし: realtime 経路と同等の品質を出すため、silero VAD で
-            # 無音境界分割 → 各 chunk に prompt_carry を引き継ぎながら transcribe。
-            # 固定長 chunk だと文の途中で切れて語尾欠落・幻覚が出やすいため、
-            # 発話の切れ目で分割する。
-            chunk_ranges = _split_pcm_on_silence(pcm_data, SAMPLE_RATE)
-
-            loop = asyncio.get_running_loop()
-            prompt_carry_text = ""
-            total_segments = 0
-
-            for start_byte, end_byte in chunk_ranges:
-                chunk = pcm_data[start_byte:end_byte]
-                if len(chunk) == 0:
-                    continue
-                chunk_offset_sec = start_byte / (SAMPLE_RATE * 2)
-
-                if ENGINE == "qwen3asr":
-                    raw_segments = await loop.run_in_executor(
-                        executor,
-                        lambda c=chunk: model.transcribe_audio(
-                            c, SAMPLE_RATE, 0.0, session_hotwords,
-                            LANGUAGE, term_corrector, SEGMENT_MAX_DURATION,
-                            audio_preprocessor,
-                        ),
-                    )
-                else:
-                    _carry = prompt_carry_text
-                    raw_segments = await loop.run_in_executor(
-                        executor,
-                        lambda c=chunk, p=_carry: transcribe_audio(
-                            c, model, 0.0, session_hotwords, p,
-                        ),
-                    )
-
-                if raw_segments:
-                    rec_segments = _offset_segments(raw_segments, chunk_offset_sec)
-                    recorder.add_segments(rec_segments)
-                    total_segments += len(raw_segments)
-                    if ENGINE != "qwen3asr":
-                        prompt_carry_text = " ".join(
-                            s.get("text", "") for s in raw_segments
-                        )[-200:]
-
-            log.info(
-                f"SD transcribe: {total_segments} segment(s) across "
-                f"{len(chunk_ranges)} VAD-split chunk(s)"
-            )
-
-            # Finalize + batch 投入 (既存 _finalize_and_enqueue と同じ流れ)
-            recorder.finalize()
-            session_id = None
-            enqueued = False
-            if (batch_corrector and recorder.enabled
-                    and hasattr(recorder, 'session_dir') and recorder.session_dir
-                    and len(recorder.all_segments) > 0
-                    and recorder.session_dir.exists()):
-                session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
-                batch_corrector.enqueue(session_id)
-                enqueued = True
-
-            return web.json_response({
-                "status": "ok",
-                "session_id": session_id,
-                "duration_seconds": round(duration, 2),
-                "segments_count": total_segments,
-                "enqueued_for_batch": enqueued,
-            })
-
-        except Exception as e:
-            log.error(f"SD upload processing failed: {e}", exc_info=True)
-            return web.json_response({"error": "processing failed"}, status=500)
-        finally:
-            model_manager.release()
+        return web.json_response({
+            "status": "ok",
+            "queued": True,
+            "session_id": session_id_hint,
+            "duration_seconds": round(duration, 2),
+            "segments_count": 0,
+            "enqueued_for_batch": False,
+        })
 
     mgmt_middlewares = []
     if MANAGEMENT_TOKEN:

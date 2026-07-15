@@ -234,7 +234,7 @@ Omi CV1 SD カードに溜めた OPUS 音声を HTTP で一括アップロード
 
 | メソッド | パス | 説明 |
 |----------|------|------|
-| POST | `/sdcard/upload` | OPUS フレーム列をデコード → 文字起こし → セッション保存 |
+| POST | `/sdcard/upload` | OPUS フレーム列をデコード → 即 ACK → バックグラウンドで文字起こし → セッション保存 |
 
 **リクエスト**:
 
@@ -249,7 +249,20 @@ Omi CV1 SD カードに溜めた OPUS 音声を HTTP で一括アップロード
   - `X-Frame-Header`: `3byte` (Omi 3バイトヘッダ付き) | `none`
 - ボディ: `[4バイトLE 長][フレーム][4バイトLE 長][フレーム]...` (最大 100MB)
 
-**レスポンス**: `{"status", "session_id", "duration_seconds", "segments_count", "enqueued_for_batch"}`
+**レスポンス**: `{"status", "queued", "session_id", "duration_seconds", "segments_count", "enqueued_for_batch"}`
+
+**動作**:
+
+- デコード成功後すぐ 200 を返し、文字起こしはバックグラウンドで実行する
+  (30分ファイルの同期処理はアプリ側 HTTP タイムアウト → 無限再送を招くため)
+- 同一アップロード (`device_id` + `timestamp_start` + ボディ SHA-256) の再送は
+  `recordings/.sdcard_registry.json` で重複排除し、処理中/処理済みとも即 ACK
+  (`{"duplicate": true, "state": "processing"|"done"}`)。処理失敗分は再送で再処理される
+- `X-Timestamp-Start` が `SDCARD_TS_MAX_AGE_DAYS` より古い/未来の場合は
+  デバイス時計の異常とみなして受信時刻で保存し、元の時刻は
+  `session.device_timestamp` に記録する (SD セッションには `uploaded_at` も付く)
+- 未処理の新規アップロードは同時 `SDCARD_MAX_PENDING` 件まで。超過分は 503
+  (アプリの再送で後から取り込まれる)
 
 ### リアルタイム WebSocket (OPUS 経路)
 
@@ -539,7 +552,9 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 |------|-----------|------|
 | `SAVE_AUDIO` | `true` | 録音保存 |
 | `RECORDINGS_DIR` | `./recordings` | 保存先 |
-| `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効) |
+| `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効)。日付名が古くても最近書き込まれた (mtime が新しい) ディレクトリは削除しない |
+| `SDCARD_TS_MAX_AGE_DAYS` | `7` | SD アップロードのデバイス時刻がこの日数より古い/未来なら受信時刻で保存 (0=無効) |
+| `SDCARD_MAX_PENDING` | `4` | SD アップロードのバックグラウンド処理待ち上限 (超過は 503) |
 | `CONFIG_DIR` | `./config` | ランタイム設定 (JSON) の保存先。Bridge と Viewer で共有 |
 
 ### 音声前処理
@@ -1281,6 +1296,7 @@ omi_whisper_transcribe/
 ├── gpu_manager.py            # GPU リソース管理 (レガシー、未使用)
 ├── model_manager.py          # Whisper モデルのロード/アンロード管理
 ├── opus_decoder.py           # Omi CV1 OPUS フレームのデコード (BLE/SD カード)
+├── sdcard_registry.py        # SD アップロードの重複排除レジストリ + デバイス時刻検証
 ├── audio_preprocessor.py     # ノイズ除去 + ラウドネス正規化
 ├── llm_pipeline.py           # 3段階 LLM パイプライン (候補抽出→補正→監査)
 ├── llm_pipeline_schema.py    # パイプライン用 JSON Schema 定義
