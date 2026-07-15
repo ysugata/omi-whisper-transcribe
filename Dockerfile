@@ -45,6 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 
 COPY omi_whisper_bridge.py .
 COPY opus_decoder.py .
+COPY sdcard_registry.py .
 COPY model_manager.py .
 COPY term_corrector.py .
 COPY llm_corrector.py .
