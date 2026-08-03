@@ -28,12 +28,24 @@ class SuggestionLearner:
         self._path = Path(suggestions_path)
         self._mtime: float = 0.0
         self._learned: dict[str, str] = {}  # wrong → correct
+        # Precompiled (pattern, correct) pairs, longest wrong first — rebuilt
+        # on every _load(). Compiling per segment stalled the event loop for
+        # seconds on long sessions.
+        self._compiled: list = []
         self._load()
+
+    def _rebuild_compiled(self) -> None:
+        self._compiled = [
+            (compile_boundary_pattern(wrong), self._learned[wrong])
+            for wrong in sorted(self._learned, key=len, reverse=True)
+            if wrong and wrong != self._learned[wrong]
+        ]
 
     def _load(self) -> None:
         """Load and analyze pending_suggestions.json for learnable patterns."""
         if not self._path.exists():
             self._learned = {}
+            self._rebuild_compiled()
             return
         try:
             mtime = self._path.stat().st_mtime
@@ -44,8 +56,10 @@ class SuggestionLearner:
                 # _extract_patterns and abort bridge startup entirely.
                 log.warning("SuggestionLearner: %s is not a list, ignoring", self._path)
                 self._learned = {}
+                self._rebuild_compiled()
                 return
             self._learned = self._extract_patterns(data)
+            self._rebuild_compiled()
             if self._learned:
                 log.info(
                     "SuggestionLearner: loaded %d learned pattern(s) from %s",
@@ -54,6 +68,7 @@ class SuggestionLearner:
         except (json.JSONDecodeError, OSError) as e:
             log.warning("SuggestionLearner: failed to load %s: %s", self._path, e)
             self._learned = {}
+            self._rebuild_compiled()
 
     def _reload_if_changed(self) -> None:
         """Reload if file has been modified."""
@@ -108,11 +123,7 @@ class SuggestionLearner:
         """
         self._reload_if_changed()
         corrections = 0
-        for wrong in sorted(self._learned, key=len, reverse=True):
-            correct = self._learned[wrong]
-            if not wrong or wrong == correct:
-                continue
-            pattern = compile_boundary_pattern(wrong)
+        for pattern, correct in self._compiled:
             text, n = pattern.subn(lambda _m, _c=correct: _c, text)
             if n:
                 corrections += 1

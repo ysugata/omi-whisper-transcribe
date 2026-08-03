@@ -239,7 +239,10 @@ class Indexer:
                     await self._db.execute(stmt)
                     logger.info("Migration: added column %s", col)
                 except Exception:
-                    pass  # Column already exists
+                    # 想定は「既に存在」だが、locked/disk full 等の本物の失敗も
+                    # ここに来る。黙殺すると以後の UPSERT が全て
+                    # "no such column" で失敗し続けるため、必ずログに残す。
+                    logger.exception("Migration: ALTER TABLE failed for %s", col)
 
     async def close(self):
         if self._db:
@@ -672,6 +675,7 @@ class Indexer:
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
         max_per_class: int = 0,
         require_tagged: bool = False,
+        require_files: bool = False,
         require_summary: bool = False,
         exclude_personal_only: bool = False,
         external_audio_max: float | None = None,
@@ -688,6 +692,7 @@ class Indexer:
             exclude_personal_only=exclude_personal_only,
             external_audio_max=external_audio_max,
             high_value_or=high_value_or,
+            require_files=require_files,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -738,6 +743,7 @@ class Indexer:
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
         max_per_class: int = 0,
         require_tagged: bool = False,
+        require_files: bool = False,
         require_summary: bool = False,
         exclude_personal_only: bool = False,
         external_audio_max: float | None = None,
@@ -768,6 +774,7 @@ class Indexer:
             exclude_personal_only=exclude_personal_only,
             external_audio_max=external_audio_max,
             high_value_or=high_value_or,
+            require_files=require_files,
         )
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
@@ -801,6 +808,7 @@ class Indexer:
         min_segments: int, business_domain: str = "",
         conversation_type: str = "", domain: str = "", importance_v2: str = "",
         require_tagged: bool = False,
+        require_files: bool = False,
         require_summary: bool = False,
         exclude_personal_only: bool = False,
         external_audio_max: float | None = None,
@@ -813,6 +821,11 @@ class Indexer:
         if min_segments > 0:
             where.append("segment_count >= ?")
             params.append(min_segments)
+
+        if require_files:
+            # comprehensive 形式は transcript.json 必須: プレビュー件数と
+            # 実ダウンロード件数を一致させる
+            where.append("COALESCE(files_present, 1) = 1")
 
         if date_from:
             where.append("date >= ?")

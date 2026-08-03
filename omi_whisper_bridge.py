@@ -123,6 +123,14 @@ VIBEVOICE_ENABLED = os.environ.get("VIBEVOICE_ENABLED", "false").lower() in ("tr
 NIGHTLY_SCHEDULE_HOUR = int(os.environ.get("NIGHTLY_SCHEDULE_HOUR", "4"))  # 0=無効, 1-23=実行時刻
 BATCH_MAX_DAYS = int(os.environ.get("BATCH_MAX_DAYS", "7"))  # batch scan range in days (0=unlimited)
 
+# --- 夜間自動 sanitize (Safe Training Data 自動生成) ---
+# タグ付け完了後、未 sanitize の高価値セッションを自動で匿名化する。
+# 生成された safe_training_*.jsonl は KC エクスポートと Wiki ビルドの材料。
+NIGHTLY_SANITIZE_ENABLED = os.environ.get("NIGHTLY_SANITIZE_ENABLED", "true").lower() in ("true", "1", "yes")
+NIGHTLY_SANITIZE_MAX_SESSIONS = int(os.environ.get("NIGHTLY_SANITIZE_MAX_SESSIONS", "50"))  # 1晩の上限 (LLM コスト制御)
+NIGHTLY_SANITIZE_HIGH_VALUE_ONLY = os.environ.get("NIGHTLY_SANITIZE_HIGH_VALUE_ONLY", "true").lower() in ("true", "1", "yes")
+NIGHTLY_SANITIZE_MAX_ATTEMPTS = int(os.environ.get("NIGHTLY_SANITIZE_MAX_ATTEMPTS", "2"))  # 失敗セッションの再試行上限
+
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
@@ -1540,7 +1548,9 @@ async def _batch_diarize_task(force: bool = False):
     _batch_state["finished_at"] = None
 
     try:
-        sessions = _find_undiarized_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_undiarized_sessions(force=force)
+        )
         _batch_state["total"] = len(sessions)
         log.info(f"Batch diarization: {len(sessions)} session(s) to process (force={force})")
 
@@ -1762,7 +1772,9 @@ async def _batch_tag_task(force: bool = False):
     _batch_tag_state["finished_at"] = None
 
     try:
-        sessions = _find_untagged_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_sessions(force=force)
+        )
         _batch_tag_state["total"] = len(sessions)
         log.info(f"Batch speaker tagging: {len(sessions)} session(s) to process (force={force})")
 
@@ -1803,14 +1815,33 @@ async def _batch_tag_task(force: bool = False):
                             None, lambda: speaker_filter._unload_model(inference)
                         )
 
-                # Preserve manually_tagged segments
-                for i, orig in enumerate(original_segments):
-                    if orig.get("manually_tagged") and i < len(updated):
-                        updated[i] = orig
-
+                # Re-read before write (lost-update guard): the snapshot in
+                # sess["data"] predates any corrections made while this batch
+                # was running (same pattern as the combined-tag voice phase).
                 data = sess["data"]
-                data["segments"] = updated
-                data["session"]["speaker_tagged"] = True
+                try:
+                    with open(sess["transcript_path"], encoding="utf-8") as f:
+                        fresh = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    fresh = None
+                if fresh is not None and len(fresh.get("segments", [])) == len(updated):
+                    fresh_segments = fresh["segments"]
+                    for i, us in enumerate(updated):
+                        fs = fresh_segments[i]
+                        if fs.get("manually_tagged"):
+                            continue
+                        for key in ("person_id", "person_name",
+                                    "is_user", "speaker_similarity"):
+                            if key in us:
+                                fs[key] = us[key]
+                    data = fresh
+                else:
+                    # Preserve manually_tagged segments (snapshot view)
+                    for i, orig in enumerate(original_segments):
+                        if orig.get("manually_tagged") and i < len(updated):
+                            updated[i] = orig
+                    data["segments"] = updated
+                data.setdefault("session", {})["speaker_tagged"] = True
 
                 tmp_path = str(sess["transcript_path"]) + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1963,7 +1994,9 @@ async def _batch_session_tag_task(force: bool = False):
     _batch_session_tag_state["finished_at"] = None
 
     try:
-        sessions = _find_untagged_session_tag_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_session_tag_sessions(force=force)
+        )
         _batch_session_tag_state["total"] = len(sessions)
         log.info(f"Batch session tagging: {len(sessions)} session(s) to process (force={force})")
 
@@ -2101,7 +2134,9 @@ async def _batch_combined_tag_task(force: bool = False):
             log.info("Combined tag Phase 1 skipped: no speaker_filter (HF_AUTH_TOKEN not set)")
             return
 
-        voice_sessions = _find_untagged_sessions(force=force)
+        voice_sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_sessions(force=force)
+        )
         st["voice_tag_total"] = len(voice_sessions)
         st["total"] = len(voice_sessions)
         log.info(f"Combined tag Phase 1 (voice tag): {len(voice_sessions)} session(s) (force={force})")
@@ -2187,7 +2222,9 @@ async def _batch_combined_tag_task(force: bool = False):
         if not AUDIO_SCENE_ENABLED:
             return
 
-        scene_sessions = _find_unscene_classified_sessions(force=force)
+        scene_sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_unscene_classified_sessions(force=force)
+        )
         st["audio_scene_total"] = len(scene_sessions)
         log.info(f"Combined tag Phase 1.5 (audio scene): {len(scene_sessions)} session(s)")
 
@@ -2250,7 +2287,9 @@ async def _batch_combined_tag_task(force: bool = False):
             return
 
         st["phase"] = "session_tag"
-        session_tag_sessions = _find_untagged_session_tag_sessions(force=force)
+        session_tag_sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_session_tag_sessions(force=force)
+        )
         st["session_tag_total"] = len(session_tag_sessions)
         st["total"] = st["voice_tag_total"] + st["audio_scene_total"] + len(session_tag_sessions)
         st["processed"] = st["voice_tag_processed"] + st["voice_tag_failed"]
@@ -2627,7 +2666,9 @@ async def _batch_vibevoice_task(force: bool = False):
     try:
         # --- Phase 1: VibeVoice-ASR transcription ---
         st["phase"] = "vibevoice"
-        sessions = _find_unvibevoiced_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_unvibevoiced_sessions(force=force)
+        )
         # Sort by audio file size (ascending) — short sessions first for
         # better GPU utilization (less OOM risk, KV cache warmup).
         sessions.sort(key=lambda s: s["audio"].stat().st_size)
@@ -2887,6 +2928,151 @@ def _should_catch_up_nightly(hour: int, persisted: dict, now: datetime | None = 
     return persisted.get("last_completed_date") != today_str
 
 
+# ============================================================
+# 夜間自動 sanitize: 選定ロジックと試行台帳
+# ============================================================
+
+# main() 内で定義されるクロージャ (_batch_sanitize_task / state) への参照。
+# 夜間スケジューラ (モジュールレベル) から呼ぶために登録する。
+_sanitize_hooks: dict = {}
+
+_SANITIZE_LEDGER_PATH = os.path.join(CONFIG_DIR, "sanitize_ledger.json")
+
+# 事業継承価値の判定 (viewer indexer の high_value_or と同じ基準)
+_SANITIZE_USEFUL_CONV_TYPES = {
+    "ミーティング", "社内ミーティング", "アイデア出し", "商談",
+    "顧客ヒアリング", "1on1", "外部セミナー",
+}
+_SANITIZE_USEFUL_OUTCOMES = {
+    "意思決定あり", "TODO発生", "方針転換", "アイデア創出", "問題提起",
+}
+
+
+def _load_sanitize_ledger() -> dict:
+    try:
+        with open(_SANITIZE_LEDGER_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _record_sanitize_outcome(session_id: str, outcome: str) -> None:
+    """Persist per-session sanitize outcome (done/dropped/failed).
+
+    high-risk dropped や失敗したセッションは safe_training には現れないため、
+    この台帳がないと毎晩再選定されて LLM コストを払い直すことになる。
+    """
+    try:
+        ledger = _load_sanitize_ledger()
+        entry = ledger.get(session_id) or {"attempts": 0}
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["outcome"] = outcome
+        entry["at"] = datetime.now().isoformat(timespec="seconds")
+        ledger[session_id] = entry
+        tmp = _SANITIZE_LEDGER_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ledger, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _SANITIZE_LEDGER_PATH)
+    except OSError as e:
+        log.warning(f"Sanitize ledger write failed: {e}")
+
+
+def _load_sanitized_session_ids() -> set:
+    """Collect session_ids already present in config/safe_training_*.jsonl."""
+    ids: set = set()
+    for fp in sorted(Path(CONFIG_DIR).glob("safe_training_*.jsonl")):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        sid = json.loads(line).get("session_id")
+                    except json.JSONDecodeError:
+                        continue
+                    if sid:
+                        ids.add(sid)
+        except OSError:
+            continue
+    return ids
+
+
+def _find_unsanitized_sessions() -> list:
+    """夜間自動 sanitize の対象セッションを古い順に返す (上限つき)。
+
+    対象: タグ付け済み (V2) で、まだ sanitize されておらず、
+    台帳上も未処理 (失敗は NIGHTLY_SANITIZE_MAX_ATTEMPTS 回まで再試行)。
+    個人のみ / 外部音声 80%+ は除外。NIGHTLY_SANITIZE_HIGH_VALUE_ONLY の
+    場合は事業継承価値のあるセッションに絞る。
+    """
+    base = Path(RECORDINGS_DIR)
+    if not base.exists():
+        return []
+
+    sanitized = _load_sanitized_session_ids()
+    ledger = _load_sanitize_ledger()
+    result: list = []
+
+    for day_dir in sorted(base.iterdir()):
+        if len(result) >= NIGHTLY_SANITIZE_MAX_SESSIONS:
+            break
+        if not day_dir.is_dir():
+            continue
+        for time_dir in sorted(day_dir.iterdir()):
+            if len(result) >= NIGHTLY_SANITIZE_MAX_SESSIONS:
+                break
+            if not time_dir.is_dir():
+                continue
+            sid = f"{day_dir.name}/{time_dir.name}"
+            if sid in sanitized:
+                continue
+            entry = ledger.get(sid)
+            if entry:
+                if entry.get("outcome") in ("done", "dropped"):
+                    continue
+                if int(entry.get("attempts", 0)) >= NIGHTLY_SANITIZE_MAX_ATTEMPTS:
+                    continue
+            transcript_path = time_dir / "transcript.json"
+            if not transcript_path.exists():
+                continue
+            try:
+                with open(transcript_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            segments = data.get("segments", [])
+            if len(segments) < 3:
+                continue
+            tags = data.get("session", {}).get("tags", {}) or {}
+            if not tags.get("conversation_type"):
+                continue  # V2 タグ待ち (今夜の Phase 2 後、明晩以降に対象化)
+
+            domains = tags.get("domains") or []
+            if domains == ["個人"]:
+                continue
+            ext = tags.get("external_audio_ratio")
+            if ext is not None and ext >= 0.8:
+                continue
+
+            if NIGHTLY_SANITIZE_HIGH_VALUE_ONLY:
+                outcomes = set(tags.get("outcomes") or [])
+                high_value = (
+                    tags.get("importance") in ("中", "高")
+                    or tags.get("conversation_type") in _SANITIZE_USEFUL_CONV_TYPES
+                    or bool(tags.get("decision_memo"))
+                    or bool(outcomes & _SANITIZE_USEFUL_OUTCOMES)
+                )
+                if not high_value:
+                    continue
+
+            result.append(sid)
+
+    return result
+
+
 async def _nightly_scheduler():
     """Background task: run diarize + combined tag at NIGHTLY_SCHEDULE_HOUR.
 
@@ -2985,6 +3171,34 @@ async def _nightly_scheduler():
             except Exception as e:
                 log.error("Nightly scheduler: Phase 2 (combined tag) error: %s", e, exc_info=True)
                 phase_errors.append(f"combined_tag: {e}")
+
+            # Phase 2.5: Auto-sanitize (Safe Training Data 自動生成)
+            # タグ付け直後に実行するので、その夜タグが付いたセッションも対象。
+            # 生成物は KC エクスポートと翌朝の Wiki ビルドの材料になる。
+            if (NIGHTLY_SANITIZE_ENABLED
+                    and _sanitize_hooks.get("task") is not None
+                    and (training_sanitizer is not None
+                         or responses_sanitizer is not None)):
+                try:
+                    _nightly_state["phase"] = "sanitize"
+                    san_state = _sanitize_hooks.get("state") or {}
+                    if san_state.get("running"):
+                        log.info("Nightly scheduler: Phase 2.5 skipped (sanitize already running)")
+                    else:
+                        paths = await asyncio.get_running_loop().run_in_executor(
+                            None, _find_unsanitized_sessions
+                        )
+                        if paths:
+                            log.info(
+                                "Nightly scheduler: Phase 2.5 — auto-sanitize %d session(s) "
+                                "(max %d/night)", len(paths), NIGHTLY_SANITIZE_MAX_SESSIONS,
+                            )
+                            await _sanitize_hooks["task"](paths)
+                        else:
+                            log.info("Nightly scheduler: Phase 2.5 — no sessions to sanitize")
+                except Exception as e:
+                    log.error("Nightly scheduler: Phase 2.5 (sanitize) error: %s", e, exc_info=True)
+                    phase_errors.append(f"sanitize: {e}")
 
             # Phase 3: Monthly taxonomy refinement (1st of month only)
             now_after_tag = datetime.now()
@@ -3707,7 +3921,9 @@ async def main():
             pass
 
         # 対象セッション数を事前チェック
-        sessions = _find_undiarized_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_undiarized_sessions(force=force)
+        )
         if not sessions and not force:
             return web.json_response({
                 "status": "no_sessions",
@@ -4083,7 +4299,9 @@ async def main():
         except Exception:
             pass
 
-        sessions = _find_untagged_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_sessions(force=force)
+        )
         if not sessions and not force:
             return web.json_response({
                 "status": "no_sessions",
@@ -4153,7 +4371,9 @@ async def main():
         except Exception:
             pass
 
-        sessions = _find_untagged_session_tag_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_session_tag_sessions(force=force)
+        )
         if not sessions and not force:
             return web.json_response({
                 "status": "no_sessions",
@@ -4195,8 +4415,12 @@ async def main():
             pass
 
         # Check if there's anything to do
-        st_sessions = _find_untagged_session_tag_sessions(force=force) if session_tagger else []
-        vt_sessions = _find_untagged_sessions(force=force) if speaker_filter else []
+        st_sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_session_tag_sessions(force=force) if session_tagger else []
+        )
+        vt_sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_untagged_sessions(force=force) if speaker_filter else []
+        )
 
         if not st_sessions and not vt_sessions and not force:
             return web.json_response({
@@ -4240,7 +4464,9 @@ async def main():
         except Exception:
             pass
 
-        sessions = _find_unvibevoiced_sessions(force=force)
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _find_unvibevoiced_sessions(force=force)
+        )
         if not sessions and not force:
             return web.json_response({
                 "status": "no_sessions",
@@ -4351,17 +4577,21 @@ async def main():
                             )
                             if rs_result is None:
                                 _batch_sanitize_state["failed"] += 1
+                                _record_sanitize_outcome(sess_path, "failed")
                                 continue
                             # Responses API の出力を JSONL に書き込み
                             out_rec = {"session_id": sess_path, **rs_result.data}
                             if rs_result.data.get("risk") == "high":
                                 _batch_sanitize_state["dropped"] += 1
                                 _batch_sanitize_state["processed"] += 1
+                                _record_sanitize_outcome(sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
                             out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+                            out_f.flush()
                             _batch_sanitize_state["records_generated"] += 1
                             _batch_sanitize_state["processed"] += 1
+                            _record_sanitize_outcome(sess_path, "done")
                             log.info(
                                 f"Sanitize: {sess_path} → {rs_result.data.get('risk', '?')}"
                             )
@@ -4372,10 +4602,12 @@ async def main():
                             )
                             if result is None:
                                 _batch_sanitize_state["failed"] += 1
+                                _record_sanitize_outcome(sess_path, "failed")
                                 continue
                             if result["risk_level"] == "high":
                                 _batch_sanitize_state["dropped"] += 1
                                 _batch_sanitize_state["processed"] += 1
+                                _record_sanitize_outcome(sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
                             for rec in result["records"]:
@@ -4383,7 +4615,9 @@ async def main():
                                 rec["risk_level"] = result["risk_level"]
                                 out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                                 _batch_sanitize_state["records_generated"] += 1
+                            out_f.flush()
                             _batch_sanitize_state["processed"] += 1
+                            _record_sanitize_outcome(sess_path, "done")
                             log.info(
                                 f"Sanitize: {sess_path} → {result['risk_level']}, "
                                 f"{len(result['records'])} records"
@@ -4393,6 +4627,7 @@ async def main():
                         _batch_sanitize_state["errors"].append(
                             f"{sess_path}: {e}"
                         )
+                        _record_sanitize_outcome(sess_path, "failed")
                         log.error(f"Sanitize error for {sess_path}: {e}")
                         continue
                     await asyncio.sleep(0)
@@ -4411,6 +4646,10 @@ async def main():
                 f"{_batch_sanitize_state['dropped']} dropped, "
                 f"{_batch_sanitize_state['records_generated']} records"
             )
+
+    # 夜間スケジューラ (モジュールレベル) から自動 sanitize を呼べるよう登録
+    _sanitize_hooks["task"] = _batch_sanitize_task
+    _sanitize_hooks["state"] = _batch_sanitize_state
 
     async def handle_sanitize_start(request):
         if training_sanitizer is None and responses_sanitizer is None:

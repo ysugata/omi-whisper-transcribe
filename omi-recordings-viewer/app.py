@@ -134,10 +134,31 @@ async def handle_index(request: web.Request) -> web.Response:
     return aiohttp_jinja2.render_template("index.html", request, {"v": int(time.time())})
 
 
+def _query_int(request: web.Request, name: str, default: int) -> int:
+    """Parse an int query param; non-numeric input → 400 instead of 500."""
+    raw = request.query.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise web.HTTPBadRequest(text=f"invalid {name}: {raw!r}")
+
+
+def _query_float(request: web.Request, name: str, default: float) -> float:
+    raw = request.query.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise web.HTTPBadRequest(text=f"invalid {name}: {raw!r}")
+
+
 async def handle_api_sessions(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
-    page = int(request.query.get("page", "1"))
-    per_page = int(request.query.get("per_page", "20"))
+    page = _query_int(request, "page", 1)
+    per_page = _query_int(request, "per_page", 20)
     query = request.query.get("q", "").strip()
 
     page = max(1, page)
@@ -1064,8 +1085,8 @@ async def handle_taxonomy_refine_reject(request: web.Request) -> web.Response:
 async def handle_review_queue(request: web.Request) -> web.Response:
     """GET /api/review/queue — get next items to review, ordered by priority."""
     indexer: Indexer = request.app["indexer"]
-    limit = max(1, min(20, int(request.query.get("limit", "1"))))
-    offset = max(0, int(request.query.get("offset", "0")))
+    limit = max(1, min(20, _query_int(request, "limit", 1)))
+    offset = max(0, _query_int(request, "offset", 0))
 
     try:
         items = await indexer.get_review_queue(limit=limit, offset=offset)
@@ -1234,11 +1255,11 @@ def _parse_export_params(request: web.Request) -> dict:
         "domain": domain,
         "importance_v2": importance_v2,
         "speaker_mode": request.query.get("speaker_mode", "conversation"),
-        "min_segments": int(request.query.get("min_segments", "3")),
+        "min_segments": _query_int(request, "min_segments", 3),
         "include_monologue": include_monologue,
-        "max_per_class": int(request.query.get("max_per_class", "0")),
-        "val_ratio": float(request.query.get("val_ratio", "0")),
-        "min_class_samples": int(request.query.get("min_class_samples", "0")),
+        "max_per_class": _query_int(request, "max_per_class", 0),
+        "val_ratio": _query_float(request, "val_ratio", 0.0),
+        "min_class_samples": _query_int(request, "min_class_samples", 0),
         "require_tagged": _bool("require_tagged"),
         "require_summary": _bool("require_summary"),
         "exclude_personal_only": _bool("exclude_personal_only"),
@@ -1257,6 +1278,7 @@ async def handle_export_stats(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
     try:
         stats = await indexer.get_export_stats(
+            require_files=(params["format"] == "comprehensive"),
             date_from=params["date_from"],
             date_to=params["date_to"],
             quality=params["quality"],
@@ -1339,6 +1361,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
     try:
         session_pairs = await indexer.get_export_sessions(
+            require_files=(params["format"] == "comprehensive"),
             date_from=params["date_from"],
             date_to=params["date_to"],
             quality=params["quality"],
@@ -1421,14 +1444,19 @@ async def handle_export_training(request: web.Request) -> web.Response:
             logger.exception("Export error for %s/%s", date, time_val)
             continue
 
-    # Filter out classes with too few samples
+    # Filter out classes with too few samples. Count SESSIONS, not lines —
+    # the stats preview annotates per-session counts, and multi-line formats
+    # would otherwise disagree with what the download actually excludes.
     if min_class_samples > 0:
-        class_counts: dict[str, int] = {}
-        for _, ct, _sid in lines:
-            class_counts[ct] = class_counts.get(ct, 0) + 1
-        excluded = {ct for ct, n in class_counts.items() if n < min_class_samples}
+        class_sessions_count: dict[str, set] = {}
+        for _, ct, sid in lines:
+            class_sessions_count.setdefault(ct, set()).add(sid)
+        excluded = {
+            ct for ct, sids in class_sessions_count.items()
+            if len(sids) < min_class_samples
+        }
         if excluded:
-            logger.info("Export: excluding classes with < %d samples: %s",
+            logger.info("Export: excluding classes with < %d sessions: %s",
                         min_class_samples, excluded)
             lines = [(l, ct, sid) for l, ct, sid in lines if ct not in excluded]
 
@@ -1526,7 +1554,7 @@ def _parse_sanitize_params(request: web.Request) -> dict:
         "conversation_type": request.query.get("conversation_type", "").strip(),
         "domain": request.query.get("domain", "").strip(),
         "importance_v2": request.query.get("importance_v2", "").strip(),
-        "min_segments": int(request.query.get("min_segments", "3")),
+        "min_segments": _query_int(request, "min_segments", 3),
         "require_tagged": _bool("require_tagged"),
         "require_summary": _bool("require_summary"),
         "exclude_personal_only": _bool("exclude_personal_only"),
@@ -1545,6 +1573,7 @@ async def handle_sanitize_start(request: web.Request) -> web.Response:
     indexer: Indexer = request.app["indexer"]
     try:
         session_pairs = await indexer.get_export_sessions(
+            require_files=True,
             date_from=params["date_from"],
             date_to=params["date_to"],
             quality=params["quality"],

@@ -75,12 +75,28 @@ class ModelManager:
         Raises:
             TimeoutError: gpu_lock 取得がタイムアウトした場合
         """
-        try:
-            await asyncio.wait_for(self._gpu_lock.acquire(), timeout=timeout)
-        except asyncio.TimeoutError:
+        # NOTE: asyncio.wait_for(lock.acquire()) は Python 3.10 でキャンセルと
+        # 取得が競合するとロックを取得したままタイムアウトを送出しうる
+        # (bpo-42130 系、3.12 で修正)。バッチが gpu_lock を長時間保持する本環境
+        # では 30 秒タイムアウトが頻繁に発生するため、取得タスクを自前で
+        # 監視し、競合時は必ず解放してからタイムアウトを返す。
+        acquire_task = asyncio.ensure_future(self._gpu_lock.acquire())
+        done, _pending = await asyncio.wait({acquire_task}, timeout=timeout)
+        if acquire_task not in done:
+            acquire_task.cancel()
+            try:
+                await acquire_task
+                # キャンセルが間に合わず取得が成立していた → 解放して返す
+                self._gpu_lock.release()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
             raise TimeoutError(
                 f"GPU busy (lock timeout {timeout}s) — batch operation in progress?"
             )
+        # 取得完了 (例外があればここで送出)
+        acquire_task.result()
         try:
             async with self._lock:
                 self._session_count += 1
