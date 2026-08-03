@@ -582,7 +582,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `LLM_ENABLED` | `true` | LLM 後処理の有効化 |
-| `LLM_MODEL` | `gemini-3.1-flash-lite` | LLM モデル名 |
+| `LLM_MODEL` | `gemini-3.1-flash-lite` | LLM モデル名。`gpt-*` を指定すると自動で OpenAI (`OPENAI_API_KEY` + `OPENAI_BASE_URL`)、それ以外は Gemini (`GEMINI_API_KEY` + `LLM_BASE_URL`) に接続 |
 | `LLM_TIMEOUT` | `10` | リクエストタイムアウト (秒) |
 | `LLM_MIN_TEXT_LENGTH` | `20` | 処理対象の最小テキスト長 |
 | `LLM_BATCH_INTERVAL` | `60` | バッチフラッシュ間隔 (秒) |
@@ -591,9 +591,11 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 | `STAGE_C_AUTO` | `true` | Stage C (品質監査) の自動トリガー (補正密度・候補数に応じて実行) |
 | `LLM_FLUSH_MODE` | `smart` | フラッシュモード (`smart`=トピック境界検出, `fixed`=固定) |
 | `LLM_SCREENING_ENABLED` | `true` | スクリーニング (辞書補正 + 信頼度分類で LLM スキップ) |
-| `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引) |
+| `LLM_BATCH_MODE` | `sync` | バッチ補正モード (`sync`=同期処理, `batch`=Gemini Batch API 50%割引)。`batch` は gemini モデル限定 (gpt-* 指定時は自動で sync に降格) |
 | `RECOVERY_SCAN_DAYS` | `7` | 起動時リカバリ: 直近N日の未処理セッションを自動エンキュー (0=無効) |
-| `LLM_BASE_URL` | Gemini OpenAI 互換 | LLM API のベース URL |
+| `LLM_BASE_URL` | Gemini OpenAI 互換 | Gemini 系モデル用ベース URL |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1/` | gpt 系モデル用ベース URL |
+| `LLM_REASONING_EFFORT` | `minimal` | gpt-5 系の思考トークン制御 (補正・タグ付け用。思考は出力課金のため既定で最小化) |
 | `CONFIDENCE_LOGPROB_THRESHOLD` | `-0.5` | 信頼度スクリーニング閾値 (低信頼度→dirty) |
 
 ### セッションタグ (3軸分類)
@@ -628,7 +630,7 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `TAGGING_ENABLED` | `true` | セッション終了時の自動タグ付け |
-| `TAGGING_MODEL` | `gemini-3.1-flash-lite` | タグ付け用 LLM モデル名 |
+| `TAGGING_MODEL` | `gemini-3.1-flash-lite` | タグ付け用 LLM モデル名。`gpt-*` 指定時は OpenAI に自動接続し、Gemini Batch はスキップして同期処理 |
 | `DOMAIN_PREFILTER_ENABLED` | `true` | ドメイン事前フィルタ (keyword_anchors によるキーワード走査) |
 | `DOMAIN_PREFILTER_MIN_MATCHES` | `1` | 候補ドメインとなる最小キーワードヒット数 |
 | `RAG_ENABLED` | `true` | RAG 分類 (過去セッション埋め込みベースの k-NN 加重投票) |
