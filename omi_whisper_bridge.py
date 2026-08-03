@@ -2316,14 +2316,20 @@ async def _batch_combined_tag_task(force: bool = False):
 
             needs_sync_fallback = False
             if batch_candidates and genai_client and not st["cancel_requested"]:
-                # Build batch requests
+                # Build batch requests. Each request carries the session_id in
+                # metadata (google-genai InlinedRequest.metadata) so results
+                # can be matched by key instead of trusting response order.
                 batch_requests = []
                 batch_session_map = []  # parallel list: (sess, fresh_data, segments, audio_scene)
+                batch_by_key = {}       # session_id -> same tuple, for keyed matching
                 for sess, fresh_data, segments, audio_scene in batch_candidates:
                     req = session_tagger.build_batch_request(segments, audio_scene=audio_scene)
                     if req:
+                        req["metadata"] = {"session_id": sess["path"]}
                         batch_requests.append(req)
-                        batch_session_map.append((sess, fresh_data, segments, audio_scene))
+                        entry = (sess, fresh_data, segments, audio_scene)
+                        batch_session_map.append(entry)
+                        batch_by_key[sess["path"]] = entry
 
                 if batch_requests:
                     log.info(f"Combined tag: submitting {len(batch_requests)} session(s) to Batch API")
@@ -2355,21 +2361,50 @@ async def _batch_combined_tag_task(force: bool = False):
                             if state == "JOB_STATE_SUCCEEDED":
                                 log.info(f"Combined tag: Batch API completed → {batch_result.name}")
                                 responses = list(genai_client.batches.list_results(name=batch_result.name))
-                                if len(responses) != len(batch_session_map):
-                                    # Positional zip below assumes 1:1 order;
-                                    # a dropped/reordered response would write
-                                    # tags to the WRONG session silently.
+
+                                # Prefer keyed matching via echoed request
+                                # metadata; only if the SDK/API did not echo
+                                # keys, fall back to positional mapping with
+                                # the strict count guard.
+                                def _resp_key(r):
+                                    md = getattr(r, "metadata", None)
+                                    if isinstance(md, dict):
+                                        return md.get("session_id")
+                                    return None
+
+                                keyed = [(_resp_key(r), r) for r in responses]
+                                use_keys = (
+                                    all(k for k, _ in keyed)
+                                    and len({k for k, _ in keyed}) == len(keyed)
+                                )
+                                if use_keys:
+                                    matched = [
+                                        (batch_by_key[k], r)
+                                        for k, r in keyed if k in batch_by_key
+                                    ]
+                                    unknown = [k for k, _ in keyed if k not in batch_by_key]
+                                    if unknown:
+                                        log.warning(
+                                            "Combined tag: %d batch response(s) with "
+                                            "unknown session keys ignored", len(unknown),
+                                        )
+                                elif len(responses) != len(batch_session_map):
+                                    # No keys AND count mismatch: positional
+                                    # mapping would write tags to the WRONG
+                                    # sessions silently — abort to sync.
                                     log.error(
                                         "Combined tag: Batch API returned %d responses "
-                                        "for %d requests — positional mapping unsafe, "
+                                        "for %d requests without usable keys — "
                                         "falling back to sync",
                                         len(responses), len(batch_session_map),
                                     )
                                     break
-                                for i, resp in enumerate(responses):
-                                    if i >= len(batch_session_map):
-                                        break
-                                    sess, fresh_data, segments, audio_scene = batch_session_map[i]
+                                else:
+                                    log.info("Combined tag: no metadata keys echoed; using positional mapping")
+                                    matched = list(zip(batch_session_map, responses))
+
+                                for entry, resp in matched:
+                                    sess, fresh_data, segments, audio_scene = entry
                                     try:
                                         raw_text = resp.response.candidates[0].content.parts[0].text
                                         tags = session_tagger.parse_batch_response(raw_text, segments, audio_scene=audio_scene)

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -187,6 +188,11 @@ class Indexer:
         # Default keeps the historical layout (config/ next to recordings/)
         self.config_dir = Path(config_dir) if config_dir else self.recordings_dir.parent / "config"
         self._db: aiosqlite.Connection | None = None
+        # Serializes logical write units on the shared connection. Without
+        # this, any commit() publishes every other writer's half-finished
+        # statements (sync mid-batch, rename mid-loop), and a failed writer
+        # leaves an open transaction for someone else to commit later.
+        self._write_lock = asyncio.Lock()
 
     async def open(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -200,6 +206,26 @@ class Indexer:
         # Create indexes on migrated columns (must be after migration)
         await self._db.executescript(POST_MIGRATION_INDEXES)
         await self._db.commit()
+
+    @asynccontextmanager
+    async def write_tx(self):
+        """One logical write unit: statements + commit, or rollback on error.
+
+        All DB writers (sync, reindex, renames, feedback marks) must go
+        through this so their statements stay contiguous on the shared
+        connection and never leak into another writer's commit.
+        """
+        async with self._write_lock:
+            try:
+                yield self._db
+            except BaseException:
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    logger.exception("write_tx rollback failed")
+                raise
+            else:
+                await self._db.commit()
 
     async def _migrate_tags(self):
         """Add tag columns to existing DB if they don't exist."""
@@ -381,18 +407,9 @@ class Indexer:
             if stored_mtime is None or abs(mtime - stored_mtime) > 0.01:
                 to_index.append((date, time, mtime))
 
-        # Retention cleanup deletes session files while their DB rows remain;
-        # keep files_present in step so queues/exports can exclude or fall back.
-        reconciled = await self._reconcile_files_present(
-            {(d, t) for d, t, _ in on_disk}
-        )
-
-        if not to_index:
-            if reconciled:
-                await self._db.commit()
-            return 0
-
-        count = 0
+        # Parse OUTSIDE the write lock (executor I/O can be slow; only the
+        # DB statements need to be serialized).
+        parsed: list[dict] = []
         for date, time, mtime in to_index:
             try:
                 info = await loop.run_in_executor(
@@ -401,16 +418,23 @@ class Indexer:
             except Exception:
                 logger.exception("Failed to parse %s/%s", date, time)
                 continue
-
             info["last_modified"] = mtime
-            await self._db.execute(SESSION_UPSERT_SQL, info)
-            count += 1
+            parsed.append(info)
 
-            # Yield to event loop periodically to prevent blocking
-            if count % 10 == 0:
-                await asyncio.sleep(0)
+        count = 0
+        async with self.write_tx():
+            # Retention cleanup deletes session files while their DB rows
+            # remain; keep files_present in step so queues/exports can
+            # exclude or fall back.
+            await self._reconcile_files_present({(d, t) for d, t, _ in on_disk})
 
-        await self._db.commit()
+            for info in parsed:
+                await self._db.execute(SESSION_UPSERT_SQL, info)
+                count += 1
+                # Yield to event loop periodically to prevent blocking
+                if count % 10 == 0:
+                    await asyncio.sleep(0)
+
         if count:
             logger.info("Indexed %d new/updated sessions", count)
         return count
@@ -443,11 +467,11 @@ class Indexer:
         Used when a handler discovers mid-request that a session's files
         vanished (retention cleanup race between two sync ticks).
         """
-        await self._db.execute(
-            "UPDATE sessions SET files_present = 0 WHERE date = ? AND time = ?",
-            (date, time),
-        )
-        await self._db.commit()
+        async with self.write_tx():
+            await self._db.execute(
+                "UPDATE sessions SET files_present = 0 WHERE date = ? AND time = ?",
+                (date, time),
+            )
 
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
@@ -597,8 +621,8 @@ class Indexer:
             info = await loop.run_in_executor(None, self._parse_transcript, date, time)
             path = self.recordings_dir / date / time / "transcript.json"
             info["last_modified"] = path.stat().st_mtime if path.exists() else 0
-            await self._db.execute(SESSION_UPSERT_SQL, info)
-            await self._db.commit()
+            async with self.write_tx():
+                await self._db.execute(SESSION_UPSERT_SQL, info)
             return info
         except Exception:
             logger.exception("Failed to reindex %s/%s", date, time)

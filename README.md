@@ -230,7 +230,9 @@ open http://localhost:8092
 Phase 3 = 月次タクソノミー refine。diarize は音声 1 秒未満のセッションを
 スキップし、失敗したセッションは `diarize_attempts` を transcript に記録して
 3 回で打ち切る (無限リトライ防止)。Gemini Batch API がタイムアウト/失敗した
-場合は同期タグ付けにフォールバックする。
+場合は同期タグ付けにフォールバックする。Batch リクエストには `metadata.session_id`
+を付与し、応答はキーで突合する (キーが返らない場合は件数一致を条件に順序
+マッピングへフォールバック)。
 
 ### SD カード一括アップロード (OPUS)
 
