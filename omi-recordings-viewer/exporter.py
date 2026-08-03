@@ -216,6 +216,45 @@ class SanitizedIndex:
 
 
 # ---------------------------------------------------------------------------
+# SanitizedIndex cache
+# ---------------------------------------------------------------------------
+
+# Keyed by config dir; value is (directory signature, built index). The
+# signature is the sorted (name, mtime_ns, size) of every safe_training_*
+# file — cheap to compute per request, so the multi-MB JSONL parse only
+# happens when a file actually changed.
+_INDEX_CACHE: dict[str, tuple[tuple, "SanitizedIndex"]] = {}
+
+
+def _sanitized_dir_signature(config_dir: Path) -> tuple:
+    sig = []
+    for f in sorted(config_dir.glob("safe_training_*.jsonl")):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        sig.append((f.name, st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
+def get_sanitized_index(config_dir: Path | str) -> "SanitizedIndex":
+    """Return a (possibly cached) SanitizedIndex for config_dir.
+
+    Synchronous — async callers should run it in an executor so a cache
+    miss (full JSONL parse) does not block the event loop.
+    """
+    config_dir = Path(config_dir)
+    key = str(config_dir)
+    sig = _sanitized_dir_signature(config_dir)
+    cached = _INDEX_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    index = SanitizedIndex(config_dir)
+    _INDEX_CACHE[key] = (sig, index)
+    return index
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers (unchanged)
 # ---------------------------------------------------------------------------
 
