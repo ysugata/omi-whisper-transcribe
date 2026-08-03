@@ -78,9 +78,23 @@ WHISPER_VAD_THRESHOLD = float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.5"))
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LLM_API_KEY = GEMINI_API_KEY  # Default LLM uses Gemini
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite")
+# gpt-5 系 Chat Completions 用: 思考トークンは出力課金されるため既定で最小化
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "minimal")
+
+
+def resolve_llm_endpoint(model: str) -> tuple[str, str]:
+    """モデル名から (api_key, base_url) を解決する。
+
+    以前は LLM_API_KEY=GEMINI_API_KEY がハードコードされており、補正・
+    タグ付けを OpenAI モデルに切り替えられなかった。プレフィックスで
+    自動判定する: gpt-* → OpenAI、それ以外 → Gemini (OpenAI 互換 endpoint)。
+    """
+    if model.startswith("gpt-"):
+        return OPENAI_API_KEY, OPENAI_BASE_URL
+    return GEMINI_API_KEY, LLM_BASE_URL
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "10"))
 LLM_MIN_TEXT_LENGTH = int(os.environ.get("LLM_MIN_TEXT_LENGTH", "20"))
 LLM_PIPELINE_STAGES = os.environ.get("LLM_PIPELINE_STAGES", "B")        # Pipeline stages to run (A/B/C)
@@ -265,13 +279,15 @@ term_corrector = TermCorrector(_TERM_CORRECTIONS_PATH)
 # (レガシーの LLMCorrector インスタンスは廃止。detect_corrections の
 #  静的メソッドのみ _save_llm_suggestions で使用)
 llm_pipeline: LLMPipeline | None = None
-if LLM_ENABLED and LLM_API_KEY:
+_llm_key, _llm_base_url = resolve_llm_endpoint(LLM_MODEL)
+if LLM_ENABLED and _llm_key:
     llm_pipeline = LLMPipeline(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=_llm_key,
+        base_url=_llm_base_url,
         model=LLM_MODEL,
         timeout=LLM_TIMEOUT,
         stages=LLM_PIPELINE_STAGES,
+        reasoning_effort=LLM_REASONING_EFFORT,
     )
 
 # Batch corrector: post-session async LLM correction
@@ -335,11 +351,13 @@ if TAXONOMY_REFINE_ENABLED and GEMINI_API_KEY and rag_classifier:
 TAG_TAXONOMY_PATH = os.path.join(CONFIG_DIR, "tag_taxonomy.json")
 
 session_tagger: SessionTagger | None = None
-if TAGGING_ENABLED and LLM_API_KEY:
+_tag_key, _tag_base_url = resolve_llm_endpoint(TAGGING_MODEL)
+if TAGGING_ENABLED and _tag_key:
     session_tagger = SessionTagger(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=_tag_key,
+        base_url=_tag_base_url,
         model=TAGGING_MODEL,
+        reasoning_effort=LLM_REASONING_EFFORT,
         taxonomy_path=TAG_TAXONOMY_PATH,
         prefilter_enabled=DOMAIN_PREFILTER_ENABLED,
         prefilter_min_matches=DOMAIN_PREFILTER_MIN_MATCHES,
@@ -427,12 +445,7 @@ if _use_responses and OPENAI_API_KEY:
     )
 else:
     # Gemini or fallback Chat Completions API
-    if SANITIZE_MODEL.startswith("gpt-"):
-        _sanitize_key = OPENAI_API_KEY
-        _sanitize_url = "https://api.openai.com/v1/"
-    else:
-        _sanitize_key = GEMINI_API_KEY
-        _sanitize_url = LLM_BASE_URL
+    _sanitize_key, _sanitize_url = resolve_llm_endpoint(SANITIZE_MODEL)
     if _sanitize_key:
         training_sanitizer = TrainingSanitizer(
             api_key=_sanitize_key,
@@ -2344,9 +2357,11 @@ async def _batch_combined_tag_task(force: bool = False):
                     log.error(f"Combined tag session-tag prep error: {sess['path']}: {e}")
                 await asyncio.sleep(0)
 
-            # Try Gemini Batch API for remaining LLM-needed sessions
+            # Try Gemini Batch API for remaining LLM-needed sessions.
+            # TAGGING_MODEL が gemini 以外 (gpt-* 等) の場合は Gemini Batch に
+            # 送れないため、最初から同期パス (OpenAI 互換クライアント) に回す。
             genai_client = None
-            if batch_candidates and GEMINI_API_KEY:
+            if batch_candidates and GEMINI_API_KEY and TAGGING_MODEL.startswith("gemini"):
                 try:
                     from google import genai
                     genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -3784,6 +3799,15 @@ async def main():
                 suggestion_learner.pattern_count,
             )
 
+        # Gemini Batch モードは gemini モデル限定。gpt-* に切り替えたまま
+        # batch モードだと全ジョブが submit 失敗するため sync に落とす。
+        _corrector_mode = LLM_BATCH_MODE
+        if _corrector_mode == "batch" and not LLM_MODEL.startswith("gemini"):
+            log.warning(
+                "LLM_BATCH_MODE=batch is Gemini-only; model %s → forcing sync mode",
+                LLM_MODEL,
+            )
+            _corrector_mode = "sync"
         batch_corrector = BatchCorrector(
             recordings_dir=RECORDINGS_DIR,
             config_dir=CONFIG_DIR,
@@ -3792,7 +3816,7 @@ async def main():
             hotword_loader=hotword_loader,
             stage_c_auto=STAGE_C_AUTO,
             min_text_length=LLM_MIN_TEXT_LENGTH,
-            mode=LLM_BATCH_MODE,
+            mode=_corrector_mode,
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=LLM_MODEL,
             segment_screener=segment_screener,

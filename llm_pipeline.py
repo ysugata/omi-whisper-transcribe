@@ -94,10 +94,12 @@ class LLMPipeline:
         max_tokens_a: int = 2048,
         max_tokens_b: int = 4096,
         max_tokens_c: int = 2048,
+        reasoning_effort: str = "minimal",
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
         self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
         self._stages = stages.upper()
         self._max_tokens_a = max_tokens_a
         self._max_tokens_b = max_tokens_b
@@ -144,16 +146,24 @@ class LLMPipeline:
                     {"role": "user", "content": user_message},
                 ],
                 response_format=response_format,
-                temperature=self._temperature,
-                max_tokens=max_tokens,
             )
-            # Minimize thinking tokens for cost control.
-            # Gemini 3.x: reasoning_effort="low" (cannot be fully disabled).
-            # Gemini 2.5 Flash: reasoning_effort="none" disables thinking.
-            if "gemini-3" in self._model:
-                kwargs["reasoning_effort"] = "low"
-            elif self._model.startswith("gemini-2.5-flash") and "lite" not in self._model:
-                kwargs["reasoning_effort"] = "none"
+            if self._model.startswith("gpt-"):
+                # gpt-5 系 (Chat Completions): max_tokens は拒否されるため
+                # max_completion_tokens を使う。temperature はデフォルト固定
+                # (指定するとエラー)。思考トークンは出力レートで課金されるので
+                # reasoning_effort で最小化する (既定 minimal)。
+                kwargs["max_completion_tokens"] = max_tokens
+                kwargs["reasoning_effort"] = self._reasoning_effort
+            else:
+                kwargs["temperature"] = self._temperature
+                kwargs["max_tokens"] = max_tokens
+                # Minimize thinking tokens for cost control.
+                # Gemini 3.x: reasoning_effort="low" (cannot be fully disabled).
+                # Gemini 2.5 Flash: reasoning_effort="none" disables thinking.
+                if "gemini-3" in self._model:
+                    kwargs["reasoning_effort"] = "low"
+                elif self._model.startswith("gemini-2.5-flash") and "lite" not in self._model:
+                    kwargs["reasoning_effort"] = "none"
             response = self._client.chat.completions.create(**kwargs)
             return response.choices[0].message.content
         except Exception as e:

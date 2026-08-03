@@ -144,11 +144,13 @@ class SessionTagger:
         prefilter_enabled: bool = True,
         prefilter_min_matches: int = 1,
         rag_classifier=None,
+        reasoning_effort: str = "minimal",
     ) -> None:
         self._enabled = bool(api_key)
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._reasoning_effort = reasoning_effort
         self._client = None
         self._taxonomy_path = taxonomy_path
         self._taxonomy = _load_taxonomy(taxonomy_path)
@@ -663,15 +665,22 @@ class SessionTagger:
 
         try:
             system_prompt = self._build_system_prompt()
-            response = self._client.chat.completions.create(
+            kwargs = dict(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": session_text + prefilter_hint},
                 ],
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
             )
+            if self._model.startswith("gpt-"):
+                # gpt-5 系: max_tokens/temperature は拒否される。思考トークンは
+                # 出力課金なので reasoning_effort で最小化 (llm_pipeline と同様)。
+                kwargs["max_completion_tokens"] = self._max_tokens
+                kwargs["reasoning_effort"] = self._reasoning_effort
+            else:
+                kwargs["temperature"] = self._temperature
+                kwargs["max_tokens"] = self._max_tokens
+            response = self._client.chat.completions.create(**kwargs)
             raw = response.choices[0].message.content
             log.debug(f"SessionTagger raw response: {raw[:300]}")
 
