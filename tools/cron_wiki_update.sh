@@ -12,7 +12,7 @@
 #   3. If the build changed any tracked files, commit + push to origin.
 #
 # Crontab line:
-#   30 4 * * * /home/dev/omi_whisper_transcribe/tools/cron_wiki_update.sh
+#   30 5 * * * /home/dev/omi_whisper_transcribe/tools/cron_wiki_update.sh (bridge の nightly sanitize 完了後)
 #
 # Logs append to ~/knowledge/.build.log (gitignored).
 

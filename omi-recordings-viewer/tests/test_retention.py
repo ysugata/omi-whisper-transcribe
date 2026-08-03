@@ -228,3 +228,29 @@ def test_sanitized_index_dedups_training_sanitizer_kcs(tmp_path):
     idx = SanitizedIndex(tmp_path)
     bucket = idx.get("2026-03-29/10-00-00")
     assert len(bucket["knowledge_cards"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_export_sessions_require_files(tmp_env):
+    """require_files=True (comprehensive) excludes retention-deleted sessions."""
+    recordings, db_path = tmp_env
+    _create_session(recordings, "2026-03-29", "10-00-00")
+    _create_session(recordings, "2026-03-29", "11-00-00")
+
+    indexer = Indexer(db_path, str(recordings))
+    await indexer.open()
+    await indexer.sync()
+
+    shutil.rmtree(recordings / "2026-03-29" / "10-00-00")
+    await indexer.sync()
+
+    all_pairs = await indexer.get_export_sessions(min_segments=1)
+    file_pairs = await indexer.get_export_sessions(min_segments=1, require_files=True)
+    assert len(all_pairs) == 2
+    assert file_pairs == [("2026-03-29", "11-00-00")]
+
+    stats_all = await indexer.get_export_stats(min_segments=1)
+    stats_files = await indexer.get_export_stats(min_segments=1, require_files=True)
+    assert stats_all["sessions"] == 2
+    assert stats_files["sessions"] == 1
+    await indexer.close()

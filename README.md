@@ -227,6 +227,8 @@ open http://localhost:8092
 
 実行フェーズ: Phase 0 = 録音保持期限クリーンアップ (`MAX_RECORDING_DAYS`、
 起動時に加えて毎晩実行) → Phase 1 = diarize → Phase 2 = combined tag →
+Phase 2.5 = 自動 sanitize (`NIGHTLY_SANITIZE_*`、その夜タグ付けされた
+高価値セッションを Safe Training Data 化。Wiki ビルド cron が翌朝取り込む) →
 Phase 3 = 月次タクソノミー refine。diarize は音声 1 秒未満のセッションを
 スキップし、失敗したセッションは `diarize_attempts` を transcript に記録して
 3 回で打ち切る (無限リトライ防止)。Gemini Batch API がタイムアウト/失敗した
@@ -649,6 +651,10 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 |------|-----------|------|
 | `NIGHTLY_SCHEDULE_HOUR` | `4` | 深夜バッチ実行時刻 (0=無効, 1-23=実行時刻) |
 | `BATCH_MAX_DAYS` | `7` | バッチ処理の走査対象日数 (0=無制限)。これより古いセッションはバッチ対象外 |
+| `NIGHTLY_SANITIZE_ENABLED` | `true` | 夜間自動 sanitize (Phase 2.5)。タグ付け後、未 sanitize の高価値セッションを自動で匿名化して `safe_training_*.jsonl` を生成 (Wiki / KC エクスポートの材料) |
+| `NIGHTLY_SANITIZE_MAX_SESSIONS` | `50` | 自動 sanitize の1晩あたり上限 (LLM コスト制御)。バックログは古い順に消化 |
+| `NIGHTLY_SANITIZE_HIGH_VALUE_ONLY` | `true` | 事業継承価値のあるセッションのみ対象 (重要度中+ / 有用な会話種別 / 意思決定メモ / 実質的アウトカム)。個人のみ・外部音声80%+は常に除外 |
+| `NIGHTLY_SANITIZE_MAX_ATTEMPTS` | `2` | 失敗セッションの再試行上限 (`config/sanitize_ledger.json` で管理。dropped=高リスク除外は再試行しない) |
 
 ### リアルタイム声紋フィルタ
 
