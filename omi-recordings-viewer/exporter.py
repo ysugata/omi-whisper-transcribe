@@ -217,6 +217,44 @@ class SanitizedIndex:
 # ---------------------------------------------------------------------------
 
 
+def transcript_stub_from_row(row: dict) -> dict:
+    """Rebuild a minimal transcript dict from a sessions DB row.
+
+    Retention cleanup (MAX_RECORDING_DAYS) deletes transcript.json from disk
+    while the DB row and sanitized safe_training data survive. The KC-sourced
+    formats only need session metadata (tags) from the transcript, so this
+    stub lets those sessions still be exported.
+    """
+    def _split(v: str | None) -> list[str]:
+        return [s for s in (v or "").split(",") if s]
+
+    tags: dict = {
+        "conversation_type": row.get("tags_conversation_type"),
+        "outcomes": _split(row.get("tags_outcomes")),
+        "domains": _split(row.get("tags_domains")),
+        "importance": row.get("tags_importance_v2"),
+        "quality": row.get("tags_quality"),
+        "summary": row.get("tags_summary"),
+        "decision_memo": row.get("tags_decision_memo"),
+        "action_items": _split(row.get("tags_action_items")),
+        "topics": _split(row.get("tags_topics")),
+        "entities": _split(row.get("tags_entities")),
+        "business_domain": row.get("tags_business_domain"),
+        "external_audio_ratio": row.get("tags_external_audio"),
+    }
+    tags = {k: v for k, v in tags.items() if v}
+    return {
+        "session": {
+            "start": row.get("start_at"),
+            "end": row.get("end_at"),
+            "duration_seconds": row.get("duration_seconds"),
+            "language": row.get("language"),
+            "tags": tags,
+        },
+        "segments": [],
+    }
+
+
 def merge_turns(segments: list[dict]) -> list[dict]:
     """Merge consecutive segments from the same speaker into turns."""
     if not segments:

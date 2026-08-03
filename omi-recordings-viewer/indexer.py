@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tags_manually_corrected INTEGER DEFAULT 0,
     tags_corrected_at TEXT,
     tags_review_outcome TEXT,
+    files_present INTEGER DEFAULT 1,
     UNIQUE(date, time)
 );
 
@@ -128,6 +129,7 @@ MIGRATION_ADD_TAGS = [
     "ALTER TABLE sessions ADD COLUMN tags_manually_corrected INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN tags_corrected_at TEXT",
     "ALTER TABLE sessions ADD COLUMN tags_review_outcome TEXT",
+    "ALTER TABLE sessions ADD COLUMN files_present INTEGER DEFAULT 1",
 ]
 
 # Single source of truth for the sessions upsert. Any column change must be
@@ -148,7 +150,7 @@ SESSION_UPSERT_SQL = """INSERT OR REPLACE INTO sessions
     tags_audio_noise_sources, tags_audio_events,
     tags_audio_music_detected, tags_audio_speaker_count,
     tags_tag_source, tags_rag_similarity, tags_manually_corrected, tags_corrected_at,
-    tags_review_outcome)
+    tags_review_outcome, files_present)
    VALUES (:date, :time, :start_at, :end_at, :duration_seconds,
            :audio_size_mb, :model, :language, :transcript_text, :segment_count,
            :tags_topics, :tags_activity, :tags_intent, :tags_mood,
@@ -164,7 +166,7 @@ SESSION_UPSERT_SQL = """INSERT OR REPLACE INTO sessions
            :tags_audio_noise_sources, :tags_audio_events,
            :tags_audio_music_detected, :tags_audio_speaker_count,
            :tags_tag_source, :tags_rag_similarity, :tags_manually_corrected, :tags_corrected_at,
-           :tags_review_outcome)"""
+           :tags_review_outcome, :files_present)"""
 
 # FTS5 was set up historically but never used for search (Japanese text has
 # no word boundaries, so the unicode61 tokenizer cannot serve substring
@@ -351,6 +353,7 @@ class Indexer:
             "tags_manually_corrected": 1 if tags.get("manually_corrected") else 0,
             "tags_corrected_at": tags.get("corrected_at"),
             "tags_review_outcome": tags.get("review_outcome"),
+            "files_present": 1,
         }
 
     async def sync(self) -> int:
@@ -378,7 +381,15 @@ class Indexer:
             if stored_mtime is None or abs(mtime - stored_mtime) > 0.01:
                 to_index.append((date, time, mtime))
 
+        # Retention cleanup deletes session files while their DB rows remain;
+        # keep files_present in step so queues/exports can exclude or fall back.
+        reconciled = await self._reconcile_files_present(
+            {(d, t) for d, t, _ in on_disk}
+        )
+
         if not to_index:
+            if reconciled:
+                await self._db.commit()
             return 0
 
         count = 0
@@ -403,6 +414,28 @@ class Indexer:
         if count:
             logger.info("Indexed %d new/updated sessions", count)
         return count
+
+    async def _reconcile_files_present(self, on_disk_keys: set[tuple[str, str]]) -> int:
+        """Update files_present to match what is actually on disk.
+
+        Returns the number of rows changed. Does not commit.
+        """
+        cursor = await self._db.execute(
+            "SELECT date, time, COALESCE(files_present, 1) AS fp FROM sessions"
+        )
+        rows = await cursor.fetchall()
+        changed = 0
+        for r in rows:
+            fp = 1 if (r["date"], r["time"]) in on_disk_keys else 0
+            if fp != r["fp"]:
+                await self._db.execute(
+                    "UPDATE sessions SET files_present = ? WHERE date = ? AND time = ?",
+                    (fp, r["date"], r["time"]),
+                )
+                changed += 1
+        if changed:
+            logger.info("files_present reconciled: %d session(s) updated", changed)
+        return changed
 
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
@@ -1011,6 +1044,7 @@ class Indexer:
             WHERE tags_version >= 2
               AND COALESCE(tags_manually_corrected, 0) = 0
               AND segment_count > 0
+              AND COALESCE(files_present, 1) = 1
 {policy_sql}
         """
         params = list(policy_params)
@@ -1035,7 +1069,7 @@ class Indexer:
         policy = self._get_queue_policy()
         policy_clauses, policy_params = self._queue_policy_clauses(policy)
         base = ("tags_version >= 2 AND COALESCE(tags_manually_corrected, 0) = 0"
-                " AND segment_count > 0")
+                " AND segment_count > 0 AND COALESCE(files_present, 1) = 1")
         policy_sql = "".join(f" AND {c}" for c in policy_clauses)
 
         rows = await self._db.execute_fetchall(
