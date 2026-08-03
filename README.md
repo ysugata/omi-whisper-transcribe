@@ -430,7 +430,7 @@ python tools/build_wiki.py --mode full --domain 物販 --dry-run
 
 | メソッド | パス | 説明 |
 |----------|------|------|
-| GET | `/api/review/queue?limit=1&offset=0` | 優先度順にレビュー対象セッションを返却 (transcript 付き) |
+| GET | `/api/review/queue?limit=1&offset=0` | 優先度順にレビュー対象セッションを返却 (transcript 付き)。保持期限切れでファイル削除済みのセッション (`files_present=0`) は対象外 (accept が 404 になるため) |
 | GET | `/api/review/stats` | キュー統計 (残数、ポリシー除外内訳 `policy_excluded`、済数、今日の処理数) |
 | POST | `/api/review/accept` | セッションを承認 (`{"date","time"}`) → `manually_corrected` + `review_outcome` を書き込み + フィードバック記録 |
 | POST | `/api/review/skip` | スキップ (永続化なし、メモリのみ。リロードで再表示) |
@@ -552,7 +552,7 @@ Hotwords は Qwen3-ASR の context boost 機能を通じて自動的に適用さ
 |------|-----------|------|
 | `SAVE_AUDIO` | `true` | 録音保存 |
 | `RECORDINGS_DIR` | `./recordings` | 保存先 |
-| `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効)。日付名が古くても最近書き込まれた (mtime が新しい) ディレクトリは削除しない |
+| `MAX_RECORDING_DAYS` | `30` | 自動削除日数 (0=無効)。日付名が古くても最近書き込まれた (mtime が新しい) ディレクトリは削除しない。削除後も Viewer の DB 行は残り、`files_present=0` として管理される (詳細表示はメタデータのみ、レビューキュー・声紋学習の対象外、KC 系エクスポートは DB メタデータで代替) |
 | `SDCARD_TS_MAX_AGE_DAYS` | `7` | SD アップロードのデバイス時刻がこの日数より古い/未来なら受信時刻で保存 (0=無効) |
 | `SDCARD_MAX_PENDING` | `4` | SD アップロードのバックグラウンド処理待ち上限 (超過は 503) |
 | `CONFIG_DIR` | `./config` | ランタイム設定 (JSON) の保存先。Bridge と Viewer で共有 |
@@ -1016,6 +1016,7 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 | **SOP** | 手順書 / TODO 抽出 | steps (keypoints から), context, domain | outcomes=TODO発生/方針転換 + sanitized keypoints |
 
 - **OpenAI/ShareGPT**: sanitized KC が存在しない場合は空を返す (そのセッションはスキップ)
+- **保持期限切れセッション**: `MAX_RECORDING_DAYS` により transcript.json が削除されたセッションも、sanitized JSONL があれば DB のタグメタデータから system message を再構築してエクスポートに含まれる (Comprehensive のみ raw transcript 必須)。Preview Stats には `Sanitized済み (レコード生成対象)` として実際にレコードを生成できるセッション数が表示される
 - **Knowledge**: summary (sanitized or tags) があれば出力
 - **Decision Log**: `decision_memo` 非空 OR `outcomes` に意思決定あり OR sanitized KC の confidence≥medium
 - **SOP**: `outcomes` に TODO発生/方針転換 を含むセッションから sanitized keypoints を手順として抽出

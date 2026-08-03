@@ -13,7 +13,7 @@ import aiohttp_jinja2
 import jinja2
 from aiohttp import web
 
-from exporter import SanitizedIndex, export_session
+from exporter import SanitizedIndex, export_session, transcript_stub_from_row
 from indexer import DATE_RE, TIME_RE, Indexer
 
 logging.basicConfig(
@@ -1030,10 +1030,14 @@ async def handle_review_queue(request: web.Request) -> web.Response:
         logger.exception("Review queue query failed")
         return web.json_response({"error": str(e)}, status=500)
 
-    # Attach transcript for each item
+    # Attach transcript for each item. Skip items whose files vanished
+    # since the last sync (retention cleanup race) — accepting them would
+    # 404 because review accept writes to transcript.json.
     results = []
     for item in items:
         transcript = await indexer.get_transcript(item["date"], item["time"])
+        if transcript is None:
+            continue
         results.append({
             "session": item,
             "transcript": transcript,
@@ -1213,6 +1217,35 @@ async def handle_export_stats(request: web.Request) -> web.Response:
         logger.exception("Export stats failed")
         return web.json_response({"error": str(e)}, status=500)
 
+    # KC-sourced formats generate records from sanitized safe_training data;
+    # report how many matching sessions actually have it so the preview
+    # count is not misleading (sessions without it emit no openai/conversation
+    # records).
+    if params["format"] in ("openai", "conversation", "knowledge", "decision_log", "sop"):
+        try:
+            sanitized_index = SanitizedIndex(Path(CONFIG_DIR))
+            pairs = await indexer.get_export_sessions(
+                date_from=params["date_from"],
+                date_to=params["date_to"],
+                quality=params["quality"],
+                activity=params["activity"],
+                min_segments=params["min_segments"],
+                business_domain=params["business_domain"],
+                conversation_type=params["conversation_type"],
+                domain=params["domain"],
+                importance_v2=params["importance_v2"],
+                require_tagged=params["require_tagged"],
+                require_summary=params["require_summary"],
+                exclude_personal_only=params["exclude_personal_only"],
+                external_audio_max=params["external_audio_max"],
+                high_value_or=params["high_value_or"],
+            )
+            stats["sanitized_sessions"] = sum(
+                1 for d, t in pairs if f"{d}/{t}" in sanitized_index
+            )
+        except Exception:
+            logger.exception("Sanitized coverage check failed")
+
     # Annotate classes that would be excluded by min_class_samples
     min_cls = params["min_class_samples"]
     if min_cls > 0 and "class_breakdown" in stats:
@@ -1283,14 +1316,22 @@ async def handle_export_training(request: web.Request) -> web.Response:
     for date, time_val in session_pairs:
         try:
             transcript = await indexer.get_transcript(date, time_val)
-            if not transcript:
-                continue
             session_id = f"{date}/{time_val}"
             sanitized = (
                 sanitized_index.get(session_id)
                 if sanitized_index is not None
                 else None
             )
+            if not transcript:
+                # Retention cleanup removed transcript.json. KC-sourced
+                # formats only need tag metadata, which the DB row still
+                # holds — rebuild a stub so sanitized sessions stay exportable.
+                if sanitized is None:
+                    continue
+                row = await indexer.get_session(date, time_val)
+                if not row:
+                    continue
+                transcript = transcript_stub_from_row(row)
             out_lines = export_session(
                 fmt, session_id, transcript, speaker_mode,
                 include_monologue=include_monologue,
@@ -1446,7 +1487,26 @@ async def handle_sanitize_start(request: web.Request) -> web.Response:
             "message": "No sessions match the filters",
         })
 
-    sessions = [f"{date}/{time}" for date, time in session_pairs]
+    # Retention cleanup deletes old session files; the Bridge can only
+    # sanitize sessions whose transcript.json still exists on disk.
+    recordings = Path(RECORDINGS_DIR)
+    available = [
+        (date, time) for date, time in session_pairs
+        if (recordings / date / time / "transcript.json").exists()
+    ]
+    skipped = len(session_pairs) - len(available)
+    if skipped:
+        logger.info(
+            "Sanitize: skipping %d session(s) whose files were removed by retention",
+            skipped,
+        )
+    if not available:
+        return web.json_response({
+            "status": "no_sessions",
+            "message": "No sessions with files on disk match the filters",
+        })
+
+    sessions = [f"{date}/{time}" for date, time in available]
 
     # Forward to Bridge
     session: aiohttp.ClientSession = request.app["bridge_session"]

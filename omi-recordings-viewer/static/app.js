@@ -380,18 +380,31 @@
             detailHeader.innerHTML += sceneHtml;
         }
 
-        var audioFile = (t && t.session && t.session.audio_file) ? t.session.audio_file : "audio.ogg";
-        audioContainer.innerHTML =
-            '<audio id="audio-el" controls preload="metadata" src="/audio/' + s.date + "/" + s.time + '/' + audioFile + '"></audio>';
-        audioEl = document.getElementById("audio-el");
+        var filesDeleted = !t;
+        if (filesDeleted) {
+            // Retention cleanup removed the session files: no audio, no
+            // segments — voiceprint learning / speaker correction impossible.
+            audioContainer.innerHTML =
+                '<div class="files-deleted-notice">&#9888; 音声・詳細ファイルは保持期間終了により削除済みです（タグ・全文などのメタデータのみ表示）。声紋学習・話者修正はできません。</div>';
+            audioEl = null;
+        } else {
+            var audioFile = (t.session && t.session.audio_file) ? t.session.audio_file : "audio.ogg";
+            audioContainer.innerHTML =
+                '<audio id="audio-el" controls preload="metadata" src="/audio/' + s.date + "/" + s.time + '/' + audioFile + '"></audio>';
+            audioEl = document.getElementById("audio-el");
 
-        audioEl.addEventListener("timeupdate", onTimeUpdate);
+            audioEl.addEventListener("timeupdate", onTimeUpdate);
+        }
 
         // Reset segment speaker filter
         segmentSpeakerFilter = "";
 
-        // Always show voiceprint bar (users can create new speakers inline)
+        // Show voiceprint bar unless the session files were deleted
         var vpBar = document.getElementById("voiceprint-bar");
+        if (vpBar) {
+            if (filesDeleted) vpBar.classList.add("hidden");
+            else vpBar.classList.remove("hidden");
+        }
         var filterBar = document.getElementById("segment-filter-bar");
         var hasTagged = currentDetailSegments.some(function (seg) { return seg.person_id; });
 
@@ -423,13 +436,18 @@
         // Reset new speaker form
         var newSp = document.getElementById("voiceprint-new-speaker");
         if (newSp) newSp.classList.add("hidden");
-        if (hasTagged) {
+        if (hasTagged && !filesDeleted) {
             filterBar.classList.remove("hidden");
         } else {
             filterBar.classList.add("hidden");
         }
 
         renderSegments();
+        if (filesDeleted && s.transcript_text) {
+            // Segments are gone with the file; show the indexed full text.
+            segmentsContainer.innerHTML =
+                '<div class="segment"><span class="text">' + escapeHtml(s.transcript_text) + '</span></div>';
+        }
     }
 
     function renderSegments() {
@@ -2232,6 +2250,12 @@
                         '<div class="export-preview-line"><strong>' + data.sessions + '</strong> sessions / <strong>' + data.segments + '</strong> segments</div>' +
                         '<div class="export-preview-line">Date: ' + escapeHtml(data.date_from || "N/A") + ' ~ ' + escapeHtml(data.date_to || "N/A") + '</div>' +
                         '<div class="export-preview-line">Est. size: <strong>' + formatBytes(data.est_size_bytes) + '</strong></div>';
+                    if (data.sanitized_sessions != null) {
+                        previewHtml += '<div class="export-preview-line">Sanitized済み (レコード生成対象): <strong>' + data.sanitized_sessions + '</strong> sessions</div>';
+                        if (data.sanitized_sessions === 0) {
+                            previewHtml += '<div class="export-preview-line" style="color:#e67e22;">&#9888; Sanitized データがありません。このフォーマットは Safe Training Data 生成済みセッションからレコードを作るため、先に「Safe Training Data」で Generate を実行してください。</div>';
+                        }
+                    }
                     if (data.balanced_sessions != null) {
                         previewHtml += '<div class="export-preview-line" style="margin-top:6px;"><strong>均等化後: ' + data.balanced_sessions + '</strong> sessions</div>';
                         var bd = data.class_breakdown || {};
