@@ -168,7 +168,7 @@ class KeywordLearner:
         suggestions = self._load_suggestions()
         target = None
         for s in suggestions:
-            if s["id"] == suggestion_id:
+            if s.get("id") == suggestion_id:
                 target = s
                 break
         if not target:
@@ -193,7 +193,7 @@ class KeywordLearner:
         suggestions = self._load_suggestions()
         target = None
         for s in suggestions:
-            if s["id"] == suggestion_id:
+            if s.get("id") == suggestion_id:
                 target = s
                 break
         if not target:
@@ -292,10 +292,12 @@ class KeywordLearner:
 
     def _save_suggestions(self, suggestions: list) -> None:
         self.suggestions_path.parent.mkdir(parents=True, exist_ok=True)
-        self.suggestions_path.write_text(
+        tmp = self.suggestions_path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(suggestions, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, self.suggestions_path)
 
     def _load_taxonomy(self) -> dict:
         try:
@@ -308,11 +310,15 @@ class KeywordLearner:
         return {}
 
     def _save_taxonomy(self, data: dict) -> None:
+        # tmp + rename: tag_taxonomy.json は refiner / session_tagger と
+        # 共有される。途中で truncate されると全タグ付けが degrade する。
         self.taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
-        self.taxonomy_path.write_text(
+        tmp = self.taxonomy_path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, self.taxonomy_path)
 
     def _count_pending(self, suggestions: Optional[list] = None) -> int:
         if suggestions is None:

@@ -83,17 +83,22 @@ class SdcardUploadRegistry:
             return
         self._prune()
 
-    def _prune(self) -> None:
+    def _prune(self, drop_processing: bool = True) -> None:
+        """Apply retention.
+
+        drop_processing=True (load time): stale "processing" entries are from
+        a crashed/restarted process; drop them so the file can be uploaded
+        again. Runtime pruning must pass False — in-flight uploads are
+        legitimately in STATE_PROCESSING.
+        """
         cutoff = (
             datetime.now() - timedelta(days=REGISTRY_RETENTION_DAYS)
         ).isoformat()
-        # Stale "processing" entries are from a crashed/restarted process;
-        # drop them so the file can be uploaded again.
         before = len(self._entries)
         self._entries = {
             k: v for k, v in self._entries.items()
             if v.get("uploaded_at", "") >= cutoff
-            and v.get("state") != STATE_PROCESSING
+            and (not drop_processing or v.get("state") != STATE_PROCESSING)
         }
         if len(self._entries) != before:
             self._save()
@@ -135,6 +140,7 @@ class SdcardUploadRegistry:
             finished_at=datetime.now().isoformat(),
         )
         entry.setdefault("uploaded_at", datetime.now().isoformat())
+        self._maybe_prune()
         self._save()
 
     def mark_failed(self, key: str, error: str) -> None:
@@ -145,7 +151,17 @@ class SdcardUploadRegistry:
             finished_at=datetime.now().isoformat(),
         )
         entry.setdefault("uploaded_at", datetime.now().isoformat())
+        self._maybe_prune()
         self._save()
+
+    def _maybe_prune(self) -> None:
+        """Runtime retention: _prune() was only ever called at load, so a
+        long-lived container grew the registry (and its O(n) rewrites)
+        without bound. Every 50 mutations is plenty."""
+        self._mutations = getattr(self, "_mutations", 0) + 1
+        if self._mutations >= 50:
+            self._mutations = 0
+            self._prune(drop_processing=False)
 
     def __len__(self) -> int:
         return len(self._entries)

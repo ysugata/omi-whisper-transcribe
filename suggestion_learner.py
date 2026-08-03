@@ -39,6 +39,12 @@ class SuggestionLearner:
             mtime = self._path.stat().st_mtime
             data = json.loads(self._path.read_text(encoding="utf-8"))
             self._mtime = mtime
+            if not isinstance(data, list):
+                # A dict-shaped file would raise AttributeError inside
+                # _extract_patterns and abort bridge startup entirely.
+                log.warning("SuggestionLearner: %s is not a list, ignoring", self._path)
+                self._learned = {}
+                return
             self._learned = self._extract_patterns(data)
             if self._learned:
                 log.info(
