@@ -185,3 +185,46 @@ def test_openai_export_works_with_stub_and_sanitized():
         "openai", "2026-03-29/10-00-00", stub, "user_vs_others",
         include_monologue=False, sanitized=None,
     ) == []
+
+
+def test_decision_log_kc_only_no_crash():
+    """KC-only sanitized bucket (summary_output=None) must not TypeError."""
+    from exporter import to_decision_log
+    sanitized = {
+        "session_id": "2026-03-29/10-00-00",
+        "summary_input": None,
+        "summary_output": None,
+        "keypoints": None,
+        "safe_conversation": None,
+        "knowledge_cards": [{
+            "question": "仕入先の選定基準は？",
+            "answer": "品質と納期を最優先に、価格は二番目とする。",
+            "evidence": [],
+            "confidence": "high",
+        }],
+        "risk": "low",
+    }
+    transcript = {"session": {"tags": {}}, "segments": []}
+    rec = to_decision_log("2026-03-29/10-00-00", transcript, sanitized=sanitized)
+    assert rec is not None
+    assert rec["title"] == "Decision"
+
+
+def test_sanitized_index_dedups_training_sanitizer_kcs(tmp_path):
+    """Same KC in two safe_training files (overlapping runs) must appear once."""
+    from exporter import SanitizedIndex
+    rec = {
+        "type": "knowledge_card",
+        "input": "テスト質問はこれですか？",
+        "output": "はい、テスト回答はこれです。",
+        "session_id": "2026-03-29/10-00-00",
+        "risk_level": "low",
+    }
+    for name in ("safe_training_20260101_000000.jsonl",
+                 "safe_training_20260102_000000.jsonl"):
+        (tmp_path / name).write_text(
+            json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    idx = SanitizedIndex(tmp_path)
+    bucket = idx.get("2026-03-29/10-00-00")
+    assert len(bucket["knowledge_cards"]) == 1

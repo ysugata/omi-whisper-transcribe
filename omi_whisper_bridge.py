@@ -621,6 +621,30 @@ model_manager = ModelManager(
 )
 
 # ============================================================
+# バックグラウンドタスク管理
+# ============================================================
+
+# asyncio はタスクを弱参照でしか保持しないため、bare create_task した
+# タスクは GC で回収されて途中で消えることがある (CPython 公式ドキュメント
+# 記載の挙動)。夜間スケジューラや diarization がこれで無言停止すると
+# 致命的なので、強参照を保持し、例外もログに出す。
+_background_tasks: set = set()
+
+
+def _spawn_bg(coro, name: str = "") -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task):
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error(f"Background task {name or coro!r} failed: {t.exception()!r}")
+
+    task.add_done_callback(_done)
+    return task
+
+
+# ============================================================
 # 古い録音の自動クリーンアップ
 # ============================================================
 
@@ -1464,6 +1488,15 @@ def _find_undiarized_sessions(force: bool = False) -> list[dict]:
             if not force and session_info.get("diarized"):
                 continue
 
+            # 恒久的に失敗するセッションを除外: 1秒未満の音声は diarizer が
+            # 必ず ValueError を投げるため、毎晩リトライしても無駄。
+            # 失敗マーカー (diarize_attempts) が規定回数に達したものも除外。
+            duration = session_info.get("duration_seconds") or 0
+            if not force and 0 < duration < 1.0:
+                continue
+            if not force and session_info.get("diarize_attempts", 0) >= 3:
+                continue
+
             # 音声ファイル特定
             audio_file = session_info.get("audio_file", "audio.ogg")
             audio_path = time_dir / audio_file
@@ -1555,12 +1588,49 @@ async def _batch_diarize_task(force: bool = False):
                             err_msg = f"{sess['path']}: diarization failed"
                             _batch_state["errors"].append(err_msg)
                             log.warning(f"Batch diarize failed: {sess['path']}")
+                            # 失敗を transcript に永続化しないと、翌晩また同じ
+                            # セッションを選択して永遠にリトライし続ける。
+                            try:
+                                with open(sess["transcript_path"], encoding="utf-8") as f:
+                                    fresh = json.load(f)
+                                si = fresh.setdefault("session", {})
+                                si["diarize_attempts"] = int(si.get("diarize_attempts", 0)) + 1
+                                tmp_path = str(sess["transcript_path"]) + ".tmp"
+                                with open(tmp_path, "w", encoding="utf-8") as f:
+                                    json.dump(fresh, f, ensure_ascii=False, indent=2)
+                                os.replace(tmp_path, str(sess["transcript_path"]))
+                            except Exception:
+                                log.warning(
+                                    "Failed to persist diarize_attempts for %s",
+                                    sess["path"],
+                                )
                             continue
 
-                        # Safe write: tmp + rename
+                        # Safe write: tmp + rename. Re-read the file first —
+                        # the snapshot in sess["data"] is hours old by now and
+                        # writing it back would erase tags / LLM corrections
+                        # made since the batch started (lost update).
                         data = sess["data"]
-                        data["segments"] = updated
-                        data["session"]["diarized"] = True
+                        try:
+                            with open(sess["transcript_path"], encoding="utf-8") as f:
+                                fresh = json.load(f)
+                        except (json.JSONDecodeError, OSError):
+                            fresh = None
+                        if fresh is not None:
+                            fresh_segments = fresh.get("segments", [])
+                            if len(fresh_segments) == len(updated):
+                                # Graft only the diarization result onto the
+                                # current segments (texts may have been
+                                # corrected meanwhile).
+                                for fs, us in zip(fresh_segments, updated):
+                                    if "speaker" in us:
+                                        fs["speaker"] = us["speaker"]
+                            else:
+                                fresh["segments"] = updated
+                            data = fresh
+                        else:
+                            data["segments"] = updated
+                        data.setdefault("session", {})["diarized"] = True
                         speakers = set(s.get("speaker", "SPEAKER_00") for s in updated)
                         data["session"]["num_speakers"] = len(speakers)
 
@@ -1584,6 +1654,10 @@ async def _batch_diarize_task(force: bool = False):
                     await asyncio.sleep(0)
             finally:
                 await loop.run_in_executor(None, lambda: diarizer.unload_pipeline(pipeline))
+                # This frame's reference kept the ~2GB model alive through the
+                # empty_cache() above — drop it and flush again for real.
+                pipeline = None
+                await loop.run_in_executor(None, diarizer._free_vram)
                 gc.collect()
 
     except Exception as e:
@@ -2058,14 +2132,34 @@ async def _batch_combined_tag_task(force: bool = False):
                             ),
                         )
 
-                        # Preserve manually_tagged segments
-                        for i, orig in enumerate(original_segments):
-                            if orig.get("manually_tagged") and i < len(updated):
-                                updated[i] = orig
-
+                        # Re-read before write (lost-update guard): the batch
+                        # snapshot is loaded up-front, so writing it back would
+                        # erase corrections made while the batch was running —
+                        # including manually_tagged set from the viewer.
                         data = sess["data"]
-                        data["segments"] = updated
-                        data["session"]["speaker_tagged"] = True
+                        try:
+                            with open(sess["transcript_path"], encoding="utf-8") as f:
+                                fresh = json.load(f)
+                        except (json.JSONDecodeError, OSError):
+                            fresh = None
+                        if fresh is not None and len(fresh.get("segments", [])) == len(updated):
+                            fresh_segments = fresh["segments"]
+                            for i, us in enumerate(updated):
+                                fs = fresh_segments[i]
+                                if fs.get("manually_tagged"):
+                                    continue
+                                for key in ("person_id", "person_name",
+                                            "is_user", "speaker_similarity"):
+                                    if key in us:
+                                        fs[key] = us[key]
+                            data = fresh
+                        else:
+                            # Preserve manually_tagged segments (snapshot view)
+                            for i, orig in enumerate(original_segments):
+                                if orig.get("manually_tagged") and i < len(updated):
+                                    updated[i] = orig
+                            data["segments"] = updated
+                        data.setdefault("session", {})["speaker_tagged"] = True
 
                         tmp_path = str(sess["transcript_path"]) + ".tmp"
                         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2118,7 +2212,7 @@ async def _batch_combined_tag_task(force: bool = False):
                     sess_data["audio_scene"] = result
                     session_json = os.path.join(sess_dir, "session.json")
                     tmp_path = session_json + ".tmp"
-                    with open(tmp_path, "w") as f:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(sess_data, f, ensure_ascii=False, indent=2)
                     os.replace(tmp_path, session_json)
                     log.info("Audio scene for %s: %s", os.path.basename(sess_dir), result.get("scene_label", "unknown"))
@@ -2136,10 +2230,18 @@ async def _batch_combined_tag_task(force: bool = False):
         # PANNs runs on CPU, voice tag on GPU — no resource conflict.
         st["phase"] = "voice_tag+audio_scene"
         log.info("Combined tag: starting voice tag (GPU) + audio scene (CPU) in parallel")
-        await asyncio.gather(
+        # return_exceptions: gather のデフォルトは最初の例外で即座に伝播する
+        # が、もう一方のフェーズはキャンセルされず走り続ける。その状態で
+        # finally が running=False を立てると、二重バッチ起動を許してしまう。
+        results = await asyncio.gather(
             _run_voice_tag_phase(),
             _run_audio_scene_phase(),
+            return_exceptions=True,
         )
+        for name, r in zip(("voice_tag", "audio_scene"), results):
+            if isinstance(r, BaseException):
+                log.error(f"Combined tag: {name} phase failed: {r!r}")
+                st["errors"].append(f"{name}: {r}")
 
         # --- Phase 2: Session Tag (LLM) ---
         # 声紋タグ済みのセグメントを使って LLM タグ付けを実行する。
@@ -2212,6 +2314,7 @@ async def _batch_combined_tag_task(force: bool = False):
                 except Exception as e:
                     log.warning(f"Gemini genai init failed for session tag batch, falling back to sync: {e}")
 
+            needs_sync_fallback = False
             if batch_candidates and genai_client and not st["cancel_requested"]:
                 # Build batch requests
                 batch_requests = []
@@ -2252,6 +2355,17 @@ async def _batch_combined_tag_task(force: bool = False):
                             if state == "JOB_STATE_SUCCEEDED":
                                 log.info(f"Combined tag: Batch API completed → {batch_result.name}")
                                 responses = list(genai_client.batches.list_results(name=batch_result.name))
+                                if len(responses) != len(batch_session_map):
+                                    # Positional zip below assumes 1:1 order;
+                                    # a dropped/reordered response would write
+                                    # tags to the WRONG session silently.
+                                    log.error(
+                                        "Combined tag: Batch API returned %d responses "
+                                        "for %d requests — positional mapping unsafe, "
+                                        "falling back to sync",
+                                        len(responses), len(batch_session_map),
+                                    )
+                                    break
                                 for i, resp in enumerate(responses):
                                     if i >= len(batch_session_map):
                                         break
@@ -2287,12 +2401,17 @@ async def _batch_combined_tag_task(force: bool = False):
                         # Sync fallback: timeout, failed, or cancelled
                         if not _batch_tag_done and not st["cancel_requested"]:
                             log.info(f"Combined tag: sync fallback for {len(batch_session_map)} session(s)")
+                            # genai_client is still set here, so the flag is the
+                            # only way the fallback below actually runs (it was
+                            # dead code before: timeout/JOB_STATE_FAILED left
+                            # sessions untagged and re-submitted every night).
+                            needs_sync_fallback = True
                     except Exception as e:
                         log.error(f"Combined tag: Batch API submit failed: {e}, falling back to sync")
                         genai_client = None  # fall through to sync
 
             # Sync fallback for sessions that weren't batch-processed
-            if not genai_client and batch_candidates and not st["cancel_requested"]:
+            if (needs_sync_fallback or not genai_client) and batch_candidates and not st["cancel_requested"]:
                 for sess, fresh_data, segments, audio_scene in batch_candidates:
                     if st["cancel_requested"]:
                         break
@@ -2485,7 +2604,12 @@ async def _batch_vibevoice_task(force: bool = False):
 
             # Acquire GPU lock, unload Whisper, load VibeVoice
             async with model_manager.gpu_lock:
-                await model_manager.force_unload(wait_sessions=True)
+                if not await model_manager.force_unload(wait_sessions=True):
+                    # Whisper がまだ VRAM に残ったまま VibeVoice をロードすると
+                    # OOM 一直線なので、このフェーズは中止して次回に回す。
+                    log.error("VibeVoice batch: Whisper unload failed (active sessions) — aborting phase")
+                    st["errors"].append("whisper unload failed; phase aborted")
+                    return
                 try:
                     await loop.run_in_executor(None, vibevoice_transcriber.load_model)
 
@@ -2796,6 +2920,18 @@ async def _nightly_scheduler():
 
         phase_errors = []
         try:
+            # Phase 0: Retention cleanup — 以前は起動時にしか実行されず、
+            # コンテナが数ヶ月動き続けると MAX_RECORDING_DAYS が事実上
+            # 無効になっていた (4月のディレクトリが8月まで残存)。
+            try:
+                _nightly_state["phase"] = "cleanup"
+                await asyncio.get_running_loop().run_in_executor(
+                    None, cleanup_old_recordings
+                )
+            except Exception as e:
+                log.error("Nightly scheduler: Phase 0 (cleanup) error: %s", e)
+                phase_errors.append(f"cleanup: {e}")
+
             # Phase 1: Diarize
             if diarizer is not None:
                 try:
@@ -2941,7 +3077,10 @@ async def handle_connection(websocket):
     session_start = time.time()
     total_audio_seconds = 0.0
     recorder_audio_seconds = 0.0  # WAV に実際に書き込んだ秒数 (録音用オフセット)
-    recorder = SessionRecorder()
+    # 遅延生成: コンストラクタがディレクトリ作成 + WAV オープンを行うため、
+    # GPU busy で早期リターンする接続ごとに空ディレクトリと open fd が
+    # リークしていた。最初の発話チャンクで _transcribe_chunk が生成する。
+    recorder = None
     last_speech_time = time.time()  # 最後に発話を検出した時刻 (セッション管理用)
     last_vad_check_len = 0  # 前回 VAD チェック時のバッファ長 (bytes)
 
@@ -2964,21 +3103,6 @@ async def handle_connection(websocket):
     # セッション内で文脈を維持し、用語の一貫性・漢字変換精度を向上させる
     prompt_carry_text = ""  # PROMPT_CARRY_ENABLED=false の場合は常に空のまま
 
-    # Realtime voice filter: load embedding model if enabled + user speakers exist
-    voice_filter_inference = None
-    if VOICE_FILTER_ENABLED and speaker_filter and speaker_filter.enabled:
-        user_speakers = speaker_filter.get_user_speakers()
-        if user_speakers:
-            try:
-                voice_filter_inference = speaker_filter._load_model()
-                log.info(f"Voice filter: ENABLED ({len(user_speakers)} user speaker(s), "
-                         f"threshold={VOICE_FILTER_THRESHOLD or speaker_filter.get_threshold()})")
-            except Exception as e:
-                log.warning(f"Voice filter: model load failed, continuing without filter: {e}")
-                voice_filter_inference = None
-        else:
-            log.warning("Voice filter: ENABLED but no user speakers with embeddings registered")
-
     # モデル確保 (未ロードなら自動ロード)
     # バッチ処理中 (diarize/speaker-tag) は gpu_lock が保持されるため
     # タイムアウトで早期にリジェクトする
@@ -2992,6 +3116,27 @@ async def handle_connection(websocket):
         log.error(f"Failed to acquire model: {e}", exc_info=True)
         await websocket.close(1013, "Model unavailable")
         return
+
+    # Realtime voice filter: load embedding model if enabled + user speakers
+    # exist. acquire() の後にロードする — 以前は acquire 前に同期ロードして
+    # いたため、(a) バッチ実行中でも VRAM にモデルを積んで OOM を誘発し、
+    # (b) イベントループをブロックし、(c) GPU busy リジェクト時にモデルが
+    # アンロードされずリークしていた。
+    voice_filter_inference = None
+    if VOICE_FILTER_ENABLED and speaker_filter and speaker_filter.enabled:
+        user_speakers = speaker_filter.get_user_speakers()
+        if user_speakers:
+            try:
+                voice_filter_inference = await asyncio.get_running_loop().run_in_executor(
+                    None, speaker_filter._load_model
+                )
+                log.info(f"Voice filter: ENABLED ({len(user_speakers)} user speaker(s), "
+                         f"threshold={VOICE_FILTER_THRESHOLD or speaker_filter.get_threshold()})")
+            except Exception as e:
+                log.warning(f"Voice filter: model load failed, continuing without filter: {e}")
+                voice_filter_inference = None
+        else:
+            log.warning("Voice filter: ENABLED but no user speakers with embeddings registered")
 
     async def _transcribe_chunk(chunk: bytes):
         """チャンクを文字起こしして結果を送信する共通処理。"""
@@ -3076,12 +3221,14 @@ async def handle_connection(websocket):
         """Finalize recorder and enqueue for batch LLM correction."""
         rec.finalize()
 
-        # Enqueue for async LLM correction + tagging (Layer 3)
-        if batch_corrector and rec.enabled and not rec._finalized:
-            pass  # finalize failed or empty session
-        elif (batch_corrector and rec.enabled
-              and hasattr(rec, 'session_dir') and rec.session_dir
-              and len(rec.all_segments) > 0):
+        # Enqueue for async LLM correction + tagging (Layer 3).
+        # finalize() は空セッション (total_bytes==0) のディレクトリを削除する
+        # ことがあるため、session_dir.exists() を確認しないと存在しないパスを
+        # キューに積んで毎回失敗する (SDカード側 handler と同じガード)。
+        if (batch_corrector and rec.enabled
+                and hasattr(rec, 'session_dir') and rec.session_dir
+                and rec.session_dir.exists()
+                and len(rec.all_segments) > 0):
             session_id = str(rec.session_dir.relative_to(RECORDINGS_DIR))
             batch_corrector.enqueue(session_id)
 
@@ -3258,7 +3405,7 @@ async def handle_connection(websocket):
                 and not recorder._finalized
                 and recorder.total_bytes > 0):
             recorder.close_audio()
-            asyncio.create_task(_run_diarization_bg(recorder))
+            _spawn_bg(_run_diarization_bg(recorder), name='diarization_bg')
         else:
             # diarization なし → タグ付け + finalize
             if recorder is not None:
@@ -3366,7 +3513,7 @@ async def main():
             log.info("RAG index loaded: %d sessions", rag_classifier.session_count())
         else:
             log.info("RAG index not found, building in background...")
-            asyncio.create_task(_auto_build_rag_index())
+            _spawn_bg(_auto_build_rag_index(), name='auto_build_rag')
 
     # Batch corrector initialization (needs known_terms which depend on term_corrector + hotword_loader)
     if llm_pipeline:
@@ -3532,7 +3679,10 @@ async def main():
                 "message": "All sessions already diarized",
             })
 
-        asyncio.create_task(_batch_diarize_task(force=force))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_state["running"] = True
+        _spawn_bg(_batch_diarize_task(force=force), name='batch_diarize')
         return web.json_response({"status": "started", "total": len(sessions)})
 
     async def handle_batch_status(request):
@@ -3698,8 +3848,12 @@ async def main():
             seg["speaker_similarity"] = 1.0
             seg["manually_tagged"] = True
 
-        with open(transcript_path, "w", encoding="utf-8") as f:
+        # tmp + rename: transcript.json は source of truth なので、書き込み
+        # 途中のクラッシュで truncate されると復旧不能になる
+        tmp_path = str(transcript_path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, str(transcript_path))
 
         result = {
             "status": "ok",
@@ -3901,7 +4055,10 @@ async def main():
                 "message": "All sessions already tagged",
             })
 
-        asyncio.create_task(_batch_tag_task(force=force))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_tag_state["running"] = True
+        _spawn_bg(_batch_tag_task(force=force), name='batch_tag')
         return web.json_response({"status": "started", "total": len(sessions)})
 
     async def handle_speakers_tag_status(request):
@@ -3968,7 +4125,10 @@ async def main():
                 "message": "All sessions already tagged",
             })
 
-        asyncio.create_task(_batch_session_tag_task(force=force))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_session_tag_state["running"] = True
+        _spawn_bg(_batch_session_tag_task(force=force), name='batch_session_tag')
         return web.json_response({"status": "started", "total": len(sessions)})
 
     async def handle_session_tag_status(request):
@@ -4009,7 +4169,10 @@ async def main():
                 "message": "All sessions already tagged",
             })
 
-        asyncio.create_task(_batch_combined_tag_task(force=force))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_combined_tag_state["running"] = True
+        _spawn_bg(_batch_combined_tag_task(force=force), name='batch_combined_tag')
         return web.json_response({
             "status": "started",
             "total": len(st_sessions) + len(vt_sessions),
@@ -4049,7 +4212,10 @@ async def main():
                 "message": "All sessions already transcribed by VibeVoice",
             })
 
-        asyncio.create_task(_batch_vibevoice_task(force=force))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_vibevoice_state["running"] = True
+        _spawn_bg(_batch_vibevoice_task(force=force), name='batch_vibevoice')
         return web.json_response({
             "status": "started",
             "total": len(sessions),
@@ -4234,7 +4400,10 @@ async def main():
                 {"error": "sessions list required"}, status=400
             )
 
-        asyncio.create_task(_batch_sanitize_task(sessions))
+        # 二重起動ガード: タスク内で running=True になるまでの間に
+        # もう一度 start が呼ばれると素通りするため、ここで立てる
+        _batch_sanitize_state["running"] = True
+        _spawn_bg(_batch_sanitize_task(sessions), name='batch_sanitize')
         return web.json_response({
             "status": "started",
             "total": len(sessions),
@@ -4429,7 +4598,7 @@ async def main():
         # Reset in-memory index
         rag_classifier._embeddings = None
         rag_classifier._metadata = []
-        asyncio.create_task(_auto_build_rag_index())
+        _spawn_bg(_auto_build_rag_index(), name='auto_build_rag')
         return web.json_response({"status": "rebuild_started"})
 
     # --- Taxonomy Refiner API ---
@@ -4447,7 +4616,7 @@ async def main():
             except Exception as e:
                 log.error("Taxonomy refine task error: %s", e)
 
-        asyncio.create_task(_run_refine())
+        _spawn_bg(_run_refine(), name='taxonomy_refine')
         return web.json_response({"status": "started"})
 
     async def handle_taxonomy_refine_status(request):
@@ -4531,7 +4700,7 @@ async def main():
                 if NIGHTLY_SCHEDULE_HOUR > 0:
                     _nightly_state["next_run"] = _calc_next_nightly(NIGHTLY_SCHEDULE_HOUR)
 
-        asyncio.create_task(_run_nightly_now())
+        _spawn_bg(_run_nightly_now(), name='nightly_now')
         return web.json_response({"status": "started"})
 
     # --- SD カード一括アップロード ---
@@ -4888,7 +5057,7 @@ async def main():
 
         # Start nightly scheduler
         if NIGHTLY_SCHEDULE_HOUR > 0:
-            asyncio.create_task(_nightly_scheduler())
+            _spawn_bg(_nightly_scheduler(), name='nightly_scheduler')
         else:
             log.info("Nightly scheduler: DISABLED (NIGHTLY_SCHEDULE_HOUR=0)")
 

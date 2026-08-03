@@ -103,7 +103,13 @@ class Diarizer:
         return pipeline
 
     def unload_pipeline(self, pipeline):
-        """Unload pipeline and free VRAM."""
+        """Unload pipeline and free VRAM.
+
+        NOTE: `del pipeline` only drops THIS frame's reference — the caller
+        must also drop its own reference (pipeline = None) and then call
+        _free_vram(), otherwise empty_cache() runs while the ~2GB model is
+        still alive and nothing is actually released.
+        """
         del pipeline
         self._free_vram()
         log.info("Diarization model unloaded, VRAM released")
@@ -144,6 +150,8 @@ class Diarizer:
             result = self._run_pipeline_with(pipeline, audio_path, segments, min_speakers, max_speakers)
         finally:
             self.unload_pipeline(pipeline)
+            pipeline = None
+            self._free_vram()
         return result
 
     def _run_pipeline_with(

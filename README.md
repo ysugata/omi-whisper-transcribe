@@ -225,6 +225,13 @@ open http://localhost:8092
 バッチ diarize 開始時には Whisper モデルを unload して RAM/VRAM を解放する
 (OOM 対策)。
 
+実行フェーズ: Phase 0 = 録音保持期限クリーンアップ (`MAX_RECORDING_DAYS`、
+起動時に加えて毎晩実行) → Phase 1 = diarize → Phase 2 = combined tag →
+Phase 3 = 月次タクソノミー refine。diarize は音声 1 秒未満のセッションを
+スキップし、失敗したセッションは `diarize_attempts` を transcript に記録して
+3 回で打ち切る (無限リトライ防止)。Gemini Batch API がタイムアウト/失敗した
+場合は同期タグ付けにフォールバックする。
+
 ### SD カード一括アップロード (OPUS)
 
 Omi CV1 SD カードに溜めた OPUS 音声を HTTP で一括アップロードし、
@@ -1036,7 +1043,7 @@ Viewer の **Export** タブまたは API からセッションデータを JSON
 | `min_segments` | 最小セグメント数 | 3 |
 | `max_per_class` | conversation_type ごとの最大件数 (クラス均等化) | 0 (無制限) |
 | `min_class_samples` | この件数未満のクラスを除外 (過学習防止) | 0 (除外なし) |
-| `val_ratio` | 検証データの割合 (0.2=20%)。>0 で ZIP (train+val) 出力 | 0 (分割なし) |
+| `val_ratio` | 検証データの割合 (0.2=20%)。>0 で ZIP (train+val) 出力。分割は**セッション単位** (同一会話由来のレコードが train/val に跨ってリークしない) | 0 (分割なし) |
 | `include_monologue` | 独白セッションを含めるか | フォーマットによる |
 | `require_tagged` | session_tagged=1 のみ (KC 抽出に必須) | false |
 | `require_summary` | tags.summary 非空のみ | false |

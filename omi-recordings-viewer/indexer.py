@@ -437,6 +437,18 @@ class Indexer:
             logger.info("files_present reconciled: %d session(s) updated", changed)
         return changed
 
+    async def mark_files_missing(self, date: str, time: str) -> None:
+        """Mark a single session as having no files on disk (and commit).
+
+        Used when a handler discovers mid-request that a session's files
+        vanished (retention cleanup race between two sync ticks).
+        """
+        await self._db.execute(
+            "UPDATE sessions SET files_present = 0 WHERE date = ? AND time = ?",
+            (date, time),
+        )
+        await self._db.commit()
+
     async def get_sessions(
         self, page: int = 1, per_page: int = 20, query: str = "",
         activity: str = "", mood: str = "",
@@ -836,7 +848,7 @@ class Indexer:
             #   importance 中+ / 有用 conv_type / decision_memo 非空 /
             #   outcomes に実質的アウトカムを含む
             useful_conv_types = (
-                "ミーティング", "アイデア出し", "商談",
+                "ミーティング", "社内ミーティング", "アイデア出し", "商談",
                 "顧客ヒアリング", "1on1", "外部セミナー",
             )
             useful_outcomes = (
@@ -1077,7 +1089,7 @@ class Indexer:
                    SUM(CASE WHEN {base}{policy_sql} THEN 1 ELSE 0 END) AS total_pending,
                    SUM(CASE WHEN {base} THEN 1 ELSE 0 END) AS total_raw,
                    SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 THEN 1 ELSE 0 END) AS total_reviewed,
-                   SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 AND tags_corrected_at >= date('now') THEN 1 ELSE 0 END) AS reviewed_today
+                   SUM(CASE WHEN COALESCE(tags_manually_corrected, 0) = 1 AND tags_corrected_at >= date('now', 'localtime') THEN 1 ELSE 0 END) AS reviewed_today
                FROM sessions""",
             policy_params,
         )

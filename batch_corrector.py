@@ -152,6 +152,25 @@ class BatchCorrector:
                     if not job.finished_at:
                         job.finished_at = datetime.now().isoformat()
                 self._jobs[job.session_id] = job
+
+            # Prune terminal jobs whose recordings were deleted by retention:
+            # without this the queue file grows forever (observed: 2341 jobs /
+            # 1.4MB spanning 4 months) and every state change rewrites all of
+            # it synchronously on the event loop. Only dir-less jobs are safe
+            # to drop — existing dirs may lack the llm_corrected flag and
+            # would be re-enqueued by _recover_unprocessed_sessions.
+            terminal = (JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED)
+            before = len(self._jobs)
+            self._jobs = {
+                sid: j for sid, j in self._jobs.items()
+                if j.status not in terminal
+                or os.path.isdir(os.path.join(self._recordings_dir, sid))
+            }
+            pruned = before - len(self._jobs)
+            if pruned:
+                log.info("BatchCorrector: pruned %d job(s) for deleted sessions", pruned)
+                self._save_queue()
+
             queued = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_QUEUED)
             submitted = sum(1 for j in self._jobs.values() if j.status == JOB_STATUS_SUBMITTED)
             if queued or submitted:
@@ -337,30 +356,42 @@ class BatchCorrector:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                pass
+            except Exception:
                 pass
         log.info("BatchCorrector: worker stopped")
 
     async def _worker_loop(self):
-        """Main worker loop: poll for queued jobs and check submitted jobs."""
-        while self._running:
-            # 1. Process queued jobs (correction phase)
-            job = self._next_queued_job()
-            if job is not None:
-                if self._mode == "batch":
-                    await self._submit_batch_job(job)
-                else:
-                    await self._process_sync(job)
-                continue
+        """Main worker loop: poll for queued jobs and check submitted jobs.
 
-            # 2. Check submitted batch jobs for completion
-            if self._mode == "batch":
-                submitted = [j for j in self._jobs.values()
-                             if j.status == JOB_STATUS_SUBMITTED]
-                for sjob in submitted:
-                    await self._check_batch_result(sjob)
+        個々のジョブ処理外で例外が漏れるとワーカーが無言で死に、以降
+        LLM 補正が一切走らなくなるため、ループ全体を防御する。
+        """
+        try:
+            while self._running:
+                try:
+                    # 1. Process queued jobs (correction phase)
+                    job = self._next_queued_job()
+                    if job is not None:
+                        if self._mode == "batch":
+                            await self._submit_batch_job(job)
+                        else:
+                            await self._process_sync(job)
+                        continue
 
-            await asyncio.sleep(5 if self._mode == "sync" else self._batch_poll_interval)
+                    # 2. Check submitted batch jobs for completion
+                    if self._mode == "batch":
+                        submitted = [j for j in self._jobs.values()
+                                     if j.status == JOB_STATUS_SUBMITTED]
+                        for sjob in submitted:
+                            await self._check_batch_result(sjob)
+                except Exception:
+                    log.exception("BatchCorrector: worker loop error (continuing)")
+
+                await asyncio.sleep(5 if self._mode == "sync" else self._batch_poll_interval)
+        finally:
+            self._running = False
 
     def _next_queued_job(self) -> Optional[BatchJob]:
         """Get the next queued job (FIFO by created_at)."""
@@ -803,17 +834,22 @@ class BatchCorrector:
                 if orig.get("text", "") != corr.get("text", ""):
                     orig["text"] = corr["text"]
 
-            session_meta = transcript_data.get("session", {})
-            session_meta["llm_corrected"] = True
-            session_meta["llm_corrected_at"] = datetime.now().isoformat()
-            session_meta["llm_stages"] = stages_run
-            session_meta["llm_api_calls"] = api_calls
+        # llm_corrected は変更ゼロでも必ず書く: このフラグが無いと
+        # _recover_unprocessed_sessions が再起動のたびに同じセッションを
+        # 再エンキューし、LLM 課金を払い直す (queue 履歴だけが再処理を
+        # 防いでいたため、履歴の prune もできなかった)。
+        session_meta = transcript_data.get("session", {})
+        session_meta["llm_corrected"] = True
+        session_meta["llm_corrected_at"] = datetime.now().isoformat()
+        session_meta["llm_stages"] = stages_run
+        session_meta["llm_api_calls"] = api_calls
 
-            tmp_path = transcript_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(transcript_data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, transcript_path)
+        tmp_path = transcript_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(transcript_data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, transcript_path)
 
+        if changes > 0:
             log.info(
                 "BatchCorrector: session %s corrected %d segment(s), "
                 "stages=%s, api_calls=%d",

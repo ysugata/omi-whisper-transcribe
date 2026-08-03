@@ -53,9 +53,19 @@
     }
 
     function escapeHtml(text) {
-        var d = document.createElement("div");
-        d.textContent = text;
-        return d.innerHTML;
+        // String-replace instead of textContent/innerHTML: the DOM round-trip
+        // does not escape quotes, which breaks (and allows injection into)
+        // attribute contexts like value="..." / data-id="...".
+        return String(text == null ? "" : text)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function cssEscape(v) {
+        return (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\\]]/g, "\\$&");
     }
 
     // --- API ---
@@ -185,7 +195,7 @@
                     html += '<span class="tag-badge activity">' + escapeHtml(s.tags_activity.replace(/_/g, " ")) + '</span>';
                 }
                 if (s.tags_mood) {
-                    html += '<span class="tag-badge mood-' + s.tags_mood + '">' + escapeHtml(s.tags_mood) + '</span>';
+                    html += '<span class="tag-badge mood-' + escapeHtml(s.tags_mood) + '">' + escapeHtml(s.tags_mood) + '</span>';
                 }
                 if (s.tags_topics) {
                     var topics = s.tags_topics.split(",");
@@ -258,7 +268,10 @@
         currentDetailTime = s.time;
         currentDetailSegments = (t && t.segments) ? t.segments : [];
 
-        detailHeader.innerHTML =
+        // Build the whole header as one string and assign innerHTML once:
+        // incremental `innerHTML +=` re-creates all children, silently
+        // destroying listeners bound to earlier elements (the 編集 button).
+        var headerHtml =
             "<h2>" + formatDateTime(s.date, s.time) + "</h2>" +
             '<div class="meta">' +
             "<span>Duration: " + formatDuration(s.duration_seconds) + "</span>" +
@@ -267,8 +280,23 @@
             (s.audio_size_mb ? "<span>Size: " + s.audio_size_mb.toFixed(1) + " MB</span>" : "") +
             "</div>";
 
-        // Tag info in detail — V2 preferred, V1 fallback
+        // Tag info in detail — V2 preferred, V1 fallback. When the transcript
+        // file was deleted by retention, rebuild the tags from the DB row so
+        // metadata stays visible (read-only: the editor writes to the file).
         var tags = (t && t.session && t.session.tags) ? t.session.tags : null;
+        var tagsEditable = !!t;
+        if (!tags && s.tags_conversation_type) {
+            tags = {
+                conversation_type: s.tags_conversation_type,
+                outcomes: s.tags_outcomes ? s.tags_outcomes.split(",").map(function (x) { return x.trim(); }) : [],
+                domains: s.tags_domains ? s.tags_domains.split(",").map(function (x) { return x.trim(); }) : [],
+                importance: s.tags_importance_v2,
+                quality: s.tags_quality,
+                summary: s.tags_summary,
+                decision_memo: s.tags_decision_memo,
+                external_audio_ratio: s.tags_external_audio,
+            };
+        }
         if (tags) {
             var isV2Detail = !!tags.conversation_type;
             var tagsHtml = '<div class="detail-tags">';
@@ -292,7 +320,7 @@
             } else {
                 if (tags.activity) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.activity.replace(/_/g, " ")) + '</span>';
                 if (tags.intent) tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.intent.replace(/_/g, " ")) + '</span>';
-                if (tags.mood) tagsHtml += '<span class="tag-badge mood-' + tags.mood + '">' + escapeHtml(tags.mood) + '</span>';
+                if (tags.mood) tagsHtml += '<span class="tag-badge mood-' + escapeHtml(tags.mood) + '">' + escapeHtml(tags.mood) + '</span>';
                 if (tags.quality) tagsHtml += '<span class="tag-badge topic">' + escapeHtml(tags.quality) + '</span>';
                 if (tags.topics) {
                     for (var tti = 0; tti < tags.topics.length; tti++) {
@@ -305,35 +333,29 @@
                     tagsHtml += '<span class="tag-badge activity">' + escapeHtml(tags.entities[tei]) + '</span>';
                 }
             }
-            if (isV2Detail) {
+            if (isV2Detail && tagsEditable) {
                 tagsHtml += ' <button class="btn-sm tag-edit-btn" id="tag-edit-trigger">&#9998; 編集</button>';
             }
             tagsHtml += '</div>';
-            detailHeader.innerHTML += tagsHtml;
-            if (isV2Detail) {
-                detailHeader.innerHTML += '<div id="tag-editor-container" style="display:none"></div>';
+            headerHtml += tagsHtml;
+            if (isV2Detail && tagsEditable) {
+                headerHtml += '<div id="tag-editor-container" style="display:none"></div>';
             }
             if (tags.summary) {
-                detailHeader.innerHTML += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
+                headerHtml += '<div class="detail-summary">' + escapeHtml(tags.summary) + '</div>';
             }
             if (isV2Detail && tags.decision_memo) {
-                detailHeader.innerHTML += '<div class="detail-decision-memo">&#9997; ' + escapeHtml(tags.decision_memo) + '</div>';
+                headerHtml += '<div class="detail-decision-memo">&#9997; ' + escapeHtml(tags.decision_memo) + '</div>';
             }
             if (isV2Detail && tags.external_audio_ratio != null && tags.external_audio_ratio >= 0.5) {
-                detailHeader.innerHTML += '<div class="detail-external-audio">&#128250; 外部音声比率: ' + Math.round(tags.external_audio_ratio * 100) + '% (unknown speaker)</div>';
-            }
-            // Wire up tag edit button
-            var editBtn = document.getElementById("tag-edit-trigger");
-            if (editBtn) {
-                editBtn.addEventListener("click", function () {
-                    showTagEditor(s.date, s.time, tags);
-                });
+                headerHtml += '<div class="detail-external-audio">&#128250; 外部音声比率: ' + Math.round(tags.external_audio_ratio * 100) + '% (unknown speaker)</div>';
             }
         }
 
         // Audio scene section (with extended dimensions)
+        var sceneHtml = "";
         if (s.tags_audio_scene || s.tags_audio_noise_sources || s.tags_audio_events || s.tags_audio_speaker_count) {
-            var sceneHtml = '<div class="detail-audio-scene">';
+            sceneHtml = '<div class="detail-audio-scene">';
             if (s.tags_audio_scene) {
                 sceneHtml += '<div class="scene-row">';
                 sceneHtml += '<span class="scene-label">シーン:</span> ' + escapeHtml(s.tags_audio_scene);
@@ -377,7 +399,16 @@
                 sceneHtml += '</div>';
             }
             sceneHtml += '</div>';
-            detailHeader.innerHTML += sceneHtml;
+        }
+        headerHtml += sceneHtml;
+        detailHeader.innerHTML = headerHtml;
+
+        // Wire up tag edit button (bind AFTER the final innerHTML assignment)
+        var editBtn = document.getElementById("tag-edit-trigger");
+        if (editBtn) {
+            editBtn.addEventListener("click", function () {
+                showTagEditor(s.date, s.time, tags);
+            });
         }
 
         var filesDeleted = !t;
@@ -454,6 +485,7 @@
         var segments = currentDetailSegments;
         if (segments.length === 0) {
             segmentsContainer.innerHTML = '<div class="loading">No segments</div>';
+            updateVoiceprintSelection();
             return;
         }
 
@@ -489,7 +521,7 @@
                 var unknownLabel = seg.speaker ? ("? " + seg.speaker) : "?";
                 html += '<span class="speaker-badge unknown-speaker clickable" data-seg-idx="' + idx + '">' + escapeHtml(unknownLabel) + '</span>';
             } else {
-                html += '<span class="segment-speaker">' + (seg.speaker || "") + "</span>";
+                html += '<span class="segment-speaker">' + escapeHtml(seg.speaker || "") + "</span>";
             }
 
             html += '<span class="segment-text">' + escapeHtml(seg.text) + "</span>";
@@ -524,6 +556,10 @@
                 showCorrectionDropdown(this, segIdx);
             });
         }
+
+        // Re-render recreated all checkboxes unchecked — sync the counter
+        // and the add button, or they claim a selection that no longer exists.
+        updateVoiceprintSelection();
     }
 
     function updateVoiceprintSelection() {
@@ -712,7 +748,16 @@
         var speakersPromise = loadSpeakersCache();
         var detailPromise = fetchSessionDetail(date, time);
         Promise.all([speakersPromise, detailPromise]).then(function (results) {
-            renderDetail(results[1]);
+            var detail = results[1];
+            if (!detail || !detail.session) {
+                throw new Error((detail && detail.error) || "not found");
+            }
+            renderDetail(detail);
+        }).catch(function (e) {
+            // Without this, a 404 (session pruned after the list rendered)
+            // leaves the modal stuck on "Loading..." forever.
+            detailHeader.innerHTML =
+                '<div class="loading">セッションを読み込めませんでした: ' + escapeHtml(e.message) + '</div>';
         });
     }
 
@@ -729,6 +774,9 @@
 
     function closeModal() {
         modal.classList.add("hidden");
+        // The speaker-correction dropdown lives on document.body; left open
+        // it would apply a correction to whatever session is opened next.
+        closeCorrectionDropdown();
         if (audioEl) {
             audioEl.pause();
             audioEl = null;
@@ -813,6 +861,8 @@
 
     function closeSettings() {
         settingsModal.classList.add("hidden");
+        // Stop the refiner status poll chain — it must not outlive the modal
+        if (refinerPollTimer) { clearTimeout(refinerPollTimer); refinerPollTimer = null; }
     }
 
     settingsBtn.addEventListener("click", openSettings);
@@ -1039,7 +1089,7 @@
     }
 
     function editTermInline(wrong) {
-        var correctSpan = termsListEl.querySelector('.term-correct[data-wrong="' + wrong + '"]');
+        var correctSpan = termsListEl.querySelector('.term-correct[data-wrong="' + cssEscape(wrong) + '"]');
         if (!correctSpan || correctSpan.querySelector("input")) return;
 
         var currentValue = termsCache[wrong] || "";
@@ -1051,7 +1101,12 @@
         correctSpan.appendChild(input);
         input.focus();
 
+        var saved = false;
         function save() {
+            // Enter fires save(), then the re-render detaches the input and
+            // fires blur → save() again. Latch so the PUT runs only once.
+            if (saved) return;
+            saved = true;
             var newCorrect = input.value.trim();
             if (!newCorrect || newCorrect === currentValue) {
                 correctSpan.textContent = currentValue;
@@ -1069,7 +1124,7 @@
 
         input.addEventListener("keydown", function (e) {
             if (e.key === "Enter") save();
-            if (e.key === "Escape") correctSpan.textContent = currentValue;
+            if (e.key === "Escape") { saved = true; correctSpan.textContent = currentValue; }
         });
         input.addEventListener("blur", save);
     }
@@ -1200,7 +1255,7 @@
     }
 
     function editSuggestionInContainer(container, id, onChanged) {
-        var correctSpan = container.querySelector('.correct[data-id="' + id + '"]');
+        var correctSpan = container.querySelector('.correct[data-id="' + cssEscape(id) + '"]');
         if (!correctSpan || correctSpan.querySelector("input")) return;
 
         var currentValue = correctSpan.textContent;
@@ -1212,7 +1267,11 @@
         correctSpan.appendChild(input);
         input.focus();
 
+        var saved = false;
         function save() {
+            // Same Enter+blur double-fire as editTermInline — latch it.
+            if (saved) return;
+            saved = true;
             var newCorrect = input.value.trim();
             if (!newCorrect || newCorrect === currentValue) {
                 correctSpan.textContent = currentValue;
@@ -1229,7 +1288,7 @@
 
         input.addEventListener("keydown", function (e) {
             if (e.key === "Enter") save();
-            if (e.key === "Escape") correctSpan.textContent = currentValue;
+            if (e.key === "Escape") { saved = true; correctSpan.textContent = currentValue; }
         });
         input.addEventListener("blur", save);
     }
@@ -1259,6 +1318,9 @@
                 }
                 return;
             }
+            // While the tag editor is open, a/s/space would accept or skip
+            // with the OLD tags and silently discard the in-progress edit.
+            if (reviewState.editing) return;
             if (e.key === "d" || e.key === "D") { toggleReviewDrawer(); return; }
             if (e.key === "a" || e.key === "A") { reviewAccept(); return; }
             if (e.key === "e" || e.key === "E") { reviewEdit(); return; }
@@ -1291,15 +1353,17 @@
     var batchCancelBtn = document.getElementById("batch-cancel-btn");
     var batchProgressFill = document.getElementById("batch-progress-fill");
     var batchCurrent = document.getElementById("batch-current");
-    var batchTimer = null;
+    var batchTimers = {};       // per-type polling intervals (concurrent jobs)
     var batchCancelTime = null;
     var batchFadeTimer = null;
-    var activeBatchType = null; // "diarize" | "tags"
+    var batchFadeInnerTimer = null;
+    var activeBatchType = null; // type currently shown in the panel
 
     var batchApiMap = {
-        diarize:   { start: "/api/diarize/start",   status: "/api/diarize/status",   cancel: "/api/diarize/cancel"   },
-        tags:      { start: "/api/tags/start",       status: "/api/tags/status",       cancel: "/api/tags/cancel"     },
-        sanitize:  { start: "/api/sanitize/start",   status: "/api/sanitize/status",   cancel: "/api/sanitize/cancel"  },
+        diarize:      { start: "/api/diarize/start",      status: "/api/diarize/status",      cancel: "/api/diarize/cancel"      },
+        tags:         { start: "/api/tags/start",          status: "/api/tags/status",          cancel: "/api/tags/cancel"        },
+        session_tags: { start: "/api/session-tags/start",  status: "/api/session-tags/status",  cancel: "/api/session-tags/cancel" },
+        sanitize:     { start: "/api/sanitize/start",      status: "/api/sanitize/status",      cancel: "/api/sanitize/cancel"     },
     };
 
     var batchLabels = {
@@ -1310,6 +1374,7 @@
             cancelling: "キャンセル中...",
             done: "タグ付け完了",
         },
+        session_tags: { running: "再タグ付け中...", cancelling: "キャンセル中...", done: "再タグ付け完了" },
         sanitize: { running: "LLM 匿名化処理中...", cancelling: "キャンセル中...", done: "匿名化完了" },
     };
 
@@ -1317,6 +1382,7 @@
         activeBatchType = type;
         batchPanel.classList.remove("hidden", "fade-out");
         if (batchFadeTimer) { clearTimeout(batchFadeTimer); batchFadeTimer = null; }
+        if (batchFadeInnerTimer) { clearTimeout(batchFadeInnerTimer); batchFadeInnerTimer = null; }
         updateBatchUI(type, state);
     }
 
@@ -1324,10 +1390,11 @@
         if (batchFadeTimer) return; // already scheduled
         batchFadeTimer = setTimeout(function () {
             batchPanel.classList.add("fade-out");
-            setTimeout(function () {
+            batchFadeInnerTimer = setTimeout(function () {
                 batchPanel.classList.add("hidden");
                 batchPanel.classList.remove("fade-out");
                 batchFadeTimer = null;
+                batchFadeInnerTimer = null;
                 activeBatchType = null;
             }, 500);
         }, 5000);
@@ -1395,26 +1462,37 @@
     }
 
     function startBatchPolling(type) {
-        if (batchTimer) return;
+        // One interval per type: with a single shared timer, starting a second
+        // concurrent batch silently went unmonitored and the Cancel button
+        // targeted the wrong job.
+        if (batchTimers[type]) return;
         var api = batchApiMap[type];
         if (!api) return;
         var errorCount = 0;
-        batchTimer = setInterval(function () {
+        batchTimers[type] = setInterval(function () {
             fetch(api.status).then(function (r) { return r.json(); }).then(function (state) {
                 errorCount = 0;
-                updateBatchUI(type, state);
+                // Only repaint the panel for the job it is showing
+                if (activeBatchType === type) updateBatchUI(type, state);
                 if (!state.running) {
-                    clearInterval(batchTimer);
-                    batchTimer = null;
-                    loadPage(currentPage);
-                    hideBatchPanel();
+                    clearInterval(batchTimers[type]);
+                    delete batchTimers[type];
+                    if (activeBatchType === type) {
+                        loadPage(currentPage);
+                        hideBatchPanel();
+                    } else if (type === "sanitize" && state.finished_at
+                               && state.output_file && state.records_generated > 0) {
+                        // Auto-download must fire even when another job owns
+                        // the panel (updateBatchUI won't run for this type).
+                        window.location.href = "/api/sanitize/download?file=" + encodeURIComponent(state.output_file);
+                    }
                 }
             }).catch(function () {
                 errorCount++;
                 // Only stop polling after 15 consecutive failures (30s)
                 if (errorCount >= 15) {
-                    clearInterval(batchTimer);
-                    batchTimer = null;
+                    clearInterval(batchTimers[type]);
+                    delete batchTimers[type];
                 }
             });
         }, 2000);
@@ -1547,11 +1625,11 @@
             var label = catNames[cat] || cat;
             html += '<div class="hotword-category-row">';
             html += '<label class="toggle-label">';
-            html += '<input type="checkbox" class="hw-cat-enabled" data-cat="' + cat + '"' +
+            html += '<input type="checkbox" class="hw-cat-enabled" data-cat="' + escapeHtml(cat) + '"' +
                 (c.enabled !== false ? " checked" : "") + '>';
             html += '<span>' + escapeHtml(label) + '</span>';
             html += '</label>';
-            html += '<input type="number" class="hw-cat-max" data-cat="' + cat + '" ' +
+            html += '<input type="number" class="hw-cat-max" data-cat="' + escapeHtml(cat) + '" ' +
                 'min="0" max="2000" value="' + (c.max || 100) + '" style="width:60px">';
             html += '</div>';
         }
@@ -2610,9 +2688,12 @@
     var taxonomyLoadingEl = document.getElementById("taxonomy-loading");
     var taxonomyErrorEl = document.getElementById("taxonomy-error");
     var taxonomyEditorEl = document.getElementById("taxonomy-editor");
-    var taxonomyRetryLink = document.getElementById("taxonomy-retry-link");
-    if (taxonomyRetryLink) {
-        taxonomyRetryLink.addEventListener("click", function (e) {
+    // Delegate on the container: the error message rewrite replaces the
+    // original #taxonomy-retry-link node, which would orphan a direct binding.
+    if (taxonomyErrorEl) {
+        taxonomyErrorEl.addEventListener("click", function (e) {
+            var link = e.target.closest("#taxonomy-retry-link");
+            if (!link) return;
             e.preventDefault();
             loadTaxonomySettings();
         });
@@ -2957,7 +3038,7 @@
         for (var j = 0; j < addBtns.length; j++) {
             addBtns[j].addEventListener("click", function () {
                 var d = this.getAttribute("data-domain");
-                var input = container.querySelector('.kw-add-input[data-domain="' + d + '"]');
+                var input = container.querySelector('.kw-add-input[data-domain="' + cssEscape(d) + '"]');
                 if (!input) return;
                 var val = input.value.trim();
                 if (!val) return;
@@ -2977,7 +3058,7 @@
             addInputs[k].addEventListener("keydown", function (e) {
                 if (e.key === "Enter") {
                     var d = this.getAttribute("data-domain");
-                    var btn = container.querySelector('.kw-add-btn[data-domain="' + d + '"]');
+                    var btn = container.querySelector('.kw-add-btn[data-domain="' + cssEscape(d) + '"]');
                     if (btn) btn.click();
                 }
             });
@@ -3053,8 +3134,11 @@
                         .then(function (r) { return r.json(); })
                         .then(function () {
                             if (taxonomyStatusEl) taxonomyStatusEl.textContent = "再タグ付け開始";
-                            showBatchPanel("tags", { running: true, total: 0, processed: 0 });
-                            startBatchPolling("tags");
+                            // session-tags has its own status/cancel endpoints;
+                            // polling "tags" here watched the WRONG job and the
+                            // panel disappeared while the retag was running.
+                            showBatchPanel("session_tags", { running: true, total: 0, processed: 0 });
+                            startBatchPolling("session_tags");
                         });
                 }
             }
@@ -3142,6 +3226,9 @@
     // Refiner Settings
     // ============================================================
 
+    var refinerPollTimer = null;
+    var drawerRefinerPollTimer = null;
+
     function loadRefinerSettings() {
         var loadingEl = document.getElementById("refiner-loading");
         var infoEl = document.getElementById("refiner-info");
@@ -3190,15 +3277,17 @@
             if (reportsList && data.reports && data.reports.length > 0) {
                 var html = "<table style='width:100%;font-size:0.85em;'><tr><th>Date</th><th>Status</th><th>Samples</th><th>Clusters</th></tr>";
                 data.reports.forEach(function (r) {
-                    html += "<tr><td>" + (r.filename || "-") + "</td><td>" + (r.status || "-") + "</td><td>" + (r.sample_count || 0) + "</td><td>" + (r.cluster_count || 0) + "</td></tr>";
+                    html += "<tr><td>" + escapeHtml(r.filename || "-") + "</td><td>" + escapeHtml(r.status || "-") + "</td><td>" + (r.sample_count || 0) + "</td><td>" + (r.cluster_count || 0) + "</td></tr>";
                 });
                 html += "</table>";
                 reportsList.innerHTML = html;
             }
 
-            // If running, poll
+            // If running, poll. Track the handle: each openSettings() call
+            // would otherwise start another self-perpetuating 5s chain.
             if (data.running) {
-                setTimeout(loadRefinerSettings, 5000);
+                if (refinerPollTimer) clearTimeout(refinerPollTimer);
+                refinerPollTimer = setTimeout(loadRefinerSettings, 5000);
             }
         }).catch(function (err) {
             if (loadingEl) loadingEl.textContent = "Error: " + err.message;
@@ -3223,15 +3312,15 @@
                     html += "<div class='refiner-change-card accepted' data-index='" + idx + "'>";
                     html += "<div class='card-header'>";
                     html += "<input type='checkbox' class='refiner-change-cb' data-index='" + idx + "' checked>";
-                    html += "<span style='color:" + typeColor + ";font-weight:bold;'>[" + c.type + "]</span> ";
-                    html += "<span>" + (c.axis || "") + "</span>";
+                    html += "<span style='color:" + typeColor + ";font-weight:bold;'>[" + escapeHtml(c.type) + "]</span> ";
+                    html += "<span>" + escapeHtml(c.axis || "") + "</span>";
                     html += "</div>";
-                    html += "<div class='card-detail'>" + (c.description || "") + "</div>";
+                    html += "<div class='card-detail'>" + escapeHtml(c.description || "") + "</div>";
                     if (c.before && c.before.length) {
-                        html += "<div class='card-detail' style='color:#999;'>Before: " + c.before.join(", ") + "</div>";
+                        html += "<div class='card-detail' style='color:#999;'>Before: " + escapeHtml(c.before.join(", ")) + "</div>";
                     }
                     if (c.after && c.after.length) {
-                        html += "<div class='card-detail' style='color:#ccc;'>After: " + c.after.join(", ") + "</div>";
+                        html += "<div class='card-detail' style='color:#ccc;'>After: " + escapeHtml(c.after.join(", ")) + "</div>";
                     }
                     html += "</div>";
                 });
@@ -3260,7 +3349,7 @@
             if (validationEl && data.pending.validation) {
                 var v = data.pending.validation;
                 validationEl.innerHTML = "<table style='font-size:0.85em;'>"
-                    + "<tr><td>Accuracy</td><td>" + ((v.accuracy_vs_current * 100).toFixed(1)) + "%</td></tr>"
+                    + "<tr><td>Accuracy</td><td>" + (((v.accuracy_vs_current || 0) * 100).toFixed(1)) + "%</td></tr>"
                     + "<tr><td>Improved</td><td style='color:#2ecc71;'>" + (v.improved_count || 0) + "</td></tr>"
                     + "<tr><td>Degraded</td><td style='color:#e74c3c;'>" + (v.degraded_count || 0) + "</td></tr>"
                     + "<tr><td>Unchanged</td><td>" + (v.unchanged_count || 0) + "</td></tr>"
@@ -3432,6 +3521,7 @@
                 loadDrawerRefiner();
             } else {
                 reviewDrawer.classList.remove("visible");
+                if (drawerRefinerPollTimer) { clearTimeout(drawerRefinerPollTimer); drawerRefinerPollTimer = null; }
             }
         }
     }
@@ -3489,8 +3579,9 @@
             if (data.has_pending) {
                 loadDrawerRefinerPending();
             }
-            if (data.running) {
-                setTimeout(loadDrawerRefiner, 5000);
+            if (data.running && reviewState.drawerOpen) {
+                if (drawerRefinerPollTimer) clearTimeout(drawerRefinerPollTimer);
+                drawerRefinerPollTimer = setTimeout(loadDrawerRefiner, 5000);
             }
         }).catch(function (err) {
             drawerRefinerStatus.textContent = "Error: " + err.message;
@@ -3524,7 +3615,7 @@
             if (data.pending.validation) {
                 var v = data.pending.validation;
                 html += "<div style='margin-top:8px;font-size:0.8em;color:var(--text-dim);'>";
-                html += "検証: 精度 " + ((v.accuracy_vs_current * 100).toFixed(1)) + "% / ";
+                html += "検証: 精度 " + (((v.accuracy_vs_current || 0) * 100).toFixed(1)) + "% / ";
                 html += "<span style='color:#2ecc71;'>改善 " + (v.improved_count || 0) + "</span> / ";
                 html += "<span style='color:#e74c3c;'>劣化 " + (v.degraded_count || 0) + "</span>";
                 html += "</div>";
@@ -3762,8 +3853,10 @@
 
         var currentTags = {
             conversation_type: s.tags_conversation_type,
-            outcomes: s.tags_outcomes ? s.tags_outcomes.split(",") : [],
-            domains: s.tags_domains ? s.tags_domains.split(",") : [],
+            // trim: untrimmed values never match taxonomy entries, so the
+            // checkbox renders unchecked and saving silently drops the tag
+            outcomes: s.tags_outcomes ? s.tags_outcomes.split(",").map(function (x) { return x.trim(); }) : [],
+            domains: s.tags_domains ? s.tags_domains.split(",").map(function (x) { return x.trim(); }) : [],
             importance: s.tags_importance_v2,
         };
 
@@ -3842,6 +3935,7 @@
     }
 
     function reviewSkip() {
+        if (!reviewState.currentItem) return;
         reviewState.skippedOffset++;
         fetch("/api/review/skip", { method: "POST" }).catch(function () {});
         loadNextReviewItem();
@@ -3977,6 +4071,10 @@
     });
     checkBatchStatus("diarize");
     checkBatchStatus("tags");
+    checkBatchStatus("session_tags");
+    // A sanitize job surviving a page reload needs its polling resumed, or
+    // its auto-download never fires and the generated file is orphaned.
+    checkBatchStatus("sanitize");
     loadHotwordsStatus();
     loadReviewStats();
     checkSettingsAttention();

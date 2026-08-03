@@ -194,7 +194,10 @@ class SanitizedIndex:
         elif rtype == "knowledge_card":
             q = (rec.get("input") or "").strip()
             a = (rec.get("output") or "").strip()
-            if q and a:
+            # Dedup by question: SanitizedIndex loads every safe_training_*
+            # file ever generated, so overlapping runs re-emit the same KCs.
+            seen = {c["question"] for c in bucket["knowledge_cards"]}
+            if q and a and q not in seen:
                 bucket["knowledge_cards"].append({
                     "question": q,
                     "answer": a,
@@ -658,7 +661,7 @@ def to_decision_log(
     context = " ".join(t["text"] for t in turns[:3])[:200]
 
     title = decision_memo[:60] or legacy_decision_summary or (
-        sanitized.get("summary_output", "")[:60] if sanitized else ""
+        (sanitized.get("summary_output") or "")[:60] if sanitized else ""
     ) or "Decision"
 
     return {

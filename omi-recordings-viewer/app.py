@@ -99,9 +99,16 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data) -> None:
-    """JSON ファイルに書き込む。"""
+    """JSON ファイルに書き込む (tmp + rename でアトミックに)。
+
+    transcript.json や設定 JSON は source of truth なので、書き込み途中の
+    クラッシュ/ディスクフルで途切れたファイルを残さない。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, str(path))
 
 
 def _valid_session_id(date: str, time: str) -> bool:
@@ -613,17 +620,24 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
                 for val in removed:
                     try:
                         if axis in ("outcomes", "domains"):
+                            # Comma-joined column: exact element match, not
+                            # substring (投資 must not count 投資教育 rows).
                             cursor = await indexer._db.execute(
-                                f"SELECT COUNT(*) as cnt FROM sessions WHERE {col} LIKE ?",
+                                f"SELECT {col} AS v FROM sessions WHERE {col} LIKE ?",
                                 ["%" + val + "%"],
+                            )
+                            rows = await cursor.fetchall()
+                            cnt = sum(
+                                1 for r in rows
+                                if val in [s.strip() for s in (r["v"] or "").split(",")]
                             )
                         else:
                             cursor = await indexer._db.execute(
                                 f"SELECT COUNT(*) as cnt FROM sessions WHERE {col} = ?",
                                 [val],
                             )
-                        row = await cursor.fetchone()
-                        cnt = row["cnt"] if row else 0
+                            row = await cursor.fetchone()
+                            cnt = row["cnt"] if row else 0
                         if cnt > 0:
                             impact[val] = cnt
                     except Exception:
@@ -631,6 +645,7 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
 
     # Apply renames to transcript.json files (source of truth) and DB
     renamed_count = 0
+    db_changed = False
     if renames and isinstance(renames, dict):
         indexer: Indexer = request.app["indexer"]
         axis_col_map = {
@@ -692,18 +707,38 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
 
                     # Also update DB for immediate consistency
                     if axis in ("outcomes", "domains"):
-                        await indexer._db.execute(
-                            f"UPDATE sessions SET {col} = REPLACE({col}, ?, ?) WHERE {col} LIKE ?",
-                            [old_val, new_val, "%" + old_val + "%"],
+                        # SQL REPLACE would corrupt values that contain
+                        # old_val as a substring (個人 → 個人事業); split,
+                        # replace the exact element, and rejoin in Python.
+                        cursor = await indexer._db.execute(
+                            f"SELECT date, time, {col} AS v FROM sessions"
+                            f" WHERE {col} LIKE ?",
+                            ["%" + old_val + "%"],
                         )
+                        for r in await cursor.fetchall():
+                            vals = [s.strip() for s in (r["v"] or "").split(",") if s.strip()]
+                            if old_val not in vals:
+                                continue
+                            new_joined = ",".join(
+                                new_val if v == old_val else v for v in vals
+                            )
+                            await indexer._db.execute(
+                                f"UPDATE sessions SET {col} = ?"
+                                " WHERE date = ? AND time = ?",
+                                [new_joined, r["date"], r["time"]],
+                            )
+                            db_changed = True
                     else:
                         await indexer._db.execute(
                             f"UPDATE sessions SET {col} = ? WHERE {col} = ?",
                             [new_val, old_val],
                         )
+                        db_changed = True
                 except Exception as e:
                     logger.warning(f"Failed to rename {axis} '{old_val}' -> '{new_val}': {e}")
-        if renamed_count > 0:
+        if db_changed:
+            # Commit even when no transcript.json was rewritten (files removed
+            # by retention): otherwise the UPDATEs sit in an open transaction.
             await indexer._db.commit()
 
     # Save new taxonomy
@@ -719,11 +754,12 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
         try:
             session_obj: aiohttp.ClientSession = request.app["bridge_session"]
             timeout = aiohttp.ClientTimeout(total=5)
-            await session_obj.post(
+            async with session_obj.post(
                 f"{BRIDGE_MGMT_URL}/session-tags/start",
                 json={"force": True},
                 timeout=timeout,
-            )
+            ):
+                pass
             retag_started = True
         except Exception as e:
             logger.warning(f"Failed to start retag: {e}")
@@ -743,7 +779,10 @@ async def _notify_bridge_taxonomy_reload(request: web.Request) -> None:
     session_obj: aiohttp.ClientSession = request.app["bridge_session"]
     try:
         timeout = aiohttp.ClientTimeout(total=3)
-        await session_obj.post(f"{BRIDGE_MGMT_URL}/taxonomy/reload", timeout=timeout)
+        async with session_obj.post(
+            f"{BRIDGE_MGMT_URL}/taxonomy/reload", timeout=timeout
+        ):
+            pass
     except Exception as e:
         logger.debug(f"Bridge taxonomy reload notification failed: {e}")
 
@@ -778,7 +817,10 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     domains = body.get("domains", [])
     importance = body.get("importance")
 
-    if conv_type and conv_type not in valid_conv:
+    # Empty string is not a valid value: writing conversation_type=""
+    # demotes the session from V2 (is_v2 checks truthiness) and NULLs its
+    # V2 columns on reindex. Only None means "no change".
+    if conv_type is not None and conv_type not in valid_conv:
         return web.json_response({"error": f"invalid conversation_type: {conv_type}"}, status=400)
     for o in outcomes:
         if o not in valid_outcomes:
@@ -786,7 +828,7 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     for d in domains:
         if d not in valid_domains:
             return web.json_response({"error": f"invalid domain: {d}"}, status=400)
-    if importance and importance not in valid_importance:
+    if importance is not None and importance not in valid_importance:
         return web.json_response({"error": f"invalid importance: {importance}"}, status=400)
 
     transcript_path = Path(RECORDINGS_DIR) / date / time / "transcript.json"
@@ -820,9 +862,7 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
     if not was_already_corrected:
         tags["review_outcome"] = "corrected"
 
-    transcript_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json(transcript_path, data)
 
     # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
@@ -836,7 +876,7 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
         try:
             session_obj: aiohttp.ClientSession = request.app["bridge_session"]
             timeout = aiohttp.ClientTimeout(total=5)
-            await session_obj.post(
+            async with session_obj.post(
                 f"{BRIDGE_MGMT_URL}/keywords/learn",
                 json={
                     "date": date,
@@ -845,7 +885,8 @@ async def handle_put_session_tags(request: web.Request) -> web.Response:
                     "new_domains": new_domains,
                 },
                 timeout=timeout,
-            )
+            ):
+                pass
         except Exception as e:
             logger.debug(f"Keyword learn notification failed: {e}")
 
@@ -1030,18 +1071,37 @@ async def handle_review_queue(request: web.Request) -> web.Response:
         logger.exception("Review queue query failed")
         return web.json_response({"error": str(e)}, status=500)
 
-    # Attach transcript for each item. Skip items whose files vanished
-    # since the last sync (retention cleanup race) — accepting them would
-    # 404 because review accept writes to transcript.json.
+    # Attach transcript for each item. Items whose files vanished since the
+    # last sync (retention cleanup race) are skipped AND marked in the DB so
+    # they leave the queue immediately — otherwise a single vanished item
+    # makes this response empty and the UI shows "レビュー完了" prematurely.
     results = []
     for item in items:
         transcript = await indexer.get_transcript(item["date"], item["time"])
         if transcript is None:
+            await indexer.mark_files_missing(item["date"], item["time"])
             continue
         results.append({
             "session": item,
             "transcript": transcript,
         })
+
+    # If everything we fetched had vanished, refetch once — the marked rows
+    # no longer match the queue, so this pulls the next real candidates.
+    if not results and items:
+        try:
+            items = await indexer.get_review_queue(limit=limit, offset=offset)
+            for item in items:
+                transcript = await indexer.get_transcript(item["date"], item["time"])
+                if transcript is None:
+                    await indexer.mark_files_missing(item["date"], item["time"])
+                    continue
+                results.append({
+                    "session": item,
+                    "transcript": transcript,
+                })
+        except Exception:
+            logger.exception("Review queue refetch failed")
 
     return web.json_response({"items": results})
 
@@ -1089,9 +1149,7 @@ async def handle_review_accept(request: web.Request) -> web.Response:
     tags["corrected_at"] = datetime.now().isoformat(timespec="seconds")
     tags["review_outcome"] = "accepted"
 
-    transcript_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json(transcript_path, data)
 
     # Re-index + feedback
     indexer: Indexer = request.app["indexer"]
@@ -1254,7 +1312,10 @@ async def handle_export_stats(request: web.Request) -> web.Response:
     val_ratio = params["val_ratio"]
     if 0 < val_ratio < 1:
         effective = stats.get("balanced_sessions", stats["sessions"])
-        stats["val_sessions"] = max(1, int(effective * val_ratio))
+        if effective > 1:
+            stats["val_sessions"] = max(1, int(effective * val_ratio))
+        else:
+            stats["val_sessions"] = 0
         stats["train_sessions"] = effective - stats["val_sessions"]
 
     return web.json_response(stats)
@@ -1295,6 +1356,14 @@ async def handle_export_training(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
     fmt = params["format"]
+    if fmt == "safe_training":
+        # safe_training is generated by the Bridge sanitize pipeline
+        # (/api/sanitize/start), not by this formatter-based endpoint —
+        # accepting it here yields a 0-byte file + a traceback per session.
+        return web.json_response(
+            {"error": "format=safe_training is generated via /api/sanitize/start"},
+            status=400,
+        )
     speaker_mode = params["speaker_mode"]
     include_monologue = params["include_monologue"]
     val_ratio = params["val_ratio"]
@@ -1312,7 +1381,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
 
     # Build all export lines first (needed for split & filtering).
     # Each session may emit 0-N JSONL lines (chat formats are multi-line).
-    lines: list[tuple[str, str]] = []  # (line_json, conversation_type)
+    lines: list[tuple[str, str, str]] = []  # (line_json, conversation_type, session_id)
     for date, time_val in session_pairs:
         try:
             transcript = await indexer.get_transcript(date, time_val)
@@ -1341,7 +1410,7 @@ async def handle_export_training(request: web.Request) -> web.Response:
                 ct = (transcript.get("session", {}).get("tags", {})
                       .get("conversation_type", "_untagged"))
                 for line in out_lines:
-                    lines.append((line, ct))
+                    lines.append((line, ct, session_id))
         except Exception:
             logger.exception("Export error for %s/%s", date, time_val)
             continue
@@ -1349,13 +1418,13 @@ async def handle_export_training(request: web.Request) -> web.Response:
     # Filter out classes with too few samples
     if min_class_samples > 0:
         class_counts: dict[str, int] = {}
-        for _, ct in lines:
+        for _, ct, _sid in lines:
             class_counts[ct] = class_counts.get(ct, 0) + 1
         excluded = {ct for ct, n in class_counts.items() if n < min_class_samples}
         if excluded:
             logger.info("Export: excluding classes with < %d samples: %s",
                         min_class_samples, excluded)
-            lines = [(l, ct) for l, ct in lines if ct not in excluded]
+            lines = [(l, ct, sid) for l, ct, sid in lines if ct not in excluded]
 
     # No train/val split: stream JSONL as before
     if val_ratio <= 0 or val_ratio >= 1:
@@ -1367,26 +1436,34 @@ async def handle_export_training(request: web.Request) -> web.Response:
             },
         )
         await response.prepare(request)
-        for line, _ in lines:
+        for line, _, _sid in lines:
             await response.write((line + "\n").encode("utf-8"))
         await response.write_eof()
         return response
 
-    # Train/val split: stratified by conversation_type, output as ZIP
-    random.shuffle(lines)
-    class_indices: dict[str, list[int]] = {}
-    for i, (_, ct) in enumerate(lines):
-        class_indices.setdefault(ct, []).append(i)
+    # Train/val split: stratified by conversation_type, assigned per SESSION.
+    # Multi-line formats emit several records from the same conversation;
+    # splitting per line would leak near-duplicates of training data into
+    # the validation set and make eval metrics meaningless.
+    session_ct: dict[str, str] = {}
+    for _line, ct, sid in lines:
+        session_ct.setdefault(sid, ct)
+    session_ids = list(session_ct)
+    random.shuffle(session_ids)
 
-    val_set: set[int] = set()
-    for ct, indices in class_indices.items():
-        n_val = max(1, int(len(indices) * val_ratio))
-        # Ensure at least 1 train sample remains
-        n_val = min(n_val, len(indices) - 1) if len(indices) > 1 else 0
-        val_set.update(indices[:n_val])
+    class_sessions: dict[str, list[str]] = {}
+    for sid in session_ids:
+        class_sessions.setdefault(session_ct[sid], []).append(sid)
 
-    train_lines = [lines[i][0] for i in range(len(lines)) if i not in val_set]
-    val_lines = [lines[i][0] for i in range(len(lines)) if i in val_set]
+    val_sessions: set[str] = set()
+    for ct, sids in class_sessions.items():
+        n_val = max(1, int(len(sids) * val_ratio))
+        # Ensure at least 1 train session remains
+        n_val = min(n_val, len(sids) - 1) if len(sids) > 1 else 0
+        val_sessions.update(sids[:n_val])
+
+    train_lines = [line for line, _, sid in lines if sid not in val_sessions]
+    val_lines = [line for line, _, sid in lines if sid in val_sessions]
 
     # Build ZIP in memory
     buf = io.BytesIO()
@@ -1542,7 +1619,9 @@ async def handle_sanitize_download(request: web.Request) -> web.Response:
     import re as _re
     filename = request.query.get("file", "")
     # Security: only allow safe_training_*.jsonl pattern + path traversal check
-    if not _re.match(r'^safe_training_\d{8}_\d{6}\.jsonl$', filename):
+    # Allow generated files and tools/dedupe_sanitized.py output
+    # (e.g. safe_training_20260413_122441_deduped.jsonl).
+    if not _re.match(r'^safe_training_[A-Za-z0-9_-]+\.jsonl$', filename):
         return web.json_response({"error": "invalid filename"}, status=400)
 
     filepath = Path(CONFIG_DIR) / filename
