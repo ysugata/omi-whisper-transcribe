@@ -258,12 +258,19 @@ class LLMPipeline:
                     authorized_forms.add(c.suggested_form)
                     candidate_map[(c.line, c.text_span)] = c.suggested_form
 
+        line_prefix = re.compile(r"^\[\d+\]\s*")
         filtered = []
         for c in corrections:
             line = c.get("line", 0)
             original_snippet = c.get("original_snippet", "").strip()
             corrected = c.get("corrected", "").strip()
             source = c.get("source", "")
+
+            # 一部のモデル (gpt-5-nano 等) は番号付き入力の "[n] " プレフィックス
+            # ごとスニペットを返す。原文には存在しないため、剥がしてから照合する。
+            original_snippet = line_prefix.sub("", original_snippet)
+            corrected = line_prefix.sub("", corrected)
+            c = {**c, "original_snippet": original_snippet, "corrected": corrected}
 
             # Empty original_snippet is invalid
             if not original_snippet:

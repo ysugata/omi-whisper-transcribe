@@ -75,3 +75,20 @@ def test_gemini_call_keeps_legacy_params():
     assert kw["max_tokens"] == 512
     assert kw["temperature"] == 0
     assert kw["reasoning_effort"] == "low"  # gemini-3.x thinking minimized
+
+
+def test_filter_strips_line_number_prefix():
+    """gpt-5-nano returns snippets with the '[n] ' prefix — must still match."""
+    corrections = [{
+        "line": 1,
+        "original_snippet": "[1] クーバネティスのデプロイ",
+        "corrected": "[1] Kubernetesのデプロイ",
+        "source": "glossary",
+    }]
+    out = LLMPipeline._filter_corrections(
+        corrections,
+        original_texts={1: "クーバネティスのデプロイ"},
+    )
+    assert len(out) == 1
+    assert out[0]["original_snippet"] == "クーバネティスのデプロイ"
+    assert out[0]["corrected"] == "Kubernetesのデプロイ"
