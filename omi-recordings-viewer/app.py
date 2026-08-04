@@ -1665,6 +1665,22 @@ async def handle_sanitize_status(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "GET", "/sanitize/status")
 
 
+async def handle_elicitation_questions(request: web.Request) -> web.Response:
+    return await _proxy_bridge(request, "GET", "/elicitation/questions")
+
+
+async def handle_elicitation_answer(request: web.Request) -> web.Response:
+    qid = request.match_info["id"]
+    return await _proxy_bridge(
+        request, "POST", f"/elicitation/questions/{qid}/answer", timeout_sec=10,
+    )
+
+
+async def handle_elicitation_skip(request: web.Request) -> web.Response:
+    qid = request.match_info["id"]
+    return await _proxy_bridge(request, "POST", f"/elicitation/questions/{qid}/skip")
+
+
 async def handle_sanitize_cancel(request: web.Request) -> web.Response:
     return await _proxy_bridge(request, "POST", "/sanitize/cancel")
 
@@ -1831,6 +1847,9 @@ def create_app() -> web.Application:
     # Sanitize batch API (training data anonymization)
     app.router.add_post("/api/sanitize/start", handle_sanitize_start)
     app.router.add_get("/api/sanitize/status", handle_sanitize_status)
+    app.router.add_get("/api/elicitation/questions", handle_elicitation_questions)
+    app.router.add_post("/api/elicitation/questions/{id}/answer", handle_elicitation_answer)
+    app.router.add_post("/api/elicitation/questions/{id}/skip", handle_elicitation_skip)
     app.router.add_post("/api/sanitize/cancel", handle_sanitize_cancel)
     app.router.add_get("/api/sanitize/download", handle_sanitize_download)
 

@@ -64,6 +64,7 @@ COPY keyword_learner.py .
 COPY training_sanitizer.py .
 COPY responses_sanitizer.py .
 COPY kc_judge.py .
+COPY elicitation.py .
 COPY tools/eval_quality.py tools/
 COPY suggestion_learner.py .
 COPY segment_classifier.py .

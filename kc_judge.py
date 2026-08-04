@@ -25,6 +25,8 @@ _JUDGE_SYSTEM = """あなたは事業継承AIの学習データ品質審査員�
 - 自己完結性: カード単体で文脈が通じるか
 
 基準: 5=模範的 / 4=良い / 3=使える / 2=曖昧・一般論 / 1=学習データに不適。
+適用条件 (preconditions) や撤退シグナル (failure_signals) が具体的に示されて
+いるカードは、判断の誤用を防ぐため1段階高く評価してよい。
 必ず次のJSONだけを返してください:
 {"scores": [{"index": 1, "score": 3, "reason": "20字以内の理由"}, ...]}"""
 
@@ -77,7 +79,14 @@ class KCJudge:
         for i, kc in enumerate(batch, 1):
             q = str(kc.get("question", "")).strip()
             a = str(kc.get("answer", "")).strip()
-            lines.append(f"[{i}] Q: {q}\n    A: {a}")
+            entry = f"[{i}] Q: {q}\n    A: {a}"
+            pre = str(kc.get("preconditions", "") or "").strip()
+            sig = str(kc.get("failure_signals", "") or "").strip()
+            if pre:
+                entry += f"\n    適用条件: {pre}"
+            if sig:
+                entry += f"\n    撤退シグナル: {sig}"
+            lines.append(entry)
         user_msg = "\n".join(lines)
         try:
             kwargs = dict(
