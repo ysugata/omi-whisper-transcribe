@@ -254,3 +254,40 @@ async def test_export_sessions_require_files(tmp_env):
     assert stats_all["sessions"] == 2
     assert stats_files["sessions"] == 1
     await indexer.close()
+
+
+def test_kc_quality_filter_in_export(monkeypatch):
+    """quality < KC_MIN_QUALITY のカードは学習データから除外される。"""
+    import exporter as ex
+    monkeypatch.setattr(ex, "KC_MIN_QUALITY", 3)
+    sanitized = {
+        "session_id": "2026-03-29/10-00-00",
+        "summary_input": None, "summary_output": None, "keypoints": None,
+        "safe_conversation": None, "risk": "low",
+        "knowledge_cards": [
+            {"question": "高品質な質問はこれですか？", "answer": "はい、具体的で有用な回答です。", "quality": 4},
+            {"question": "低品質な質問はこれですか？", "answer": "曖昧で一般論的な回答です。", "quality": 2},
+            {"question": "未採点の質問はこれですか？", "answer": "採点がなくても通過する具体的で長い回答です。"},
+        ],
+    }
+    transcript = {"session": {"tags": {"domains": ["経営"]}}, "segments": []}
+    lines = export_session("openai", "2026-03-29/10-00-00", transcript,
+                           sanitized=sanitized)
+    joined = "\n".join(lines)
+    assert "高品質な質問" in joined
+    assert "低品質な質問" not in joined
+    assert "未採点の質問" in joined  # 未採点は通す
+
+
+def test_sanitized_index_carries_quality(tmp_path):
+    from exporter import SanitizedIndex
+    rec = {
+        "session_id": "a/b", "risk": "low", "summary": {}, "keypoints": [],
+        "safe_conversation": [],
+        "knowledge_cards": [{"question": "Q1です", "answer": "A1です", "quality": 5}],
+    }
+    (tmp_path / "safe_training_20260101_000000.jsonl").write_text(
+        json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    idx = SanitizedIndex(tmp_path)
+    assert idx.get("a/b")["knowledge_cards"][0]["quality"] == 5

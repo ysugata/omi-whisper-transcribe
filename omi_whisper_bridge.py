@@ -145,6 +145,17 @@ NIGHTLY_SANITIZE_MAX_SESSIONS = int(os.environ.get("NIGHTLY_SANITIZE_MAX_SESSION
 NIGHTLY_SANITIZE_HIGH_VALUE_ONLY = os.environ.get("NIGHTLY_SANITIZE_HIGH_VALUE_ONLY", "true").lower() in ("true", "1", "yes")
 NIGHTLY_SANITIZE_MAX_ATTEMPTS = int(os.environ.get("NIGHTLY_SANITIZE_MAX_ATTEMPTS", "2"))  # 失敗セッションの再試行上限
 
+# --- KC 品質ゲート ---
+# sanitize が抽出したナレッジカードを LLM で採点し quality (1-5) を付与する。
+# Wiki ビルドとエクスポートは KC_MIN_QUALITY 未満のカードを除外する。
+KC_QUALITY_GATE_ENABLED = os.environ.get("KC_QUALITY_GATE_ENABLED", "true").lower() in ("true", "1", "yes")
+KC_JUDGE_MODEL = os.environ.get("KC_JUDGE_MODEL", "gpt-5-nano")
+
+# --- メディア音声の早期ゲート ---
+# セッション確定直後に音響シーン分類を実行し、TV・ラジオ等のメディア音声が
+# 主体のセッションは LLM 補正キューに入れない (ゴミデータへの課金防止)。
+MEDIA_EARLY_GATE_ENABLED = os.environ.get("MEDIA_EARLY_GATE_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
@@ -268,6 +279,7 @@ from succession_rag import SuccessionRAG
 from segment_screener import SegmentScreener
 from suggestion_learner import SuggestionLearner
 from keyword_learner import KeywordLearner
+from kc_judge import KCJudge
 from opus_decoder import OmiOpusStreamDecoder, OMI_HEADER_SIZE
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
@@ -380,6 +392,70 @@ audio_scene_classifier = AudioSceneClassifier(
     media_threshold=AUDIO_SCENE_MEDIA_THRESHOLD,
 )
 
+
+def _is_media_scene(scene: dict | None) -> bool:
+    """音響シーン分類の結果が「TV・ラジオ等のメディア音声主体」かを判定する。"""
+    return bool(scene) and scene.get("scene_label_en") == "media"
+
+
+async def _early_media_gate(rec) -> bool:
+    """セッション確定直後にメディア音声を検出し、LLM 補正のスキップを判断する。
+
+    noisy セッションの根本原因は TV/アニメ音声の誤録音 (実測で判明済み)。
+    従来は夜間の音響シーン分類まで判定できず、ゴミデータにも LLM 補正の
+    課金が発生していた。ここで検出した scene は transcript.json に保存する
+    ので、夜間のシーン分類フェーズはこのセッションをスキップできる。
+
+    Returns True if the session is media-dominant (correction should be skipped).
+    """
+    if not (MEDIA_EARLY_GATE_ENABLED and AUDIO_SCENE_ENABLED
+            and audio_scene_classifier.enabled
+            and rec.enabled and getattr(rec, "session_dir", None)
+            and rec.session_dir.exists()):
+        return False
+    audio_path = None
+    for name in ("audio.ogg", "audio.wav"):
+        cand = rec.session_dir / name
+        if cand.exists():
+            audio_path = cand
+            break
+    if audio_path is None:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+        scene = await loop.run_in_executor(
+            None, audio_scene_classifier.classify, str(audio_path)
+        )
+        if scene is None:
+            return False
+        is_media = _is_media_scene(scene)
+        # scene 結果と判定を transcript に永続化 (アトミック書き込み)
+        transcript_path = rec.session_dir / "transcript.json"
+        if transcript_path.exists():
+            try:
+                with open(transcript_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                session = data.setdefault("session", {})
+                session["audio_scene"] = scene
+                if is_media:
+                    session["media_suspect"] = True
+                tmp_path = str(transcript_path) + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, str(transcript_path))
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning(f"Early media gate: transcript update failed: {e}")
+        if is_media:
+            log.info(
+                f"Early media gate: {rec.session_dir.name} is media-dominant "
+                f"(scene={scene.get('scene_label')}, "
+                f"conf={scene.get('scene_confidence')}) — skipping LLM correction"
+            )
+        return is_media
+    except Exception as e:
+        log.warning(f"Early media gate failed (non-fatal): {e}")
+        return False
+
 vibevoice_transcriber = VibeVoiceTranscriber()
 
 # Text normalizer (half/full-width, duplicate chars) — CPU only
@@ -452,6 +528,59 @@ else:
             base_url=_sanitize_url,
             model=SANITIZE_MODEL,
         )
+
+# KC 品質ゲート: sanitize 直後にナレッジカードを採点する
+kc_judge: KCJudge | None = None
+if KC_QUALITY_GATE_ENABLED:
+    _judge_key, _judge_url = resolve_llm_endpoint(KC_JUDGE_MODEL)
+    if _judge_key:
+        kc_judge = KCJudge(
+            api_key=_judge_key,
+            base_url=_judge_url,
+            model=KC_JUDGE_MODEL,
+            reasoning_effort=LLM_REASONING_EFFORT,
+        )
+
+
+def _attach_kc_quality(rec: dict) -> None:
+    """Judge the KCs in a ResponsesSanitizer record and attach scores in-place.
+
+    採点失敗はスコアなし (=消費側では合格扱い) として続行する。
+    """
+    if kc_judge is None or not kc_judge.enabled:
+        return
+    kcs = []
+    if isinstance(rec.get("knowledge_cards"), list):
+        kcs.extend(k for k in rec["knowledge_cards"] if isinstance(k, dict))
+    if isinstance(rec.get("knowledge_card"), dict):
+        kcs.append(rec["knowledge_card"])
+    if not kcs:
+        return
+    scores = kc_judge.judge(kcs)
+    for kc, s in zip(kcs, scores):
+        if s:
+            kc["quality"] = s["score"]
+            kc["quality_reason"] = s["reason"]
+
+
+def _attach_kc_quality_chat_records(records: list) -> None:
+    """Same as _attach_kc_quality but for TrainingSanitizer's flat records."""
+    if kc_judge is None or not kc_judge.enabled:
+        return
+    kc_recs = [
+        r for r in records
+        if isinstance(r, dict) and r.get("type") == "knowledge_card"
+    ]
+    if not kc_recs:
+        return
+    scores = kc_judge.judge([
+        {"question": r.get("input", ""), "answer": r.get("output", "")}
+        for r in kc_recs
+    ])
+    for r, s in zip(kc_recs, scores):
+        if s:
+            r["quality"] = s["score"]
+            r["quality_reason"] = s["reason"]
 
 
 # Succession RAG (retrieval-augmented Q&A over sanitized knowledge cards)
@@ -1442,9 +1571,11 @@ async def _run_diarization_bg(recorder: SessionRecorder) -> None:
         # Enqueue for batch LLM correction + tagging
         if (batch_corrector and recorder.enabled
                 and hasattr(recorder, 'session_dir') and recorder.session_dir
+                and recorder.session_dir.exists()
                 and len(recorder.all_segments) > 0):
-            session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
-            batch_corrector.enqueue(session_id)
+            if not await _early_media_gate(recorder):
+                session_id = str(recorder.session_dir.relative_to(RECORDINGS_DIR))
+                batch_corrector.enqueue(session_id)
 
 
 # ============================================================
@@ -3533,8 +3664,9 @@ async def handle_connection(websocket):
                 and hasattr(rec, 'session_dir') and rec.session_dir
                 and rec.session_dir.exists()
                 and len(rec.all_segments) > 0):
-            session_id = str(rec.session_dir.relative_to(RECORDINGS_DIR))
-            batch_corrector.enqueue(session_id)
+            if not await _early_media_gate(rec):
+                session_id = str(rec.session_dir.relative_to(RECORDINGS_DIR))
+                batch_corrector.enqueue(session_id)
 
     try:
         async for message in websocket:
@@ -4651,6 +4783,8 @@ async def main():
                                 await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
+                            # KC 品質ゲート: 書き込み前に採点を付与
+                            await loop.run_in_executor(None, _attach_kc_quality, out_rec)
                             out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
                             out_f.flush()
                             _batch_sanitize_state["records_generated"] += 1
@@ -4674,6 +4808,10 @@ async def main():
                                 await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
+                            # KC 品質ゲート: 書き込み前に採点を付与
+                            await loop.run_in_executor(
+                                None, _attach_kc_quality_chat_records, result["records"]
+                            )
                             for rec in result["records"]:
                                 rec["session_id"] = sess_path
                                 rec["risk_level"] = result["risk_level"]

@@ -53,7 +53,7 @@ from typing import Any, Optional
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "omi-recordings-viewer"))
 
-from exporter import SanitizedIndex  # noqa: E402
+from exporter import SanitizedIndex, kc_passes_quality  # noqa: E402
 
 log = logging.getLogger("build_wiki")
 
@@ -160,6 +160,8 @@ def load_enriched_kcs(
 
     for sid, bucket in idx._by_session.items():  # noqa: SLF001
         cards = bucket.get("knowledge_cards") or []
+        # KC 品質ゲート: kc_judge の採点が閾値未満のカードは Wiki に載せない
+        cards = [c for c in cards if kc_passes_quality(c)]
         if not cards:
             continue
 
