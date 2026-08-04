@@ -63,6 +63,7 @@ COPY taxonomy_refiner.py .
 COPY keyword_learner.py .
 COPY training_sanitizer.py .
 COPY responses_sanitizer.py .
+COPY kc_judge.py .
 COPY suggestion_learner.py .
 COPY segment_classifier.py .
 COPY segment_screener.py .
