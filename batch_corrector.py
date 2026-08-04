@@ -818,10 +818,11 @@ class BatchCorrector:
         corrected_segments, stages_run, api_calls, retried,
     ):
         """Apply corrections to transcript and save to disk."""
-        changes = 0
-        for orig, corr in zip(segments, corrected_segments):
-            if orig.get("text", "") != corr.get("text", ""):
-                changes += 1
+        changed_idx = [
+            i for i, (orig, corr) in enumerate(zip(segments, corrected_segments))
+            if orig.get("text", "") != corr.get("text", "")
+        ]
+        changes = len(changed_idx)
 
         job.stages_run = stages_run
         job.api_calls = api_calls
@@ -829,16 +830,30 @@ class BatchCorrector:
         job.retried = retried
         job.stage_c_triggered = "C" in stages_run
 
-        if changes > 0:
-            for orig, corr in zip(segments, corrected_segments):
-                if orig.get("text", "") != corr.get("text", ""):
-                    orig["text"] = corr["text"]
+        # Apply to the snapshot lists (used by _save_suggestions below)
+        for i in changed_idx:
+            segments[i]["text"] = corrected_segments[i].get("text", "")
+
+        # Re-read before write (lost-update guard): transcript_data was loaded
+        # BEFORE the LLM round-trip (30s〜数分)。その間に tagging バッチや
+        # 話者修正が書いた内容をスナップショットで上書きしないよう、
+        # 変更したフィールドだけを fresh に接ぎ木する。
+        out_data = transcript_data
+        try:
+            with open(transcript_path, encoding="utf-8") as f:
+                fresh = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            fresh = None
+        if fresh is not None and len(fresh.get("segments", [])) == len(segments):
+            for i in changed_idx:
+                fresh["segments"][i]["text"] = corrected_segments[i].get("text", "")
+            out_data = fresh
 
         # llm_corrected は変更ゼロでも必ず書く: このフラグが無いと
         # _recover_unprocessed_sessions が再起動のたびに同じセッションを
         # 再エンキューし、LLM 課金を払い直す (queue 履歴だけが再処理を
         # 防いでいたため、履歴の prune もできなかった)。
-        session_meta = transcript_data.get("session", {})
+        session_meta = out_data.setdefault("session", {})
         session_meta["llm_corrected"] = True
         session_meta["llm_corrected_at"] = datetime.now().isoformat()
         session_meta["llm_stages"] = stages_run
@@ -846,7 +861,7 @@ class BatchCorrector:
 
         tmp_path = transcript_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(transcript_data, f, ensure_ascii=False, indent=2)
+            json.dump(out_data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, transcript_path)
 
         if changes > 0:

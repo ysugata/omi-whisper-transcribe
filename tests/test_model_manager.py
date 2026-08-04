@@ -86,3 +86,28 @@ async def test_acquire_does_not_hold_gpu_lock_after_return(mm):
     assert not acquired, "gpu_lock should not be held after acquire()"
 
     mm.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_caller_cancelled_does_not_leak_lock(mm):
+    """Cancelling the caller mid-wait must not orphan the lock acquisition.
+
+    asyncio.wait does not cancel the inner acquire task; without cleanup the
+    orphan acquires gpu_lock later and nothing ever releases it.
+    """
+    await mm.gpu_lock.acquire()  # batch holds the lock
+
+    caller = asyncio.ensure_future(mm.acquire(timeout=30))
+    await asyncio.sleep(0.05)  # caller is now waiting on gpu_lock
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    # Batch finishes → the orphaned acquire (if leaked) would grab the lock
+    mm.gpu_lock.release()
+    await asyncio.sleep(0.05)  # let any orphaned task run + done callbacks
+
+    # The lock must be free for the next real session
+    model, _ = await asyncio.wait_for(mm.acquire(timeout=1), timeout=2)
+    assert model == "fake-model"
+    mm.release()

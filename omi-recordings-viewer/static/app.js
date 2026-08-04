@@ -1473,12 +1473,20 @@
             fetch(api.status).then(function (r) { return r.json(); }).then(function (state) {
                 errorCount = 0;
                 // Only repaint the panel for the job it is showing
+                // Adopt the panel when it is free: with concurrent jobs the
+                // finishing job releases it, and the still-running one must
+                // take over or it runs invisibly with no progress/cancel UI.
+                if (activeBatchType === null && state.running) {
+                    showBatchPanel(type, state);
+                }
                 if (activeBatchType === type) updateBatchUI(type, state);
                 if (!state.running) {
                     clearInterval(batchTimers[type]);
                     delete batchTimers[type];
+                    // Refresh the list on ANY job completion — diarize/tag
+                    // results must appear even if another job owns the panel.
+                    loadPage(currentPage);
                     if (activeBatchType === type) {
-                        loadPage(currentPage);
                         hideBatchPanel();
                     } else if (type === "sanitize" && state.finished_at
                                && state.output_file && state.records_generated > 0) {

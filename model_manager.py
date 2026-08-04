@@ -81,17 +81,28 @@ class ModelManager:
         # では 30 秒タイムアウトが頻繁に発生するため、取得タスクを自前で
         # 監視し、競合時は必ず解放してからタイムアウトを返す。
         acquire_task = asyncio.ensure_future(self._gpu_lock.acquire())
-        done, _pending = await asyncio.wait({acquire_task}, timeout=timeout)
-        if acquire_task not in done:
+
+        def _abort_acquire():
+            """取得タスクを確実に始末する。取得が成立していたら解放する。"""
             acquire_task.cancel()
-            try:
-                await acquire_task
-                # キャンセルが間に合わず取得が成立していた → 解放して返す
-                self._gpu_lock.release()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+
+            def _drain(t: asyncio.Task):
+                if not t.cancelled() and t.exception() is None:
+                    # キャンセルが間に合わず取得が成立していた → 解放
+                    self._gpu_lock.release()
+
+            acquire_task.add_done_callback(_drain)
+
+        try:
+            done, _pending = await asyncio.wait({acquire_task}, timeout=timeout)
+        except BaseException:
+            # 呼び出し元のキャンセル (WS 切断等)。asyncio.wait は内側のタスクを
+            # キャンセルしないため、放置すると孤児タスクが後からロックを取得し
+            # 誰も解放しない — まさにこの関数が防ぎたいリークになる。
+            _abort_acquire()
+            raise
+        if acquire_task not in done:
+            _abort_acquire()
             raise TimeoutError(
                 f"GPU busy (lock timeout {timeout}s) — batch operation in progress?"
             )

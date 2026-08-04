@@ -673,10 +673,13 @@ class SessionTagger:
                 ],
             )
             if self._model.startswith("gpt-"):
-                # gpt-5 系: max_tokens/temperature は拒否される。思考トークンは
-                # 出力課金なので reasoning_effort で最小化 (llm_pipeline と同様)。
                 kwargs["max_completion_tokens"] = self._max_tokens
-                kwargs["reasoning_effort"] = self._reasoning_effort
+                if re.match(r"^(gpt-5|o\d)", self._model):
+                    # 推論モデル: temperature 固定・思考は reasoning_effort で最小化
+                    kwargs["reasoning_effort"] = self._reasoning_effort
+                else:
+                    # gpt-4o 等は reasoning_effort を拒否する
+                    kwargs["temperature"] = self._temperature
             else:
                 kwargs["temperature"] = self._temperature
                 kwargs["max_tokens"] = self._max_tokens

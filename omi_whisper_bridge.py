@@ -2369,6 +2369,7 @@ async def _batch_combined_tag_task(force: bool = False):
                     log.warning(f"Gemini genai init failed for session tag batch, falling back to sync: {e}")
 
             needs_sync_fallback = False
+            batch_tagged_paths: set = set()  # Batch API で処理済み (sync 二重処理防止)
             if batch_candidates and genai_client and not st["cancel_requested"]:
                 # Build batch requests. Each request carries the session_id in
                 # metadata (google-genai InlinedRequest.metadata) so results
@@ -2427,8 +2428,12 @@ async def _batch_combined_tag_task(force: bool = False):
                                     return None
 
                                 keyed = [(_resp_key(r), r) for r in responses]
+                                # bool(keyed): all([]) は真なので、空レスポンス
+                                # (quota 切れ等) が「キー突合成功・全件処理済み」
+                                # と誤判定され sync フォールバックが走らなくなる
                                 use_keys = (
-                                    all(k for k, _ in keyed)
+                                    bool(keyed)
+                                    and all(k for k, _ in keyed)
                                     and len({k for k, _ in keyed}) == len(keyed)
                                 )
                                 if use_keys:
@@ -2472,6 +2477,7 @@ async def _batch_combined_tag_task(force: bool = False):
                                             _update_rag_index(sess["path"], segments, tags)
                                             st["session_tag_processed"] += 1
                                             st["processed"] += 1
+                                            batch_tagged_paths.add(sess["path"])
                                         else:
                                             st["session_tag_failed"] += 1
                                             st["failed"] += 1
@@ -2480,7 +2486,15 @@ async def _batch_combined_tag_task(force: bool = False):
                                         st["session_tag_failed"] += 1
                                         st["failed"] += 1
                                         st["errors"].append(f"{sess['path']}: {e}")
-                                _batch_tag_done = True
+                                # 部分的な結果 (一部セッションに応答なし) は残りを
+                                # sync フォールバックへ回す
+                                _batch_tag_done = len(matched) == len(batch_session_map)
+                                if not _batch_tag_done:
+                                    log.warning(
+                                        "Combined tag: batch covered %d/%d session(s); "
+                                        "rest go to sync fallback",
+                                        len(matched), len(batch_session_map),
+                                    )
                                 break
                             elif state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
                                 log.error(f"Combined tag: Batch API failed ({state})")
@@ -2504,6 +2518,8 @@ async def _batch_combined_tag_task(force: bool = False):
                 for sess, fresh_data, segments, audio_scene in batch_candidates:
                     if st["cancel_requested"]:
                         break
+                    if sess["path"] in batch_tagged_paths:
+                        continue  # Batch API で処理済み — 二重タグ付け/課金を防ぐ
                     st["current_session"] = sess["path"]
                     try:
                         tags = await loop.run_in_executor(
@@ -3028,6 +3044,22 @@ def _find_unsanitized_sessions() -> list:
 
     sanitized = _load_sanitized_session_ids()
     ledger = _load_sanitize_ledger()
+
+    # Prune: retention で削除されたセッションの台帳エントリを落とす
+    # (放置すると無限成長し、毎セッションの全書き換えが重くなる)
+    stale = [sid for sid in ledger if not (base / sid).is_dir()]
+    if stale:
+        for sid in stale:
+            ledger.pop(sid, None)
+        try:
+            tmp = _SANITIZE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(ledger, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, _SANITIZE_LEDGER_PATH)
+            log.info("Sanitize ledger: pruned %d stale entrie(s)", len(stale))
+        except OSError:
+            pass
+
     result: list = []
 
     for day_dir in sorted(base.iterdir()):
@@ -3156,18 +3188,6 @@ async def _nightly_scheduler():
 
         phase_errors = []
         try:
-            # Phase 0: Retention cleanup — 以前は起動時にしか実行されず、
-            # コンテナが数ヶ月動き続けると MAX_RECORDING_DAYS が事実上
-            # 無効になっていた (4月のディレクトリが8月まで残存)。
-            try:
-                _nightly_state["phase"] = "cleanup"
-                await asyncio.get_running_loop().run_in_executor(
-                    None, cleanup_old_recordings
-                )
-            except Exception as e:
-                log.error("Nightly scheduler: Phase 0 (cleanup) error: %s", e)
-                phase_errors.append(f"cleanup: {e}")
-
             # Phase 1: Diarize
             if diarizer is not None:
                 try:
@@ -3200,20 +3220,40 @@ async def _nightly_scheduler():
                     if san_state.get("running"):
                         log.info("Nightly scheduler: Phase 2.5 skipped (sanitize already running)")
                     else:
-                        paths = await asyncio.get_running_loop().run_in_executor(
-                            None, _find_unsanitized_sessions
-                        )
-                        if paths:
-                            log.info(
-                                "Nightly scheduler: Phase 2.5 — auto-sanitize %d session(s) "
-                                "(max %d/night)", len(paths), NIGHTLY_SANITIZE_MAX_SESSIONS,
+                        # 選定スキャン (数秒〜) の間に手動 /sanitize/start が
+                        # 409 を素通りして二重実行にならないよう、先に立てる
+                        san_state["running"] = True
+                        try:
+                            paths = await asyncio.get_running_loop().run_in_executor(
+                                None, _find_unsanitized_sessions
                             )
-                            await _sanitize_hooks["task"](paths)
-                        else:
-                            log.info("Nightly scheduler: Phase 2.5 — no sessions to sanitize")
+                            if paths:
+                                log.info(
+                                    "Nightly scheduler: Phase 2.5 — auto-sanitize %d session(s) "
+                                    "(max %d/night)", len(paths), NIGHTLY_SANITIZE_MAX_SESSIONS,
+                                )
+                                await _sanitize_hooks["task"](paths)
+                            else:
+                                log.info("Nightly scheduler: Phase 2.5 — no sessions to sanitize")
+                        finally:
+                            # タスク自身の finally でも下ろすが、paths が空で
+                            # タスクを呼ばなかった場合はここで下ろす
+                            san_state["running"] = False
                 except Exception as e:
                     log.error("Nightly scheduler: Phase 2.5 (sanitize) error: %s", e, exc_info=True)
                     phase_errors.append(f"sanitize: {e}")
+
+            # Phase 2.7: Retention cleanup — 自動 sanitize の後に実行する。
+            # 先に消すと「上限50件/晩の sanitize が追いつく前に高価値セッション
+            # が保持期限で消える」raceになる (起動時 cleanup は従来通り別途実行)。
+            try:
+                _nightly_state["phase"] = "cleanup"
+                await asyncio.get_running_loop().run_in_executor(
+                    None, cleanup_old_recordings
+                )
+            except Exception as e:
+                log.error("Nightly scheduler: cleanup phase error: %s", e)
+                phase_errors.append(f"cleanup: {e}")
 
             # Phase 3: Monthly taxonomy refinement (1st of month only)
             now_after_tag = datetime.now()
@@ -4601,21 +4641,21 @@ async def main():
                             )
                             if rs_result is None:
                                 _batch_sanitize_state["failed"] += 1
-                                _record_sanitize_outcome(sess_path, "failed")
+                                await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "failed")
                                 continue
                             # Responses API の出力を JSONL に書き込み
                             out_rec = {"session_id": sess_path, **rs_result.data}
                             if rs_result.data.get("risk") == "high":
                                 _batch_sanitize_state["dropped"] += 1
                                 _batch_sanitize_state["processed"] += 1
-                                _record_sanitize_outcome(sess_path, "dropped")
+                                await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
                             out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
                             out_f.flush()
                             _batch_sanitize_state["records_generated"] += 1
                             _batch_sanitize_state["processed"] += 1
-                            _record_sanitize_outcome(sess_path, "done")
+                            await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "done")
                             log.info(
                                 f"Sanitize: {sess_path} → {rs_result.data.get('risk', '?')}"
                             )
@@ -4626,12 +4666,12 @@ async def main():
                             )
                             if result is None:
                                 _batch_sanitize_state["failed"] += 1
-                                _record_sanitize_outcome(sess_path, "failed")
+                                await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "failed")
                                 continue
                             if result["risk_level"] == "high":
                                 _batch_sanitize_state["dropped"] += 1
                                 _batch_sanitize_state["processed"] += 1
-                                _record_sanitize_outcome(sess_path, "dropped")
+                                await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "dropped")
                                 log.info(f"Sanitize: {sess_path} → high risk, dropped")
                                 continue
                             for rec in result["records"]:
@@ -4641,7 +4681,7 @@ async def main():
                                 _batch_sanitize_state["records_generated"] += 1
                             out_f.flush()
                             _batch_sanitize_state["processed"] += 1
-                            _record_sanitize_outcome(sess_path, "done")
+                            await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "done")
                             log.info(
                                 f"Sanitize: {sess_path} → {result['risk_level']}, "
                                 f"{len(result['records'])} records"
@@ -4651,7 +4691,7 @@ async def main():
                         _batch_sanitize_state["errors"].append(
                             f"{sess_path}: {e}"
                         )
-                        _record_sanitize_outcome(sess_path, "failed")
+                        await loop.run_in_executor(None, _record_sanitize_outcome, sess_path, "failed")
                         log.error(f"Sanitize error for {sess_path}: {e}")
                         continue
                     await asyncio.sleep(0)
