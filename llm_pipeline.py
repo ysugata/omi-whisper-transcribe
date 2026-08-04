@@ -148,12 +148,16 @@ class LLMPipeline:
                 response_format=response_format,
             )
             if self._model.startswith("gpt-"):
-                # gpt-5 系 (Chat Completions): max_tokens は拒否されるため
-                # max_completion_tokens を使う。temperature はデフォルト固定
-                # (指定するとエラー)。思考トークンは出力レートで課金されるので
-                # reasoning_effort で最小化する (既定 minimal)。
+                # OpenAI 系: max_tokens は新モデルで拒否されるため
+                # max_completion_tokens を使う (旧モデルも受け付ける)。
                 kwargs["max_completion_tokens"] = max_tokens
-                kwargs["reasoning_effort"] = self._reasoning_effort
+                if re.match(r"^(gpt-5|o\d)", self._model):
+                    # 推論モデル: temperature 固定・思考トークンは出力課金
+                    # されるので reasoning_effort で最小化 (既定 minimal)
+                    kwargs["reasoning_effort"] = self._reasoning_effort
+                else:
+                    # gpt-4o 等の非推論モデルは reasoning_effort を拒否する
+                    kwargs["temperature"] = self._temperature
             else:
                 kwargs["temperature"] = self._temperature
                 kwargs["max_tokens"] = max_tokens

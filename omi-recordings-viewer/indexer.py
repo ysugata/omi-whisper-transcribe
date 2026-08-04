@@ -447,6 +447,17 @@ class Indexer:
 
         Returns the number of rows changed. Does not commit.
         """
+        if not on_disk_keys and not self.recordings_dir.is_dir():
+            # recordings ディレクトリ自体が見えない = bind mount 外れ等の
+            # 一時障害。この 1 tick で全行を files_present=0 にすると
+            # レビューキューやエクスポートが丸ごと空に見えるため、
+            # マウントが戻るまでスキップする (空ディレクトリは正当な削除
+            # として通常どおり反映する)。
+            logger.warning(
+                "files_present reconcile skipped: recordings dir %s is not "
+                "accessible (transient mount issue?)", self.recordings_dir,
+            )
+            return 0
         cursor = await self._db.execute(
             "SELECT date, time, COALESCE(files_present, 1) AS fp FROM sessions"
         )

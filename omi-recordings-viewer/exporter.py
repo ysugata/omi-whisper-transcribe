@@ -16,6 +16,7 @@ Supported sanitizer output formats:
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,7 @@ class SanitizedIndex:
 # file — cheap to compute per request, so the multi-MB JSONL parse only
 # happens when a file actually changed.
 _INDEX_CACHE: dict[str, tuple[tuple, "SanitizedIndex"]] = {}
+_INDEX_CACHE_LOCK = threading.Lock()
 
 
 def _sanitized_dir_signature(config_dir: Path) -> tuple:
@@ -249,9 +251,15 @@ def get_sanitized_index(config_dir: Path | str) -> "SanitizedIndex":
     cached = _INDEX_CACHE.get(key)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    index = SanitizedIndex(config_dir)
-    _INDEX_CACHE[key] = (sig, index)
-    return index
+    # Double-checked lock: concurrent executor calls on a cache miss would
+    # otherwise each parse every JSONL file.
+    with _INDEX_CACHE_LOCK:
+        cached = _INDEX_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        index = SanitizedIndex(config_dir)
+        _INDEX_CACHE[key] = (sig, index)
+        return index
 
 
 # ---------------------------------------------------------------------------

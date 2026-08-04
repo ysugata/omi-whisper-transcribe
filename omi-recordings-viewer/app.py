@@ -613,6 +613,42 @@ async def handle_get_taxonomy_label_counts(request: web.Request) -> web.Response
     return web.json_response(counts)
 
 
+def _rename_tag_in_files(rows: list, axis: str, old_val: str, new_val: str) -> int:
+    """transcript.json 内のタグ値を書き換える (同期・executor 用)。
+
+    write_tx の外で走らせるためのヘルパー。書き換えた件数を返す。
+    """
+    renamed = 0
+    for date, time_val in rows:
+        tpath = Path(RECORDINGS_DIR) / date / time_val / "transcript.json"
+        if not tpath.exists():
+            continue
+        try:
+            with open(tpath, "r", encoding="utf-8") as f:
+                tdata = json.load(f)
+            tags = tdata.get("session", {}).get("tags", {})
+            changed = False
+            if axis in ("outcomes", "domains"):
+                vals = tags.get(axis, [])
+                if isinstance(vals, list) and old_val in vals:
+                    tags[axis] = [new_val if v == old_val else v for v in vals]
+                    changed = True
+            else:
+                # conversation_type / importance: single string
+                if tags.get(axis) == old_val:
+                    tags[axis] = new_val
+                    changed = True
+            if changed:
+                tmp = str(tpath) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(tdata, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, str(tpath))
+                renamed += 1
+        except Exception as e:
+            logger.warning(f"Failed to update {tpath}: {e}")
+    return renamed
+
+
 async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
     """PUT /api/tag-taxonomy — update taxonomy + optionally retag affected sessions."""
     body = await request.json()
@@ -679,90 +715,74 @@ async def handle_put_tag_taxonomy(request: web.Request) -> web.Response:
             "domains": "tags_domains",
             "importance": "tags_importance_v2",
         }
-        # One write unit for the whole rename batch: write_tx serializes it
-        # against other writers, commits on success (even when no transcript
-        # file was rewritten), and rolls back if the loop dies — no more
-        # half-done renames published by an unrelated commit.
-        async with indexer.write_tx() as db:
-            for axis, mapping in renames.items():
-                col = axis_col_map.get(axis)
-                if not col or not isinstance(mapping, dict):
+        # Phase 1 (ロック外): 対象行の収集と transcript.json の書き換え。
+        # ファイル I/O は遅いので write_tx (他の全書き込みを塞ぐ) の外で、
+        # かつ executor で行う。DB 更新文はリストに溜めて Phase 2 で適用。
+        loop = asyncio.get_running_loop()
+        db_updates: list[tuple[str, list]] = []
+        for axis, mapping in renames.items():
+            col = axis_col_map.get(axis)
+            if not col or not isinstance(mapping, dict):
+                continue
+            for old_val, new_val in mapping.items():
+                if not old_val or not new_val or old_val == new_val:
                     continue
-                for old_val, new_val in mapping.items():
-                    if not old_val or not new_val or old_val == new_val:
-                        continue
-                    try:
-                        # Find affected sessions
-                        if axis in ("outcomes", "domains"):
-                            cursor = await db.execute(
-                                f"SELECT date, time FROM sessions WHERE {col} LIKE ?",
-                                ["%" + old_val + "%"],
-                            )
-                        else:
-                            cursor = await db.execute(
-                                f"SELECT date, time FROM sessions WHERE {col} = ?",
-                                [old_val],
-                            )
-                        rows = await cursor.fetchall()
+                try:
+                    # Find affected sessions (read-only — no lock needed)
+                    if axis in ("outcomes", "domains"):
+                        cursor = await indexer._db.execute(
+                            f"SELECT date, time, {col} AS v FROM sessions"
+                            f" WHERE {col} LIKE ?",
+                            ["%" + old_val + "%"],
+                        )
+                    else:
+                        cursor = await indexer._db.execute(
+                            f"SELECT date, time, {col} AS v FROM sessions"
+                            f" WHERE {col} = ?",
+                            [old_val],
+                        )
+                    rows = [
+                        (r["date"], r["time"], r["v"])
+                        for r in await cursor.fetchall()
+                    ]
 
-                        # Update each transcript.json
-                        for row in rows:
-                            tpath = Path(RECORDINGS_DIR) / row["date"] / row["time"] / "transcript.json"
-                            if not tpath.exists():
+                    # Rewrite transcript.json files in an executor
+                    renamed_count += await loop.run_in_executor(
+                        None, _rename_tag_in_files,
+                        [(d, t) for d, t, _v in rows], axis, old_val, new_val,
+                    )
+
+                    # Queue DB updates for immediate consistency
+                    if axis in ("outcomes", "domains"):
+                        # SQL REPLACE would corrupt values that contain
+                        # old_val as a substring (個人 → 個人事業); split,
+                        # replace the exact element, and rejoin in Python.
+                        for d, t, v in rows:
+                            vals = [s.strip() for s in (v or "").split(",") if s.strip()]
+                            if old_val not in vals:
                                 continue
-                            try:
-                                with open(tpath, "r", encoding="utf-8") as f:
-                                    tdata = json.load(f)
-                                tags = tdata.get("session", {}).get("tags", {})
-                                changed = False
-                                if axis in ("outcomes", "domains"):
-                                    vals = tags.get(axis, [])
-                                    if isinstance(vals, list) and old_val in vals:
-                                        tags[axis] = [new_val if v == old_val else v for v in vals]
-                                        changed = True
-                                else:
-                                    # conversation_type / importance: single string
-                                    if tags.get(axis) == old_val:
-                                        tags[axis] = new_val
-                                        changed = True
-                                if changed:
-                                    tmp = str(tpath) + ".tmp"
-                                    with open(tmp, "w", encoding="utf-8") as f:
-                                        json.dump(tdata, f, ensure_ascii=False, indent=2)
-                                    os.replace(tmp, str(tpath))
-                                    renamed_count += 1
-                            except Exception as e:
-                                logger.warning(f"Failed to update {tpath}: {e}")
+                            new_joined = ",".join(
+                                new_val if x == old_val else x for x in vals
+                            )
+                            db_updates.append((
+                                f"UPDATE sessions SET {col} = ?"
+                                " WHERE date = ? AND time = ?",
+                                [new_joined, d, t],
+                            ))
+                    else:
+                        db_updates.append((
+                            f"UPDATE sessions SET {col} = ? WHERE {col} = ?",
+                            [new_val, old_val],
+                        ))
+                except Exception as e:
+                    logger.warning(f"Failed to rename {axis} '{old_val}' -> '{new_val}': {e}")
 
-                        # Also update DB for immediate consistency
-                        if axis in ("outcomes", "domains"):
-                            # SQL REPLACE would corrupt values that contain
-                            # old_val as a substring (個人 → 個人事業); split,
-                            # replace the exact element, and rejoin in Python.
-                            cursor = await db.execute(
-                                f"SELECT date, time, {col} AS v FROM sessions"
-                                f" WHERE {col} LIKE ?",
-                                ["%" + old_val + "%"],
-                            )
-                            for r in await cursor.fetchall():
-                                vals = [s.strip() for s in (r["v"] or "").split(",") if s.strip()]
-                                if old_val not in vals:
-                                    continue
-                                new_joined = ",".join(
-                                    new_val if v == old_val else v for v in vals
-                                )
-                                await db.execute(
-                                    f"UPDATE sessions SET {col} = ?"
-                                    " WHERE date = ? AND time = ?",
-                                    [new_joined, r["date"], r["time"]],
-                                )
-                        else:
-                            await db.execute(
-                                f"UPDATE sessions SET {col} = ? WHERE {col} = ?",
-                                [new_val, old_val],
-                            )
-                    except Exception as e:
-                        logger.warning(f"Failed to rename {axis} '{old_val}' -> '{new_val}': {e}")
+        # Phase 2: DB 更新のみを 1 write unit で適用 (成功で commit /
+        # 失敗で rollback、他の書き込みと直列化)
+        if db_updates:
+            async with indexer.write_tx() as db:
+                for sql, params in db_updates:
+                    await db.execute(sql, params)
 
     # Save new taxonomy
     new_taxonomy["version"] = (old_taxonomy or {}).get("version", 0) + 1
