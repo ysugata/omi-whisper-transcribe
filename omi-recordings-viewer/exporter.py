@@ -16,11 +16,26 @@ Supported sanitizer output formats:
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# KC 品質ゲート: sanitize 時に kc_judge が付与した quality (1-5) が
+# この値未満のカードは学習データ/Wiki から除外する。未採点カードは通す。
+KC_MIN_QUALITY = int(os.environ.get("KC_MIN_QUALITY", "3"))
+
+
+def kc_passes_quality(kc: dict) -> bool:
+    q = kc.get("quality")
+    if q is None:
+        return True
+    try:
+        return int(q) >= KC_MIN_QUALITY
+    except (TypeError, ValueError):
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +155,15 @@ class SanitizedIndex:
                     if not q or not a or q in seen_questions:
                         continue
                     seen_questions.add(q)
-                    bucket["knowledge_cards"].append({
+                    card = {
                         "question": q,
                         "answer": a,
                         "evidence": kc.get("evidence") or [],
                         "confidence": kc.get("confidence") or "medium",
-                    })
+                    }
+                    if kc.get("quality") is not None:
+                        card["quality"] = kc.get("quality")
+                    bucket["knowledge_cards"].append(card)
             # Legacy single-card field (back-compat with pre-multi-KC runs)
             kc = rec.get("knowledge_card")
             if isinstance(kc, dict):
@@ -153,12 +171,15 @@ class SanitizedIndex:
                 a = str(kc.get("answer", "")).strip()
                 if q and a and q not in seen_questions:
                     seen_questions.add(q)
-                    bucket["knowledge_cards"].append({
+                    card = {
                         "question": q,
                         "answer": a,
                         "evidence": kc.get("evidence") or [],
                         "confidence": kc.get("confidence") or "medium",
-                    })
+                    }
+                    if kc.get("quality") is not None:
+                        card["quality"] = kc.get("quality")
+                    bucket["knowledge_cards"].append(card)
             return
 
         # TrainingSanitizer format: multiple records per session, distinguished
@@ -199,12 +220,15 @@ class SanitizedIndex:
             # file ever generated, so overlapping runs re-emit the same KCs.
             seen = {c["question"] for c in bucket["knowledge_cards"]}
             if q and a and q not in seen:
-                bucket["knowledge_cards"].append({
+                card = {
                     "question": q,
                     "answer": a,
                     "evidence": [],
                     "confidence": "medium",
-                })
+                }
+                if rec.get("quality") is not None:
+                    card["quality"] = rec.get("quality")
+                bucket["knowledge_cards"].append(card)
 
     def get(self, session_id: str) -> dict | None:
         return self._by_session.get(session_id)
@@ -499,6 +523,8 @@ def to_openai(
 
     # 1. Knowledge-card driven Q&A tasks
     for kc in sanitized.get("knowledge_cards") or []:
+        if not kc_passes_quality(kc):
+            continue
         q = (kc.get("question") or "").strip()
         a = (kc.get("answer") or "").strip()
         if len(q) < 10 or len(a) < 15:
@@ -559,6 +585,8 @@ def to_conversation(
         system_qa = f"{_SYS_QA}\n事業領域: {domain_str}"
 
     for kc in sanitized.get("knowledge_cards") or []:
+        if not kc_passes_quality(kc):
+            continue
         q = (kc.get("question") or "").strip()
         a = (kc.get("answer") or "").strip()
         if len(q) < 10 or len(a) < 15:
@@ -615,6 +643,8 @@ def to_knowledge(
         summary_text = (sanitized.get("summary_output") or "").strip()
         keypoints = sanitized.get("keypoints") or []
         for kc in sanitized.get("knowledge_cards") or []:
+            if not kc_passes_quality(kc):
+                continue
             q = (kc.get("question") or "").strip()
             a = (kc.get("answer") or "").strip()
             if q and a:
@@ -690,6 +720,8 @@ def to_decision_log(
     kc_enrich: list[dict] = []
     if sanitized is not None:
         for kc in sanitized.get("knowledge_cards") or []:
+            if not kc_passes_quality(kc):
+                continue
             if kc.get("confidence") in ("high", "medium"):
                 kc_enrich.append({
                     "question": kc.get("question", ""),

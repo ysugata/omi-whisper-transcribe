@@ -29,6 +29,7 @@ Omi デバイス → (WebSocket :8090) → omi-whisper-transcribe → ASR Engine
 | リアルタイム文字起こし | WebSocket で受信した音声を ASR エンジン (Whisper / Qwen3-ASR) で逐次処理 |
 | ASR エンジン切り替え | `ENGINE` 環境変数で Whisper ↔ Qwen3-ASR を切り替え |
 | エンジン比較ツール | 同じ録音を両エンジンで処理し、CER・RTF を比較 (`tools/compare_engines.py`) |
+| 品質測定ハーネス | 人手確定タグとの一致率 (accuracy/F1) と KC 品質分布 (LLM judge) を定点観測、`config/eval_reports/` にレポート保存 (`tools/eval_quality.py`) |
 | VAD ベースセグメンテーション | Silero VAD で発話区間を検出し、自然な区切りで文字起こし |
 | 無音検出 | RMS ベースで無音を判定し、GPU リソースを節約 |
 | 音声前処理 | ラウドネス正規化 + ノイズ除去 (スペクトルゲーティング) |
@@ -657,6 +658,10 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `NIGHTLY_SANITIZE_MAX_SESSIONS` | `50` | 自動 sanitize の1晩あたり上限 (LLM コスト制御)。バックログは古い順に消化 |
 | `NIGHTLY_SANITIZE_HIGH_VALUE_ONLY` | `true` | 事業継承価値のあるセッションのみ対象 (重要度中+ / 有用な会話種別 / 意思決定メモ / 実質的アウトカム)。個人のみ・外部音声80%+は常に除外 |
 | `NIGHTLY_SANITIZE_MAX_ATTEMPTS` | `2` | 失敗セッションの再試行上限 (`config/sanitize_ledger.json` で管理。dropped=高リスク除外は再試行しない) |
+| `KC_QUALITY_GATE_ENABLED` | `true` | KC 品質ゲート。sanitize 直後にナレッジカードを LLM 採点し `quality` (1-5) を付与 |
+| `KC_JUDGE_MODEL` | `gpt-5-nano` | KC 採点モデル (観点: 明確性/具体性/事業価値/自己完結性) |
+| `KC_MIN_QUALITY` | `3` | この値未満の KC を Wiki ビルドと学習データエクスポートから除外 (未採点は通す) |
+| `MEDIA_EARLY_GATE_ENABLED` | `true` | セッション確定直後に音響シーン分類を実行し、TV・ラジオ等メディア音声主体なら LLM 補正をスキップ (`media_suspect` フラグ付与、夜間シーン分類も省略される) |
 
 ### リアルタイム声紋フィルタ
 
