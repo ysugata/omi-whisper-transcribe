@@ -4083,6 +4083,71 @@
     // A sanitize job surviving a page reload needs its polling resumed, or
     // its auto-download never fires and the generated file is orphaned.
     checkBatchStatus("sanitize");
+
+    // ============================================================
+    // Daily elicitation — 今日の質問 (経営者の判断を聞き出す)
+    // ============================================================
+
+    function loadElicitation() {
+        var panel = document.getElementById("elicitation-panel");
+        var listEl = document.getElementById("elicitation-list");
+        var countEl = document.getElementById("elicitation-count");
+        if (!panel || !listEl) return;
+        fetch("/api/elicitation/questions").then(function (r) { return r.json(); }).then(function (data) {
+            var qs = (data && data.questions) || [];
+            if (qs.length === 0) { panel.classList.add("hidden"); return; }
+            if (countEl) countEl.textContent = qs.length + " 件";
+            var html = "";
+            qs.forEach(function (q) {
+                html += '<div class="elicitation-item" data-id="' + escapeHtml(q.id) + '">';
+                html += '<div class="elicitation-q">' + escapeHtml(q.question) + '</div>';
+                if (q.anchor) {
+                    html += '<div class="elicitation-anchor">係留: ' + escapeHtml(q.anchor) + '</div>';
+                }
+                html += '<textarea class="elicitation-answer" placeholder="1〜2分で結構です。思い出せる範囲で、理由や条件も一緒に。"></textarea>';
+                html += '<div class="elicitation-actions">';
+                html += '<button class="btn-primary btn-sm elicitation-save" data-id="' + escapeHtml(q.id) + '">回答を保存</button>';
+                html += '<button class="btn-sm elicitation-skip" data-id="' + escapeHtml(q.id) + '">スキップ</button>';
+                html += '</div></div>';
+            });
+            listEl.innerHTML = html;
+            panel.classList.remove("hidden");
+
+            listEl.querySelectorAll(".elicitation-save").forEach(function (btn) {
+                btn.addEventListener("click", function () {
+                    var id = this.getAttribute("data-id");
+                    var item = listEl.querySelector('.elicitation-item[data-id="' + cssEscape(id) + '"]');
+                    var text = item ? item.querySelector(".elicitation-answer").value.trim() : "";
+                    if (!text) { alert("回答を入力してください"); return; }
+                    this.disabled = true;
+                    fetch("/api/elicitation/questions/" + encodeURIComponent(id) + "/answer", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ answer: text }),
+                    }).then(function (r) {
+                        if (!r.ok) throw new Error("HTTP " + r.status);
+                        showNotification("回答を保存しました。今夜ナレッジカード化されます。");
+                        loadElicitation();
+                    }).catch(function (e) {
+                        alert("保存に失敗しました: " + e.message);
+                        btn.disabled = false;
+                    });
+                });
+            });
+            listEl.querySelectorAll(".elicitation-skip").forEach(function (btn) {
+                btn.addEventListener("click", function () {
+                    var id = this.getAttribute("data-id");
+                    fetch("/api/elicitation/questions/" + encodeURIComponent(id) + "/skip", { method: "POST" })
+                        .then(function () { loadElicitation(); })
+                        .catch(function () { loadElicitation(); });
+                });
+            });
+        }).catch(function () {
+            panel.classList.add("hidden");
+        });
+    }
+
+    loadElicitation();
     loadHotwordsStatus();
     loadReviewStats();
     checkSettingsAttention();

@@ -1945,3 +1945,29 @@ main {
     font-size: 0.85rem;
     line-height: 1.5;
 }
+
+/* Daily elicitation panel — 経営者への今日の質問 */
+.elicitation-panel {
+    border: 1px solid #e0a63f;
+    border-radius: 8px;
+    background: rgba(224, 166, 63, 0.06);
+    padding: 14px 18px;
+    margin-bottom: 16px;
+}
+.elicitation-panel.hidden { display: none; }
+.elicitation-header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 8px;
+}
+.elicitation-title { font-weight: 700; color: #e0a63f; }
+.elicitation-item {
+    padding: 10px 0; border-top: 1px solid rgba(224, 166, 63, 0.25);
+}
+.elicitation-item:first-child { border-top: none; }
+.elicitation-q { font-weight: 600; line-height: 1.6; }
+.elicitation-anchor { font-size: 0.78rem; opacity: 0.65; margin-top: 2px; }
+.elicitation-answer {
+    width: 100%; min-height: 64px; margin-top: 8px;
+    box-sizing: border-box; resize: vertical;
+}
+.elicitation-actions { display: flex; gap: 8px; margin-top: 6px; }

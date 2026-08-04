@@ -662,6 +662,11 @@ Voice タグ (話者識別) が利用可能な場合、各セグメントの話�
 | `KC_JUDGE_MODEL` | `gpt-5-nano` | KC 採点モデル (観点: 明確性/具体性/事業価値/自己完結性) |
 | `KC_MIN_QUALITY` | `3` | この値未満の KC を Wiki ビルドと学習データエクスポートから除外 (未採点は通す) |
 | `MEDIA_EARLY_GATE_ENABLED` | `true` | セッション確定直後に音響シーン分類を実行し、TV・ラジオ等メディア音声主体なら LLM 補正をスキップ (`media_suspect` フラグ付与、夜間シーン分類も省略される) |
+| `ELICITATION_ENABLED` | `true` | デイリー・エリシテーション。夜間にその日の意思決定へ係留した質問を生成し、Viewer の「今日の質問」で経営者に提示。回答は sanitize 経由で KC・Wiki に還流 |
+| `ELICITATION_MODEL` | `gpt-5.6-luna` | 質問生成モデル (Critical Decision Method 系プローブ) |
+| `ELICITATION_QUESTIONS_PER_NIGHT` | `3` | 1晩に生成する質問数の上限 |
+| `ELICITATION_MAX_PENDING` | `9` | 未回答質問の上限 (溜まりすぎ防止) |
+| `SUCCESSION_GAP_SIMILARITY` | `0.45` | 事業相談の回答根拠がこの類似度未満なら「答えられなかった質問」として `config/rag_gap_log.json` に記録し、翌晩の質問の種にする |
 
 ### リアルタイム声紋フィルタ
 

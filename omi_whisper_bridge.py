@@ -156,6 +156,18 @@ KC_JUDGE_MODEL = os.environ.get("KC_JUDGE_MODEL", "gpt-5-nano")
 # 主体のセッションは LLM 補正キューに入れない (ゴミデータへの課金防止)。
 MEDIA_EARLY_GATE_ENABLED = os.environ.get("MEDIA_EARLY_GATE_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# --- デイリー・エリシテーション (能動的な聞き出し) ---
+# 夜間にその日の意思決定へ係留した質問を生成し、Viewer で経営者に提示。
+# 回答は sanitize を経てナレッジカード・Wiki へ還流する。
+ELICITATION_ENABLED = os.environ.get("ELICITATION_ENABLED", "true").lower() in ("true", "1", "yes")
+ELICITATION_MODEL = os.environ.get("ELICITATION_MODEL", "gpt-5.6-luna")  # 質問の質が命、量は少ない
+ELICITATION_QUESTIONS_PER_NIGHT = int(os.environ.get("ELICITATION_QUESTIONS_PER_NIGHT", "3"))
+ELICITATION_MAX_PENDING = int(os.environ.get("ELICITATION_MAX_PENDING", "9"))
+
+# --- RAG ギャップログ ---
+# 事業相談が答えられなかった質問を記録し、翌晩のエリシテーション質問の種にする
+SUCCESSION_GAP_SIMILARITY = float(os.environ.get("SUCCESSION_GAP_SIMILARITY", "0.45"))
+
 # --- 話者分離設定 ---
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION_ENABLED", "false").lower() in ("true", "1", "yes")
 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", "")
@@ -280,6 +292,7 @@ from segment_screener import SegmentScreener
 from suggestion_learner import SuggestionLearner
 from keyword_learner import KeywordLearner
 from kc_judge import KCJudge
+from elicitation import ElicitationEngine, ElicitationStore
 from opus_decoder import OmiOpusStreamDecoder, OMI_HEADER_SIZE
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
@@ -581,6 +594,230 @@ def _attach_kc_quality_chat_records(records: list) -> None:
         if s:
             r["quality"] = s["score"]
             r["quality_reason"] = s["reason"]
+
+
+# デイリー・エリシテーション
+elicitation_store = ElicitationStore(os.path.join(CONFIG_DIR, "elicitation_questions.json"))
+elicitation_engine: ElicitationEngine | None = None
+if ELICITATION_ENABLED:
+    _el_key, _el_url = resolve_llm_endpoint(ELICITATION_MODEL)
+    if _el_key:
+        elicitation_engine = ElicitationEngine(
+            api_key=_el_key, base_url=_el_url, model=ELICITATION_MODEL,
+            reasoning_effort="low",
+        )
+
+_RAG_GAP_LOG_PATH = os.path.join(CONFIG_DIR, "rag_gap_log.json")
+
+
+def _load_rag_gaps() -> list:
+    try:
+        data = json.loads(Path(_RAG_GAP_LOG_PATH).read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_rag_gaps(gaps: list) -> None:
+    tmp = _RAG_GAP_LOG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(gaps[-100:], f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _RAG_GAP_LOG_PATH)
+
+
+def _append_rag_gap(query: str, top_similarity: float, reason: str) -> None:
+    """事業相談が答えられなかった質問を記録する (エリシテーションの種)。"""
+    try:
+        gaps = _load_rag_gaps()
+        if any(g.get("query") == query for g in gaps):
+            return
+        gaps.append({
+            "query": query,
+            "top_similarity": round(top_similarity, 3),
+            "reason": reason,
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "consumed": False,
+        })
+        _save_rag_gaps(gaps)
+        log.info(f"RAG gap logged: {query[:60]} ({reason})")
+    except OSError as e:
+        log.warning(f"RAG gap log write failed: {e}")
+
+
+def _mark_rag_gaps_consumed(queries: list) -> None:
+    try:
+        gaps = _load_rag_gaps()
+        qset = set(queries)
+        changed = False
+        for g in gaps:
+            if g.get("query") in qset and not g.get("consumed"):
+                g["consumed"] = True
+                changed = True
+        if changed:
+            _save_rag_gaps(gaps)
+    except OSError:
+        pass
+
+
+def _is_rag_gap(answer_text: str, sources: list, warnings: list,
+                threshold: float) -> tuple:
+    """回答がナレッジ空白を示しているかを判定する。
+
+    Abstention 研究の知見: 「記録がない」と正直に言えた質問こそが最も
+    価値のある信号 — それが次に聞き出すべきことを教えてくれる。
+    Returns (is_gap, reason).
+    """
+    if "no_sources" in (warnings or []):
+        return True, "no_sources"
+    text = answer_text or ""
+    if "記録はありません" in text or "記録がありません" in text:
+        return True, "abstained"
+    top = 0.0
+    for s in sources or []:
+        try:
+            top = max(top, float(s.get("similarity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    if top and top < threshold:
+        return True, "low_similarity"
+    return False, ""
+
+
+def _collect_decision_contexts(max_sessions: int = 3, scan_days: int = 7) -> list:
+    """直近の意思決定価値のあるセッションを、未使用のものから集める。
+
+    Critical Decision Method: 質問は必ず実在の意思決定に係留する。
+    """
+    base = Path(RECORDINGS_DIR)
+    if not base.is_dir():
+        return []
+    used = elicitation_store.used_source_refs()
+    contexts: list = []
+    day_dirs = sorted((d for d in base.iterdir() if d.is_dir()), reverse=True)
+    for day_dir in day_dirs[:scan_days * 4]:
+        if len(contexts) >= max_sessions:
+            break
+        for time_dir in sorted(day_dir.iterdir(), reverse=True):
+            if len(contexts) >= max_sessions:
+                break
+            if not time_dir.is_dir():
+                continue
+            sid = f"{day_dir.name}/{time_dir.name}"
+            if sid in used:
+                continue
+            tpath = time_dir / "transcript.json"
+            if not tpath.exists():
+                continue
+            try:
+                with open(tpath, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            tags = data.get("session", {}).get("tags", {}) or {}
+            outcomes = set(tags.get("outcomes") or [])
+            decisionish = (
+                "意思決定あり" in outcomes
+                or "方針転換" in outcomes
+                or bool(tags.get("decision_memo"))
+                or tags.get("importance") == "高"
+            )
+            if not decisionish:
+                continue
+            segments = data.get("segments", [])
+            if len(segments) < 3:
+                continue
+            excerpt = " ".join(s.get("text", "") for s in segments)[:1500]
+            tags_line = "{} / {} / 重要度{}".format(
+                tags.get("conversation_type", ""),
+                ",".join(tags.get("outcomes") or []),
+                tags.get("importance", "?"),
+            )
+            contexts.append({
+                "session_id": sid,
+                "summary": (tags.get("summary") or "")[:300],
+                "tags_line": tags_line,
+                "excerpt": excerpt,
+            })
+    return contexts
+
+
+def _sanitize_elicitation_answers_sync() -> int:
+    """回答済みの質問を Safe Training レコードに変換する (同期・executor 用)。"""
+    answers = elicitation_store.unprocessed_answers()
+    if not answers or responses_sanitizer is None:
+        return 0
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = Path(CONFIG_DIR) / f"safe_training_{ts}.jsonl"
+    written = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for q in answers:
+            sid = "elicitation/" + q["id"]
+            raw = "【継承者からの質問】{}\n【経営者本人の回答】{}".format(
+                q.get("question", ""), q.get("answer", ""),
+            )
+            try:
+                rs = responses_sanitizer.sanitize(sid, raw, "ja")
+            except Exception as e:
+                log.warning(f"Elicitation sanitize failed for {sid}: {e}")
+                rs = None
+            if rs is None:
+                elicitation_store.mark_processed(q["id"], "failed")
+                continue
+            if rs.data.get("risk") == "high":
+                elicitation_store.mark_processed(q["id"], "dropped")
+                continue
+            rec = {"session_id": sid, **rs.data}
+            _attach_kc_quality(rec)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            written += 1
+            elicitation_store.mark_processed(q["id"], "done")
+            log.info(f"Elicitation answer converted to KC: {sid}")
+    if written == 0:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+    return written
+
+
+async def _run_elicitation_phase() -> None:
+    """夜間 Phase 2.6: 回答の取り込み + 新しい質問の生成。"""
+    loop = asyncio.get_running_loop()
+
+    # a) 回答済みの取り込み (経営者が昨日答えたもの → KC 化)
+    if responses_sanitizer is not None:
+        n = await loop.run_in_executor(None, _sanitize_elicitation_answers_sync)
+        if n:
+            log.info(f"Elicitation: {n} answered question(s) converted to KCs")
+
+    # b) 新しい質問の生成
+    if elicitation_engine is None or not elicitation_engine.enabled:
+        return
+    pending = len(elicitation_store.pending())
+    budget = min(ELICITATION_QUESTIONS_PER_NIGHT,
+                 ELICITATION_MAX_PENDING - pending)
+    if budget <= 0:
+        log.info("Elicitation: pending cap reached, no new questions")
+        return
+    contexts = await loop.run_in_executor(None, _collect_decision_contexts)
+    gaps = [g["query"] for g in _load_rag_gaps() if not g.get("consumed")][:5]
+    if not contexts and not gaps:
+        log.info("Elicitation: no decision contexts or gaps to ask about")
+        return
+    questions = await loop.run_in_executor(
+        None,
+        lambda: elicitation_engine.generate(
+            contexts, gaps,
+            elicitation_store.recent_question_texts(), budget,
+        ),
+    )
+    added = elicitation_store.add_questions(questions, ELICITATION_MAX_PENDING)
+    if added and gaps:
+        _mark_rag_gaps_consumed(gaps)
+    log.info(
+        f"Elicitation: generated {added} question(s) "
+        f"(contexts={len(contexts)}, gaps={len(gaps)})"
+    )
 
 
 # Succession RAG (retrieval-augmented Q&A over sanitized knowledge cards)
@@ -3374,6 +3611,15 @@ async def _nightly_scheduler():
                     log.error("Nightly scheduler: Phase 2.5 (sanitize) error: %s", e, exc_info=True)
                     phase_errors.append(f"sanitize: {e}")
 
+            # Phase 2.6: デイリー・エリシテーション (回答取り込み + 質問生成)
+            if ELICITATION_ENABLED:
+                try:
+                    _nightly_state["phase"] = "elicitation"
+                    await _run_elicitation_phase()
+                except Exception as e:
+                    log.error("Nightly scheduler: Phase 2.6 (elicitation) error: %s", e, exc_info=True)
+                    phase_errors.append(f"elicitation: {e}")
+
             # Phase 2.7: Retention cleanup — 自動 sanitize の後に実行する。
             # 先に消すと「上限50件/晩の sanitize が追いつく前に高価値セッション
             # が保持期限で消える」raceになる (起動時 cleanup は従来通り別途実行)。
@@ -4993,7 +5239,50 @@ async def main():
         except Exception as e:
             log.exception("SuccessionRAG: ask failed")
             return web.json_response({"error": str(e)}, status=500)
-        return web.json_response(answer.to_dict())
+        payload = answer.to_dict()
+        # ギャップ検出: 答えられなかった質問は「次に聞き出すべきこと」
+        try:
+            is_gap, reason = _is_rag_gap(
+                payload.get("answer", ""), payload.get("sources", []),
+                payload.get("warnings", []), SUCCESSION_GAP_SIMILARITY,
+            )
+            if is_gap:
+                top_sim = 0.0
+                for s in payload.get("sources", []):
+                    try:
+                        top_sim = max(top_sim, float(s.get("similarity", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                await loop.run_in_executor(
+                    None, _append_rag_gap, query, top_sim, reason,
+                )
+        except Exception:
+            log.debug("RAG gap detection failed", exc_info=True)
+        return web.json_response(payload)
+
+    # --- エリシテーション API ---
+    async def handle_elicitation_questions(request):
+        return web.json_response({"questions": elicitation_store.pending()})
+
+    async def handle_elicitation_answer(request):
+        qid = request.match_info["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        q = elicitation_store.answer(qid, str(body.get("answer", "")))
+        if q is None:
+            return web.json_response(
+                {"error": "question not found or empty answer"}, status=404,
+            )
+        return web.json_response(q)
+
+    async def handle_elicitation_skip(request):
+        qid = request.match_info["id"]
+        q = elicitation_store.skip(qid)
+        if q is None:
+            return web.json_response({"error": "question not found"}, status=404)
+        return web.json_response(q)
 
     async def handle_sanitize_download(request):
         filename = request.query.get("file", "")
@@ -5495,6 +5784,10 @@ async def main():
     mgmt_app.router.add_post("/succession/rebuild", handle_succession_rebuild)
     mgmt_app.router.add_post("/succession/reload_wiki", handle_succession_reload_wiki)
     mgmt_app.router.add_post("/succession/ask", handle_succession_ask)
+    # エリシテーション API
+    mgmt_app.router.add_get("/elicitation/questions", handle_elicitation_questions)
+    mgmt_app.router.add_post("/elicitation/questions/{id}/answer", handle_elicitation_answer)
+    mgmt_app.router.add_post("/elicitation/questions/{id}/skip", handle_elicitation_skip)
     # Batch LLM correction API
     mgmt_app.router.add_get("/batch/status", handle_batch_llm_status)
     mgmt_app.router.add_get("/batch/jobs", handle_batch_llm_jobs)

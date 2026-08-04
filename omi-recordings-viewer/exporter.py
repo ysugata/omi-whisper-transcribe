@@ -163,6 +163,9 @@ class SanitizedIndex:
                     }
                     if kc.get("quality") is not None:
                         card["quality"] = kc.get("quality")
+                    for extra in ("preconditions", "failure_signals"):
+                        if kc.get(extra):
+                            card[extra] = kc.get(extra)
                     bucket["knowledge_cards"].append(card)
             # Legacy single-card field (back-compat with pre-multi-KC runs)
             kc = rec.get("knowledge_card")
@@ -179,6 +182,9 @@ class SanitizedIndex:
                     }
                     if kc.get("quality") is not None:
                         card["quality"] = kc.get("quality")
+                    for extra in ("preconditions", "failure_signals"):
+                        if kc.get(extra):
+                            card[extra] = kc.get(extra)
                     bucket["knowledge_cards"].append(card)
             return
 
